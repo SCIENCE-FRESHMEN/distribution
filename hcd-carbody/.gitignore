@@ -1,0 +1,35 @@
+# 忽略 Python 缓存文件
+*__pycache__/
+*.py[cod]
+
+# 忽略虚拟环境文件夹
+env/
+venv/
+
+# 忽略日志文件
+*.log
+
+# 忽略操作系统生成的文件
+.DS_Store
+Thumbs.db
+
+# 忽略 IDE 相关文件夹
+.idea/
+.vscode/
+
+# 忽略打包生成的文件夹
+build/
+dist/
+*.egg-info/
+
+*.png
+*.xlsx
+simulation/data/
+*.txt
+*.json
+
+*.png
+*.xlsx
+simulation/data/
+*.txt
+*.json
