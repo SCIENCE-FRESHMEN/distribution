@@ -3,8 +3,9 @@
 包含启发式调度器和基于采样的优化调度器
 """
 
+import math
 import time
-from typing import Dict, List, Tuple, Set
+from typing import Any, Dict, List, Tuple, Set
 from simulation.task_data import TaskData, TASK_TYPE_INBOUND, TASK_TYPE_OUTBOUND
 from schedule.heuristic import HeuristicScheduler
 import random
@@ -13,7 +14,7 @@ import random
 class OptimizationScheduler:
     """基于采样优化的调度器"""
     
-    def __init__(self, warehouse_core, num_samples=500, num_evaluate=10):
+    def __init__(self, warehouse_core, num_samples=100, num_evaluate=15):
         """
         Args:
             warehouse_core: WarehouseCore实例
@@ -34,6 +35,10 @@ class OptimizationScheduler:
         self.num_evaluate = num_evaluate
         # 入库紧急阈值：距当前组小于等于该值的需求视为紧急
         self.inbound_urgency_threshold = 3
+        # 非 FIFO 场景下，出库任务在选定巷道内可直接出库的位置越多，分数越小
+        self.outbound_choice_bonus_weight = float(
+            getattr(warehouse_core, "outbound_choice_bonus_weight", 0.2)
+        )
         
         # 入库货位分配器
         self.position_allocator = None
@@ -55,6 +60,61 @@ class OptimizationScheduler:
         if not match_fields:
             return {}
         return {k: sku_dict.get(k) for k in match_fields}
+
+    def _fifo_enabled(self) -> bool:
+        return bool(getattr(self.warehouse_core, "outbound_fifo_enabled", False))
+
+    def _extract_position_inbound_time(self, pos, sku_id: str, attrs: dict) -> float:
+        times = []
+        if getattr(pos, "is_double_layer", False):
+            if pos.matches_sku(sku_id, attrs, self.warehouse_core.match_fields, shelf='upper'):
+                times.append((getattr(pos, "upper_attrs", {}) or {}).get("_inbound_time"))
+            if pos.matches_sku(sku_id, attrs, self.warehouse_core.match_fields, shelf='lower'):
+                times.append((getattr(pos, "lower_attrs", {}) or {}).get("_inbound_time"))
+        else:
+            if pos.matches_sku(sku_id, attrs, self.warehouse_core.match_fields):
+                times.append((getattr(pos, "sku_attrs", {}) or {}).get("_inbound_time"))
+
+        parsed = []
+        for value in times:
+            if value is None:
+                parsed.append(0.0)
+                continue
+            try:
+                parsed.append(float(value))
+            except Exception:
+                parsed.append(0.0)
+        return min(parsed) if parsed else math.inf
+
+    def _position_fifo_time(self, task: TaskData, pos) -> float:
+        sku_ids = task.get_sku_ids()
+        if not sku_ids:
+            return math.inf
+
+        sku_attrs_map = {}
+        for s in (task.skus or []):
+            sku_dict = self._sku_entry_to_dict(s)
+            sku_id = sku_dict.get("skuId")
+            if sku_id and sku_id not in sku_attrs_map:
+                sku_attrs_map[sku_id] = self._extract_sku_attrs(sku_dict)
+
+        times = [
+            self._extract_position_inbound_time(pos, sku_id, sku_attrs_map.get(sku_id, {}))
+            for sku_id in sku_ids
+        ]
+        return min(times) if times else math.inf
+
+    def _sort_positions_for_outbound(self, task: TaskData, positions: List[Any]) -> List[Any]:
+        if not self._fifo_enabled() or not positions:
+            return positions
+        return sorted(
+            positions,
+            key=lambda p: (
+                self._position_fifo_time(task, p),
+                -p.column,
+                p.level,
+            ),
+        )
             
     def solve(self, inbound_tasks: List[TaskData], outbound_tasks: List[TaskData], 
              running_tasks: List[TaskData] = None, current_time: float = 0.0) -> Dict[int, List[TaskData]]:
@@ -81,8 +141,7 @@ class OptimizationScheduler:
         start_time = time.time()
         
         # 1. 筛选出库任务：只保留当前组的任务
-        # filtered_outbound_tasks = self._filter_outbound_tasks(outbound_tasks)
-        filtered_outbound_tasks = outbound_tasks
+        filtered_outbound_tasks = self._filter_outbound_tasks(outbound_tasks)
         
         # 2. 计算每个任务的可行巷道和位置
         task_feasible_assignments = self._compute_feasible_assignments(
@@ -179,7 +238,7 @@ class OptimizationScheduler:
                     positions_by_aisle[pos.aisle].append(pos)
                 
                 for aisle, positions in positions_by_aisle.items():
-                    feasible.append((aisle, positions))
+                    feasible.append((aisle, self._sort_positions_for_outbound(task, positions)))
             elif len(sku_ids) == 2:
                 # 双梁任务
                 sku1, sku1_quantity = task.skus[0].get('skuId'), task.skus[0].get('quantity')
@@ -191,13 +250,15 @@ class OptimizationScheduler:
                 for pos in self.inventory_manager.inventory_positions:
                     if (pos.is_double_layer 
                         and pos.matches_pair(sku1, attrs1, sku2, attrs2, self.warehouse_core.match_fields)):
+                        if self.warehouse_core._is_position_reserved_for_other_task(pos, task.task_id):
+                            continue
                         if pos.upper_quantity + pos.lower_quantity >= sku1_quantity + sku2_quantity:
                             if pos.aisle not in positions_by_aisle:
                                 positions_by_aisle[pos.aisle] = []
                             positions_by_aisle[pos.aisle].append(pos)
                 
                 for aisle, positions in positions_by_aisle.items():
-                    feasible.append((aisle, positions))
+                    feasible.append((aisle, self._sort_positions_for_outbound(task, positions)))
         
             if feasible:
                 task_feasible_assignments[task.task_id] = feasible
@@ -410,6 +471,21 @@ class OptimizationScheduler:
             ready_counts[pl] = ready
 
         return ready_counts
+
+    def _calculate_outbound_choice_bonus(self, solution: Dict[int, List[TaskData]]) -> float:
+        """非 FIFO 场景下，出库任务在已选巷道内可直接出库的位置越多，给予更小的评分。"""
+        if self._fifo_enabled():
+            return 0.0
+
+        bonus = 0.0
+        for tasks in solution.values():
+            for task in tasks:
+                if getattr(task, "task_type", None) != TASK_TYPE_OUTBOUND:
+                    continue
+                choice_count = int(getattr(task, "choice_count", 1) or 1)
+                if choice_count > 1:
+                    bonus -= self.outbound_choice_bonus_weight * math.log1p(choice_count - 1)
+        return bonus
     
     def _get_inbound_urgency(self, task: TaskData, threshold: int = 2) -> int:
         """
@@ -558,6 +634,7 @@ class OptimizationScheduler:
             if positions:
                 # 由于分配器已经返回确定的位置方案，直接使用即可
                 # 对于双SKU任务保留完整的货位列表
+                choice_count = len(positions) if is_outbound and isinstance(positions, list) else 1
                 if (not is_outbound) and isinstance(positions, list) and len(getattr(task, "skus", []) or []) > 1:
                     selected_position = positions
                 elif isinstance(positions, list):
@@ -567,6 +644,7 @@ class OptimizationScheduler:
                     selected_position = positions
             else:
                 selected_position = None
+                choice_count = 1
             
             # 跳过没有有效位置的任务
             if selected_position is None:
@@ -587,6 +665,8 @@ class OptimizationScheduler:
                 positions=[selected_position] if not isinstance(selected_position, list) else selected_position,
                 task_record=getattr(task, 'task_record', {})
             )
+            if is_outbound:
+                new_task.choice_count = choice_count
             
             # 添加到巷道任务序列中
             aisle_task_sequences[aisle].append(new_task)
@@ -710,24 +790,49 @@ class OptimizationScheduler:
         # 评分并选择最优
         best_score = float('inf')
 
-        for solution, max_tasks in selected_solutions:
+        for idx, (solution, max_tasks) in enumerate(selected_solutions, 1):
             # 计算基础得分
-            base_score, _ = self.warehouse_core.get_sol_score(solution)
+            base_score, base_details = self.warehouse_core.get_sol_score(solution)
             
             # 计算产线进度平衡性得分
             line_progress_balance_score = self._calculate_line_progress_balance_score(solution)
+            outbound_choice_bonus = self._calculate_outbound_choice_bonus(solution)
             
-            # 综合得分 = 基础得分 + 进度平衡性惩罚
-            score = base_score + line_progress_balance_score
+            # 综合得分 = 基础得分 + 进度平衡性惩罚 + 出库选择灵活度奖励（负分更优）
+            score = base_score + line_progress_balance_score + outbound_choice_bonus
+            extra_terms = [("line_progress_balance_penalty", line_progress_balance_score)]
+            if outbound_choice_bonus:
+                extra_terms.append(("outbound_choice_bonus", outbound_choice_bonus))
             # 避免全空方案被选中
             if all(len(tasks) == 0 for tasks in solution.values()):
                 score += 10000.0
+                extra_terms.append(("empty_solution_penalty", 10000.0))
+            print(f"[优化器]候选方案 #{idx}: max_tasks={max_tasks}")
+            for line in self.warehouse_core.format_score_breakdown(
+                base_details,
+                extra_terms=extra_terms,
+            ):
+                print(line)
             if score < best_score:
                 best_score = score
                 best_solution = solution
         
-        heuristic_score, _ = self.warehouse_core.get_sol_score(heuristic_solution)
-        heuristic_score = heuristic_score + 10000.0 if all(len(tasks) == 0 for tasks in heuristic_solution.values()) else heuristic_score 
+        heuristic_score, heuristic_details = self.warehouse_core.get_sol_score(heuristic_solution)
+        heuristic_line_progress_balance_score = self._calculate_line_progress_balance_score(heuristic_solution)
+        heuristic_outbound_choice_bonus = self._calculate_outbound_choice_bonus(heuristic_solution)
+        heuristic_score += heuristic_line_progress_balance_score + heuristic_outbound_choice_bonus
+        heuristic_extra_terms = [("line_progress_balance_penalty", heuristic_line_progress_balance_score)]
+        if heuristic_outbound_choice_bonus:
+            heuristic_extra_terms.append(("outbound_choice_bonus", heuristic_outbound_choice_bonus))
+        if all(len(tasks) == 0 for tasks in heuristic_solution.values()):
+            heuristic_score += 10000.0
+            heuristic_extra_terms.append(("empty_solution_penalty", 10000.0))
+        print("[优化器]heuristic 基线方案评分:")
+        for line in self.warehouse_core.format_score_breakdown(
+            heuristic_details,
+            extra_terms=heuristic_extra_terms,
+        ):
+            print(line)
         if heuristic_score < best_score:
             score_diff = best_score - heuristic_score
             best_score = heuristic_score

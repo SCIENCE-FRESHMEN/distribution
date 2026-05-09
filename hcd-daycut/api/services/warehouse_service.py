@@ -11,6 +11,7 @@
 import time
 import random
 import json
+from copy import deepcopy
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
@@ -62,6 +63,8 @@ class WarehouseService:
             self._core.initialize()
         else:
             self._core = warehouse_core
+
+        self._bom_config_snapshot = self._build_bom_snapshot()
         
         # 时间管理：使用实际时间戳（秒）
         self._start_time = time.time()
@@ -70,6 +73,11 @@ class WarehouseService:
         # 待执行任务缓存 - 保存已分配但等待EXECUTING反馈的任务
         # {task_id: TaskData}
         self._pending_execution_tasks: Dict[str, TaskData] = {}
+
+        # Last schedule call: tasks that can match a given aisle (planning/preview only).
+        # {aisle_id: [TaskData, ...]}
+        self._last_matched_tasks_by_aisle: Dict[int, List[TaskData]] = {}
+        self._plan_id_to_line: Dict[str, int] = {}
         
     @property
     def core(self) -> WarehouseCore:
@@ -97,6 +105,217 @@ class WarehouseService:
         if not match_fields:
             return {}
         return {k: sku_dict.get(k) for k in match_fields}
+
+    def _get_value(self, obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _line_id_to_int(self, line_id: Any) -> int:
+        text = str(line_id).strip().upper()
+        if text.startswith("LINE-"):
+            text = text.split("LINE-", 1)[1]
+        elif text.startswith("LINE"):
+            text = text.split("LINE", 1)[1]
+        return int(text)
+
+    def _build_production_plan_payload(self, plan_request: Any) -> Dict[str, Any]:
+        production_plan: Dict[int, List] = {}
+        match_fields = list(getattr(self._core, "match_fields", []) or [])
+        production_plan_attrs: Dict[str, Dict[int, List]] = {field: {} for field in match_fields}
+        plan_id_to_line: Dict[str, int] = {}
+
+        plans = self._get_value(plan_request, "plans", []) or []
+        for plan in plans:
+            line_id = self._line_id_to_int(self._get_value(plan, "lineId"))
+            plan_id = self._get_value(plan, "planId")
+            if plan_id:
+                plan_id_to_line[str(plan_id)] = line_id
+
+            groups = []
+            attrs_by_field = {field: [] for field in match_fields}
+            for group in self._get_value(plan, "planIndex", []) or []:
+                tasks_in_group = []
+                group_attrs_by_field = {field: [] for field in match_fields}
+                for task_skus in self._get_value(group, "requiredSkus", []) or []:
+                    sku_list = []
+                    task_attrs_by_field = {field: [] for field in match_fields}
+                    for sku in task_skus:
+                        sku_dict = self._sku_entry_to_dict(sku)
+                        sku_id = sku_dict.get("skuId") or sku_dict.get("sku")
+                        quantity = int(sku_dict.get("quantity", 1) or 1)
+                        for _ in range(quantity):
+                            sku_list.append(sku_id)
+                            for field in match_fields:
+                                task_attrs_by_field[field].append(sku_dict.get(field))
+                    tasks_in_group.append(sku_list)
+                    for field in match_fields:
+                        group_attrs_by_field[field].append(task_attrs_by_field[field])
+                groups.append(tasks_in_group)
+                for field in match_fields:
+                    attrs_by_field[field].append(group_attrs_by_field[field])
+
+            production_plan[line_id] = groups
+            for field in match_fields:
+                production_plan_attrs[field][line_id] = attrs_by_field[field]
+
+        self._plan_id_to_line = plan_id_to_line
+        return {
+            "production_plan": production_plan,
+            "production_plan_attrs": production_plan_attrs if match_fields else {},
+        }
+
+    def _normalize_production_line_current_group(self, current_group_map: Any) -> Dict[int, int]:
+        if not current_group_map:
+            return {}
+        if not isinstance(current_group_map, dict):
+            raise ValueError("productionLineCurrentGroup must be a dict like {'LINE-1': 0}")
+
+        normalized: Dict[int, int] = {}
+        for line_id, core_group_idx in current_group_map.items():
+            line = self._line_id_to_int(line_id)
+            idx = int(core_group_idx)
+            if idx < 0:
+                raise ValueError("productionLineCurrentGroup uses core 0-based indexes; values must be >= 0")
+            total_groups = len((getattr(self._core, "production_plan", {}) or {}).get(line, []))
+            if total_groups and idx > total_groups:
+                raise ValueError(
+                    f"productionLineCurrentGroup line {line} points to core group {idx}, "
+                    f"but the plan only has {total_groups} groups"
+                )
+            normalized[line] = idx
+        return normalized
+
+    def apply_production_line_current_group(self, current_group_map: Any) -> None:
+        for line, core_group_idx in self._normalize_production_line_current_group(current_group_map).items():
+            self._core.production_line_current_group[line] = core_group_idx
+            self._core.production_line_completed_tasks.setdefault(line, set())
+            self._core.production_line_group_completion_times.setdefault(line, [])
+            print(
+                f"[WarehouseService] 产线 {line} 当前组同步为 core={core_group_idx}, public={core_group_idx + 1}"
+            )
+
+    def _normalize_current_groups(self, current_groups: Any) -> Dict[int, int]:
+        if not current_groups:
+            return {}
+
+        if isinstance(current_groups, dict):
+            iterable = current_groups.items()
+        else:
+            if isinstance(current_groups, (str, bytes)) or not hasattr(current_groups, "__iter__"):
+                raise ValueError("currentGroups must be a dict like {'LINE-1': 1} or a list of {lineId, currentGroup}")
+            iterable = []
+            for item in current_groups:
+                line_id = self._get_value(item, "lineId")
+                group_number = self._get_value(item, "currentGroup")
+                if group_number is None:
+                    group_number = self._get_value(item, "group")
+                if group_number is None:
+                    group_number = self._get_value(item, "planIndex")
+                iterable.append((line_id, group_number))
+
+        normalized: Dict[int, int] = {}
+        for line_id, public_group in iterable:
+            if line_id is None or public_group is None:
+                raise ValueError("currentGroups entries must include lineId and currentGroup")
+            line = self._line_id_to_int(line_id)
+            public_group_int = int(public_group)
+            if public_group_int < 1:
+                raise ValueError("currentGroups uses public 1-based group numbers; values must be >= 1")
+            core_group_idx = public_group_int - 1
+            total_groups = len((getattr(self._core, "production_plan", {}) or {}).get(line, []))
+            if total_groups and core_group_idx > total_groups:
+                raise ValueError(
+                    f"currentGroups line {line} points to public group {public_group_int}, "
+                    f"but the plan only has {total_groups} groups"
+                )
+            normalized[line] = core_group_idx
+        return normalized
+
+    def apply_current_groups(self, current_groups: Any) -> None:
+        for line, core_group_idx in self._normalize_current_groups(current_groups).items():
+            self._core.production_line_current_group[line] = core_group_idx
+            self._core.production_line_completed_tasks.setdefault(line, set())
+            self._core.production_line_group_completion_times.setdefault(line, [])
+            print(
+                f"[WarehouseService] 产线 {line} 当前组同步为 public={core_group_idx + 1}, core={core_group_idx}"
+            )
+
+    def apply_inline_schedule_plan(self, schedule_request: Any) -> bool:
+        inline_plan = self._get_value(schedule_request, "productionPlan")
+        if inline_plan is None and self._get_value(schedule_request, "plans") is not None:
+            inline_plan = schedule_request
+
+        current_groups = self._get_value(schedule_request, "currentGroups")
+        production_line_current_group = self._get_value(schedule_request, "productionLineCurrentGroup")
+        if inline_plan is None and current_groups is None and not production_line_current_group:
+            return True
+
+        if inline_plan is not None:
+            payload = self._build_production_plan_payload(inline_plan)
+            operation_type = self._get_value(inline_plan, "operationType")
+            operation_value = str(getattr(operation_type, "value", operation_type or "UPDATE")).upper()
+            # Inline mixed requests usually send the complete latest plan; preserve ADD merge compatibility.
+            replace_existing = operation_value != "ADD"
+            if not self.set_production_plan(payload, update=replace_existing):
+                return False
+
+        if current_groups is not None:
+            self.apply_current_groups(current_groups)
+        elif production_line_current_group:
+            self.apply_production_line_current_group(production_line_current_group)
+
+        return True
+
+    def _build_bom_snapshot(self) -> Dict[str, Any]:
+        config_data = getattr(self._core, "config_data", {}) or {}
+        return {
+            "sku_types": list(deepcopy(config_data.get("sku_types", []) or [])),
+            "sku_to_production_line": dict(deepcopy(config_data.get("sku_to_production_line", {}) or {})),
+        }
+
+    def _get_known_sku_ids(self) -> set:
+        static_config = getattr(self, "_bom_config_snapshot", {}) or {}
+        known = set(static_config.get("sku_types", []) or [])
+        known.update((static_config.get("sku_to_production_line", {}) or {}).keys())
+        return known
+
+    def find_invalid_skus(self, tasks: List[Any], task_types: Optional[List[str]] = None) -> Dict[str, List[str]]:
+        known_skus = self._get_known_sku_ids()
+        invalid_skus: set = set()
+        task_ids: List[str] = []
+        task_types_upper = {str(t).upper() for t in task_types} if task_types else None
+
+        for task in tasks:
+            task_id = task.taskId if hasattr(task, "taskId") else task.get("taskId")
+            if hasattr(task, "taskType"):
+                task_type = getattr(task, "taskType")
+            elif isinstance(task, dict):
+                task_type = task.get("taskType")
+            else:
+                task_type = None
+
+            task_type_value = getattr(task_type, "value", task_type)
+            if task_types_upper is not None and task_type_value is not None and str(task_type_value).upper() not in task_types_upper:
+                continue
+            skus = task.skus if hasattr(task, "skus") else task.get("skus", [])
+            task_invalid = False
+            for sku in skus:
+                sku_dict = self._sku_entry_to_dict(sku)
+                sku_id = sku_dict.get("skuId") or sku_dict.get("sku")
+                quantity = sku_dict.get("quantity", 1)
+                if sku_id and quantity > 0 and sku_id not in known_skus:
+                    invalid_skus.add(sku_id)
+                    task_invalid = True
+            if task_invalid and task_id:
+                task_ids.append(task_id)
+
+        return {
+            "invalidSkus": sorted(invalid_skus),
+            "taskIds": task_ids,
+        }
     
     def _external_to_internal_row(self, external_row: int, aisle: int) -> int:
         """
@@ -264,6 +483,30 @@ class WarehouseService:
                 continue
             
             # 更新货位状态
+            # IMPORTANT: incremental sync must support clearing (moves/relocation/adjustments).
+            # For the touched slot+shelf we treat the payload as the source of truth.
+            if position.is_double_layer:
+                shelf_str = str(shelf).upper() if shelf else ""
+                if "UPPER" in shelf_str:
+                    position.upper_sku = None
+                    position.upper_quantity = 0
+                    position.upper_attrs = {}
+                elif "LOWER" in shelf_str:
+                    position.lower_sku = None
+                    position.lower_quantity = 0
+                    position.lower_attrs = {}
+                else:
+                    position.upper_sku = None
+                    position.upper_quantity = 0
+                    position.upper_attrs = {}
+                    position.lower_sku = None
+                    position.lower_quantity = 0
+                    position.lower_attrs = {}
+            else:
+                position.sku = None
+                position.quantity = 0
+                position.sku_attrs = {}
+
             for pos_data in (positions_data or []):
                 sku_dict = self._sku_entry_to_dict(pos_data)
                 sku_id = sku_dict.get('skuId')
@@ -275,12 +518,12 @@ class WarehouseService:
                 
                 # 更新货位
                 if position.is_double_layer:
-                    shelf_str = str(shelf).upper() if shelf else None
-                    if shelf_str and "UPPER" in shelf_str:
+                    shelf_str = str(shelf).upper() if shelf else ""
+                    if "UPPER" in shelf_str:
                         position.upper_sku = sku_id
                         position.upper_quantity = quantity
                         position.upper_attrs = sku_attrs
-                    elif shelf_str and "LOWER" in shelf_str:
+                    elif "LOWER" in shelf_str:
                         position.lower_sku = sku_id
                         position.lower_quantity = quantity
                         position.lower_attrs = sku_attrs
@@ -300,24 +543,15 @@ class WarehouseService:
                     position.sku_attrs = sku_attrs
                 
                 # 更新current_inventory统计（动态添加新SKU）
-                if aisle_id not in self._core.inventory_manager.current_inventory:
-                    self._core.inventory_manager.current_inventory[aisle_id] = {}
-                if sku_id not in self._core.inventory_manager.current_inventory[aisle_id]:
-                    self._core.inventory_manager.current_inventory[aisle_id][sku_id] = 0
-                self._core.inventory_manager.current_inventory[aisle_id][sku_id] += quantity
                 
                 # 更新SKU位置索引（动态添加新SKU）
-                if sku_id not in self._core.inventory_manager.sku_position_index:
-                    self._core.inventory_manager.sku_position_index[sku_id] = []
-                if position not in self._core.inventory_manager.sku_position_index[sku_id]:
-                    self._core.inventory_manager.sku_position_index[sku_id].append(position)
                 
                 # 如果是新SKU，添加到sku_types列表
-                if sku_id not in self._core.sku_types:
-                    self._core.sku_types.append(sku_id)
-                    self._core.inventory_manager.sku_types.append(sku_id)
         
         # 输出同步结果统计
+        # Rebuild derived indexes/counters based on authoritative slot state.
+        self._rebuild_inventory_indexes()
+
         total_beams = sum(
             sum(skus.values()) 
             for skus in self._core.inventory_manager.current_inventory.values()
@@ -325,6 +559,55 @@ class WarehouseService:
         mode = "全量重置" if is_full_reset else "增量更新"
         print(f"[WarehouseService] 库存同步完成 ({mode})，总梁数: {total_beams}")
     
+    def _rebuild_inventory_indexes(self) -> None:
+        """
+        Rebuild `current_inventory` and `sku_position_index` from the authoritative slot state.
+
+        This makes incremental inventory updates support clears/moves while keeping counters consistent.
+        """
+        current_inventory: Dict[int, Dict[str, int]] = {}
+        sku_position_index: Dict[str, List[InventoryPosition]] = {}
+        seen_skus: set[str] = set()
+
+        for position in self._core.inventory_manager.inventory_positions:
+            aisle_id = int(position.aisle)
+            if aisle_id not in current_inventory:
+                current_inventory[aisle_id] = {}
+
+            if getattr(position, "is_double_layer", False):
+                for sku_id, qty in (
+                    (getattr(position, "upper_sku", None), getattr(position, "upper_quantity", 0)),
+                    (getattr(position, "lower_sku", None), getattr(position, "lower_quantity", 0)),
+                ):
+                    if not sku_id or qty <= 0:
+                        continue
+                    sku_id_s = str(sku_id)
+                    seen_skus.add(sku_id_s)
+                    current_inventory[aisle_id][sku_id_s] = current_inventory[aisle_id].get(sku_id_s, 0) + int(qty)
+                    sku_position_index.setdefault(sku_id_s, [])
+                    if position not in sku_position_index[sku_id_s]:
+                        sku_position_index[sku_id_s].append(position)
+            else:
+                sku_id = getattr(position, "sku", None)
+                qty = getattr(position, "quantity", 0)
+                if sku_id and qty > 0:
+                    sku_id_s = str(sku_id)
+                    seen_skus.add(sku_id_s)
+                    current_inventory[aisle_id][sku_id_s] = current_inventory[aisle_id].get(sku_id_s, 0) + int(qty)
+                    sku_position_index.setdefault(sku_id_s, [])
+                    if position not in sku_position_index[sku_id_s]:
+                        sku_position_index[sku_id_s].append(position)
+
+        self._core.inventory_manager.current_inventory = current_inventory
+        self._core.inventory_manager.sku_position_index = sku_position_index
+
+        # Ensure sku_types contains any dynamically introduced SKU IDs.
+        for sku_id_s in sorted(seen_skus):
+            if sku_id_s not in self._core.sku_types:
+                self._core.sku_types.append(sku_id_s)
+            if sku_id_s not in self._core.inventory_manager.sku_types:
+                self._core.inventory_manager.sku_types.append(sku_id_s)
+
     def _clear_all_inventory(self) -> None:
         """
         清空所有库存数据和相关任务状态
@@ -409,7 +692,7 @@ class WarehouseService:
                 sku_dict['skuId'] = sku_id
                 sku_dict['quantity'] = quantity
                 sku_list.append(sku_dict)
-            
+
             if "INBOUND" in str(task_type).upper():
                 # 入库任务
                 target_aisle = task.targetAisle if hasattr(task, 'targetAisle') else task.get('targetAisle')
@@ -432,17 +715,20 @@ class WarehouseService:
                 # 确定产线
                 production_line = None
                 if plan_id:
+                    mapped_line = self._plan_id_to_line.get(str(plan_id))
+                    if mapped_line is not None:
+                        production_line = mapped_line
                     # 尝试从plan_id中提取产线信息
                     # 支持格式: "PLAN-LINE1", "LINE-1", "1"
                     try:
                         plan_str = str(plan_id).upper()
-                        if "LINE" in plan_str:
+                        if production_line is None and "LINE" in plan_str:
                             # 提取LINE后面的数字
                             import re
                             match = re.search(r'LINE[-]?(\d+)', plan_str)
                             if match:
                                 production_line = int(match.group(1))
-                        elif plan_id.isdigit():
+                        elif production_line is None and str(plan_id).isdigit():
                             production_line = int(plan_id)
                     except:
                         pass
@@ -466,7 +752,8 @@ class WarehouseService:
                 )
                 # 存储额外信息
                 task_data.plan_id = plan_id
-                task_data.group_idx = plan_index
+                task_data.plan_index_public = plan_index
+                task_data.group_idx = int(plan_index) - 1 if plan_index is not None else None
                 
                 outbound_tasks.append(task_data)
         
@@ -499,20 +786,42 @@ class WarehouseService:
         Returns:
             Dict[int, TaskData]: 各巷道分配的任务 {aisle_id: task_data}
         """
+        result, _matched = self.execute_schedule_with_preview(tasks)
+        return result
+
+    def execute_schedule_with_preview(
+        self, tasks: Tuple[List[TaskData], List[TaskData]]
+    ) -> Tuple[Dict[int, Optional[TaskData]], Dict[int, List[TaskData]]]:
+        """
+        执行混合调度，并返回“匹配预览”信息。
+
+        Returns:
+            (result, matched_by_aisle)
+            - result: {aisle_id: assigned_task_or_running_task_or_none}
+            - matched_by_aisle: {aisle_id: [matched_task, ...]} (includes tasks that are matched but not dispatchable yet)
+        """
         self._sync_time()
         inbound_tasks, outbound_tasks = tasks
         
         print(f"[WarehouseService] 执行调度决策，入库任务: {len(inbound_tasks)}，出库任务: {len(outbound_tasks)}")
         
         # 1. 为出库任务查找库存货位并设置positions 
-        task_with_positions = []
+        task_with_positions: List[TaskData] = []
+        matched_by_aisle: Dict[int, List[TaskData]] = {}
         for task in outbound_tasks:
             if not getattr(task, 'positions', None):
                 positions = self._find_positions_for_outbound_task(task)
                 if not positions:
                     print(f"[WarehouseService] 警告: 出库任务 {task.task_id} 未找到匹配的库存货位")
                 else:
+                    task.positions = positions
                     task_with_positions.append(task)
+                    try:
+                        aisle = int(getattr(positions[0], "aisle", 0) or 0)
+                    except Exception:
+                        aisle = 0
+                    if aisle:
+                        matched_by_aisle.setdefault(aisle, []).append(task)
         
         # 2. 将入库任务添加到等待队列（只添加到可用巷道）
         for task in inbound_tasks:
@@ -561,51 +870,82 @@ class WarehouseService:
         result: Dict[int, Optional[TaskData]] = {}
         
         # 获取当前忙碌的巷道
-        busy_aisles = set()
-        for t in self._core.running_tasks.values():
-            if t.assigned_aisle:
-                busy_aisles.add(t.assigned_aisle)
         
         for aisle in self._core.aisles:
             # 检查巷道可用性
             if not self.is_aisle_available(aisle):
                 result[aisle] = None
                 continue
+
+            # 如果该巷道已有正在执行的任务，返回执行中的任务作为 assignedTask，
+            # 新任务仅做匹配预览（matchedTasks），不在此时下发。
+            running_task = None
+            for t in self._core.running_tasks.values():
+                if getattr(t, "assigned_aisle", None) == aisle:
+                    running_task = t
+                    break
+            if running_task is not None:
+                result[aisle] = running_task
+                continue
             
             # 检查巷道是否忙碌
-            if aisle in busy_aisles:
-                # 返回正在运行的任务
-                for task in self._core.running_tasks.values():
-                    if task.assigned_aisle == aisle:
-                        result[aisle] = task
-                        break
-                continue
             
             # 获取调度器分配给该巷道的任务
             sequence = aisle_task_sequences.get(aisle, [])
+            used_fallback = False
+            if sequence and all(t.task_id in self._core.running_tasks for t in sequence):
+                for pending_task in task_with_positions:
+                    positions = getattr(pending_task, "positions", None) or []
+                    if positions and str(positions[0].aisle) == str(aisle):
+                        sequence = [pending_task]
+                        used_fallback = True
+                        break
             if not sequence:
-                result[aisle] = None
-                continue
-            
-            task = sequence[0]
-            
-            # 检查出库任务的约束条件
-            if task.task_type == TASK_TYPE_OUTBOUND and task.production_line is not None:
-                # 检查阻塞状态
-                if self._core.check_blockage(aisle, task.production_line, current_time=self._core.current_time):
-                    print(f"[WarehouseService] 出库任务 {task.task_id} 巷道 {aisle} 产线 {task.production_line} 被阻塞")
+                fallback_task = None
+                for pending_task in task_with_positions:
+                    positions = getattr(pending_task, "positions", None) or []
+                    if positions and str(positions[0].aisle) == str(aisle):
+                        fallback_task = pending_task
+                        break
+                if fallback_task is None:
+                    for pending_task in self._core.pending_inbound_by_aisle.get(aisle, []):
+                        if getattr(pending_task, "positions", None):
+                            fallback_task = pending_task
+                            break
+                if fallback_task is None:
                     result[aisle] = None
+                    for running_task in self._core.running_tasks.values():
+                        if running_task.assigned_aisle == aisle:
+                            result[aisle] = running_task
+                            break
                     continue
-                
-                # 检查组顺序约束
-                if not self._core.can_start_outbound_task(task.task_id, task.production_line):
-                    print(f"[WarehouseService] 出库任务 {task.task_id} 组顺序约束未满足")
-                    result[aisle] = None
-                    continue
+                sequence = [fallback_task]
+                used_fallback = True
             
-            # 确保任务有positions
-            if not getattr(task, 'positions', None):
-                print(f"[WarehouseService] 任务 {task.task_id} 没有positions，跳过")
+            # 从序列中挑选第一个“可以下发”的任务（序列可能包含已匹配但暂不可启动的任务）。
+            task = None
+            for candidate in sequence:
+                # 出库任务的约束条件
+                if candidate.task_type == TASK_TYPE_OUTBOUND and candidate.production_line is not None:
+                    # 阻塞状态
+                    if self._core.check_blockage(aisle, candidate.production_line, current_time=self._core.current_time):
+                        continue
+                    # 组顺序约束
+                    if not self._core.can_start_outbound_task(
+                        candidate.task_id,
+                        candidate.production_line,
+                        getattr(candidate, "group_idx", None),
+                    ):
+                        continue
+
+                # 确保任务有positions
+                if not getattr(candidate, 'positions', None):
+                    continue
+
+                task = candidate
+                break
+
+            if task is None:
                 result[aisle] = None
                 continue
             
@@ -624,8 +964,8 @@ class WarehouseService:
         # 输出调度结果统计
         assigned_count = sum(1 for t in result.values() if t is not None)
         print(f"[WarehouseService] 调度完成，分配了 {assigned_count} 个任务")
-        
-        return result
+
+        return result, matched_by_aisle
     
     def _find_positions_for_outbound_task(self, task: TaskData) -> Optional[List[InventoryPosition]]:
         """
@@ -678,13 +1018,6 @@ class WarehouseService:
             print(f"[WarehouseService] SKU {sku} 找到 {len(positions)} 个可用位置")
             
             for pos in positions:
-                # 检查巷道可用性和阻塞状态
-                if not self.is_aisle_available(pos.aisle):
-                    print(f"[WarehouseService] 巷道 {pos.aisle} 不可用")
-                    continue
-                if self._core.check_blockage(pos.aisle, production_line, current_time=self._core.current_time):
-                    print(f"[WarehouseService] 巷道 {pos.aisle} 产线 {production_line} 被阻塞")
-                    continue
                 print(f"[WarehouseService] 选择位置: {pos.get_position_id()}")
                 return [pos]
         
@@ -699,11 +1032,6 @@ class WarehouseService:
                     and pos.matches_pair(sku1, attrs1, sku2, attrs2, self._core.match_fields)
                     and pos.upper_quantity > 0
                     and pos.lower_quantity > 0):
-                    # 检查巷道可用性和阻塞状态
-                    if not self.is_aisle_available(pos.aisle):
-                        continue
-                    if self._core.check_blockage(pos.aisle, production_line, current_time=self._core.current_time):
-                        continue
                     print(f"[WarehouseService] 找到配对位置: {pos.get_position_id()}")
                     return [pos]
                         
@@ -1051,6 +1379,25 @@ class WarehouseService:
         self._sync_time()
         
         try:
+            if not update and isinstance(production_plan, dict) and "production_plan" in production_plan:
+                merged_plan = {
+                    int(line_id): deepcopy(groups)
+                    for line_id, groups in (getattr(self._core, "production_plan", {}) or {}).items()
+                    if groups
+                }
+                for line_id, groups in (production_plan.get("production_plan") or {}).items():
+                    merged_plan[int(line_id)] = groups
+
+                merged_attrs = deepcopy(getattr(self._core, "production_plan_attrs", {}) or {})
+                for field, by_line in (production_plan.get("production_plan_attrs") or {}).items():
+                    merged_attrs.setdefault(field, {})
+                    for line_id, attrs in by_line.items():
+                        merged_attrs[field][int(line_id)] = attrs
+
+                production_plan = {
+                    "production_plan": merged_plan,
+                    "production_plan_attrs": merged_attrs,
+                }
             self._core.set_production_plan(production_plan)
             return True
         except Exception as e:
@@ -1078,6 +1425,10 @@ class WarehouseService:
             },
             'outbound': list(self._core.pending_outbound_queue)
         }
+
+    def get_last_matched_tasks_by_aisle(self) -> Dict[int, List[TaskData]]:
+        """获取上一次调度请求的匹配预览结果（仅用于API返回）。"""
+        return {aisle: list(tasks) for aisle, tasks in (self._last_matched_tasks_by_aisle or {}).items()}
     
     def get_completed_tasks(self) -> List[TaskData]:
         """获取已完成的任务"""
@@ -1209,6 +1560,7 @@ class WarehouseService:
             self._core.sku_to_production_line = config_data["sku_to_production_line"]
             self._core.sku_pairs = config_data["sku_pairs"]
             self._core.sku_solo = config_data["sku_solo"]
+            self._bom_config_snapshot = self._build_bom_snapshot()
 
             # 关键：入库巷道/货位分配器（如 ProposedAisleAllocator / ProposedPositionAllocator）
             # 在初始化时会缓存 sku_pairs/sku_solo；BOM update 若只替换 core 引用，
@@ -1263,4 +1615,3 @@ def reset_warehouse_service():
     """重置仓库服务（用于测试）"""
     global _warehouse_service
     _warehouse_service = None
-

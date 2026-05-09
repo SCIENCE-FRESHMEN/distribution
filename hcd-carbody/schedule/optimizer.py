@@ -13,7 +13,7 @@ import random
 class OptimizationScheduler:
     """基于采样优化的调度器"""
     
-    def __init__(self, warehouse_core, num_samples=500, num_evaluate=20):
+    def __init__(self, warehouse_core, num_samples=100, num_evaluate=20):
         """
         Args:
             warehouse_core: WarehouseCore实例
@@ -99,10 +99,7 @@ class OptimizationScheduler:
         )
         
         if not solutions:
-            print("[优化器]警告：未能生成任何可行方案，返回空方案")
             return {aisle: [] for aisle in self.aisles}
-        
-        print(f"[优化器]成功生成{len(solutions)}个不同的候选方案")
         
         # 5. 根据max_tasks进行加权采样，选择方案进行评分
         best_solution = self._evaluate_and_select_best(solutions, heuristic_solution, heuristic_future_ready)
@@ -125,6 +122,15 @@ class OptimizationScheduler:
         return best_solution if best_solution else {aisle: [] for aisle in self.aisles}
 
     def _is_high_priority_empty_outbound(self, task: TaskData) -> bool:
+        """
+        检查任务是否是高优先级的空托盘出库任务
+        
+        Args:
+            task: 任务数据
+            
+        Returns:
+            bool: 是否为高优先级空托盘出库任务
+        """
         rec = getattr(task, "task_record", {}) or {}
         return bool(rec.get("empty_skid_request")) and bool(rec.get("high_priority"))
 
@@ -570,7 +576,7 @@ class OptimizationScheduler:
                 outbound_idx += 1
                 continue
 
-            # 两侧都有时，保持原先“偏向入库(0.8)”策略
+            # 两侧都有时，保持原先"偏向入库(0.8)"策略
             if random.random() < 0.8:
                 mixed_tasks_list.append(other_inbound_tasks_list[inbound_idx])
                 inbound_idx += 1
@@ -702,7 +708,7 @@ class OptimizationScheduler:
         # 计算采样权重：以巷道负载为基准，加上产线进度与future_ready的偏好
         max_tasks_values = [max_tasks for _, max_tasks in solutions_list]
 
-        # 预先计算每个方案的“优先产线”得分与产线进度平衡度，便于加权
+        # 预先计算每个方案的"优先产线"得分与产线进度平衡度，便于加权
         # 优先产线得分：按方案中出库任务所属产线累计 heuristic_future_ready 的值，鼓励让可连续执行更多任务的产线先被推进
         line_priority_scores = []
         line_balance_scores = []
@@ -778,7 +784,6 @@ class OptimizationScheduler:
             
             selected_solutions.extend(additional_solutions)
         
-        print(f"[优化器]其中前{top_5_count}个为评分最高的方案，额外随机选择{len(selected_solutions) - top_5_count}个方案")
         
         # 评分并选择最优
         best_score = float('inf')
@@ -797,18 +802,18 @@ class OptimizationScheduler:
             if all(len(tasks) == 0 for tasks in solution.values()):
                 empty_penalty = 10000.0
                 score += empty_penalty
-            self._log_score_breakdown(
-                tag=f"sample#{idx_eval}",
-                base_score=base_score,
-                score_details=score_details,
-                line_progress_balance_score=line_progress_balance_score,
-                empty_penalty=empty_penalty,
-                final_score=score,
-            )
+            # self._log_score_breakdown(
+            #     tag=f"sample#{idx_eval}",
+            #     base_score=base_score,
+            #     score_details=score_details,
+            #     line_progress_balance_score=line_progress_balance_score,
+            #     empty_penalty=empty_penalty,
+            #     final_score=score,
+            # )
             if score < best_score:
                 best_score = score
                 best_solution = solution
-        
+
     #    heuristic_base_score, heuristic_details = self.warehouse_core.get_sol_score(heuristic_solution)
     #    heuristic_line_progress_balance = self._calculate_line_progress_balance_score(heuristic_solution)
     #    heuristic_empty_penalty = 10000.0 if all(len(tasks) == 0 for tasks in heuristic_solution.values()) else 0.0
@@ -827,7 +832,6 @@ class OptimizationScheduler:
     #        best_solution = heuristic_solution
     #        print(f"heuristic_solution is better than selected_solutions, + {score_diff:.2f}")
         
-        print(f"[优化器]最优方案得分: {best_score:.2f}, 最优方案:{best_solution}")
         
         return best_solution
     

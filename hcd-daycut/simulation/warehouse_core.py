@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from copy import deepcopy
 from typing import Dict, List, Tuple, Optional, Any
+from config_loader import load_jsonc
 from .task_data import TaskData
 from .inventory import InventoryManager
 from .metrics import MetricsCalculator
@@ -43,7 +44,7 @@ def load_warehouse_config(path: Optional[str]) -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        return load_jsonc(p)
     except Exception:
         return {}
 
@@ -125,6 +126,8 @@ class WarehouseCore:
         self.production_line_balance_weight = float(cfg.get("production_line_balance_weight", 0.3))
         self.aisle_dispersion_weight = float(cfg.get("aisle_dispersion_weight", 0.3))
         self.inbound_wait_weight = float(cfg.get("inbound_wait_weight", 0.01))
+        self.outbound_choice_bonus_weight = float(cfg.get("outbound_choice_bonus_weight", 0.2))
+        self.outbound_fifo_enabled = bool(cfg.get("outbound_fifo_enabled", False))
         
         # 左右库定义
         mid_point = len(self.aisles) // 2
@@ -517,7 +520,13 @@ class WarehouseCore:
         # 巷道分配
         assigned_aisle = None
         if self.inbound_aisle_allocator is not None:
-            assigned_aisle = self.inbound_aisle_allocator.allocate({'skus': skus}, self.inventory_manager.inventory_positions)
+            assigned_aisle = self.inbound_aisle_allocator.allocate(
+                {
+                    'skus': skus,
+                    'production_line': valid_production_lines or ([production_line] if production_line is not None else [])
+                },
+                self.inventory_manager.inventory_positions,
+            )
         
         # 如果分配器返回None或未设置分配器，则使用默认策略
         if assigned_aisle is None:
@@ -655,6 +664,7 @@ class WarehouseCore:
                             if sku_id is None:
                                 continue
                             sku_attrs = {k: sku_entry.get(k) for k in self.match_fields} if self.match_fields else {}
+                            sku_attrs["_inbound_time"] = current_time
                             pos = task.positions[min(non_null_idx, len(task.positions)-1)]
                             try:
                                 # 如果是双层货位且任务有多个SKU，将SKU分配到不同层
@@ -796,6 +806,7 @@ class WarehouseCore:
                         cp = last_pos
                     self.current_position_by_aisle[aisle] = cp
             self.relocation_task_ids.discard(task_id)
+            self._release_reserved_positions_for_task(task_id)
             # 记录完成
             self.completed_tasks.append(task)
             # 完成后尝试派发（非仿真模式）
@@ -857,6 +868,126 @@ class WarehouseCore:
             else:
                 entries.append(str(entry))
         return f" SKUs=[{', '.join(entries)}]" if entries else ""
+
+    def _get_empty_slots_by_aisle(self) -> Dict[int, int]:
+        """统计各巷道当前仍可继续入库的位置数。"""
+        empty_slots_by_aisle = {aisle: 0 for aisle in self.aisles}
+        for pos in self.inventory_manager.inventory_positions:
+            try:
+                if pos.is_empty():
+                    empty_slots_by_aisle[pos.aisle] = empty_slots_by_aisle.get(pos.aisle, 0) + 1
+            except Exception:
+                continue
+        return empty_slots_by_aisle
+
+    def _get_position_sku_quantity(self, pos: InventoryPosition, sku_id: str) -> int:
+        """统计单个货位中指定 SKU 的数量。"""
+        qty = 0
+        try:
+            if getattr(pos, "is_double_layer", False):
+                if getattr(pos, "upper_sku", None) == sku_id:
+                    qty += int(getattr(pos, "upper_quantity", 0) or 0)
+                if getattr(pos, "lower_sku", None) == sku_id:
+                    qty += int(getattr(pos, "lower_quantity", 0) or 0)
+            else:
+                if getattr(pos, "sku", None) == sku_id:
+                    qty += int(getattr(pos, "quantity", 0) or 0)
+        except Exception:
+            return 0
+        return qty
+
+    def get_inbound_allocation_context(self, task_info: Any, inventory_positions: Optional[List[Any]] = None) -> Dict[str, Any]:
+        """构造入库分配阶段的日志上下文。"""
+        positions = inventory_positions if inventory_positions is not None else self.inventory_manager.inventory_positions
+        skus_data = task_info.skus if hasattr(task_info, "skus") else task_info.get("skus", []) if isinstance(task_info, dict) else []
+
+        sku_ids: List[str] = []
+        for entry in skus_data or []:
+            if isinstance(entry, dict):
+                sku_id = entry.get("skuId")
+            else:
+                sku_id = getattr(entry, "skuId", None)
+            if sku_id and sku_id not in sku_ids:
+                sku_ids.append(sku_id)
+
+        sku_qty_by_aisle: Dict[str, Dict[int, int]] = {}
+        mate_qty_by_aisle: Dict[str, Dict[int, int]] = {}
+        solo_skus: List[str] = []
+
+        for sku_id in sku_ids:
+            sku_qty_by_aisle[sku_id] = {aisle: 0 for aisle in self.aisles}
+            mate = self.sku_pairs.get(sku_id)
+            is_solo = sku_id in self.sku_solo or not mate or mate == sku_id
+            if is_solo:
+                solo_skus.append(sku_id)
+            else:
+                mate_qty_by_aisle[sku_id] = {aisle: 0 for aisle in self.aisles}
+
+        for pos in positions or []:
+            aisle = getattr(pos, "aisle", None)
+            if aisle not in self.aisles:
+                continue
+            for sku_id in sku_ids:
+                sku_qty_by_aisle[sku_id][aisle] += self._get_position_sku_quantity(pos, sku_id)
+                mate = self.sku_pairs.get(sku_id)
+                if sku_id in mate_qty_by_aisle and mate:
+                    mate_qty_by_aisle[sku_id][aisle] += self._get_position_sku_quantity(pos, mate)
+
+        return {
+            "sku_qty_by_aisle": sku_qty_by_aisle,
+            "mate_qty_by_aisle": mate_qty_by_aisle,
+            "solo_skus": solo_skus,
+        }
+
+    def _get_task_qty_by_aisle(
+        self,
+        task: Optional[TaskData]
+    ) -> Tuple[Dict[str, int], Dict[int, int]]:
+        """统计当前任务的SKU需求，以及各巷道相关库存总量。"""
+        demand_by_sku: Dict[str, int] = {}
+        qty_by_aisle = {aisle: 0 for aisle in self.aisles}
+        if task is None:
+            return demand_by_sku, qty_by_aisle
+        for sku_entry in (getattr(task, "skus", None) or []):
+            sku_id = sku_entry.get("skuId") if isinstance(sku_entry, dict) else None
+            qty = sku_entry.get("quantity", 1) if isinstance(sku_entry, dict) else 1
+            if sku_id:
+                demand_by_sku[sku_id] = demand_by_sku.get(sku_id, 0) + int(qty or 1)
+
+        for aisle in self.aisles:
+            aisle_inventory = self.inventory_manager.current_inventory.get(aisle, {})
+            qty_by_aisle[aisle] = sum(aisle_inventory.get(sku, 0) for sku in demand_by_sku)
+        return demand_by_sku, qty_by_aisle
+
+    def _get_task_paired_positions_by_aisle(self, task: TaskData) -> Tuple[Dict[int, int], Dict[int, List[str]]]:
+        """统计当前任务在各巷道中已配对可直接出库的位置数。"""
+        paired_positions_by_aisle = {aisle: 0 for aisle in self.aisles}
+        paired_position_ids_by_aisle = {aisle: [] for aisle in self.aisles}
+        sku_ids = task.get_sku_ids() if task else []
+        if len(sku_ids) != 2:
+            return paired_positions_by_aisle, paired_position_ids_by_aisle
+
+        attrs_map = self._task_attrs_map(task)
+        sku1, sku2 = sku_ids
+        attrs1 = attrs_map.get(sku1, {})
+        attrs2 = attrs_map.get(sku2, {})
+        for pos in self.inventory_manager.inventory_positions:
+            try:
+                if not getattr(pos, "is_double_layer", False):
+                    continue
+                if not pos.matches_pair(sku1, attrs1, sku2, attrs2, self.match_fields):
+                    continue
+                if not (
+                    getattr(pos, "upper_quantity", 0) > 0
+                    and getattr(pos, "lower_quantity", 0) > 0
+                ):
+                    continue
+                aisle = pos.aisle
+                paired_positions_by_aisle[aisle] += 1
+                paired_position_ids_by_aisle[aisle].append(pos.get_position_id())
+            except Exception:
+                continue
+        return paired_positions_by_aisle, paired_position_ids_by_aisle
 
     def decide_for_idle_aisles(self, current_time: float) -> List[Event]:
         """为所有空闲巷道决策下一任务（入/出库），返回产生的任务完成事件列表"""
@@ -938,7 +1069,9 @@ class WarehouseCore:
                     attrs_map = self._task_attrs_map(task_info)
                     attrs1 = attrs_map.get(sku1, {})
                     attrs2 = attrs_map.get(sku2, {})
-                    paired_position, sku1_positions, sku2_positions = self._check_sku_pairing_status(sku1, sku2, attrs1, attrs2)
+                    paired_position, sku1_positions, sku2_positions = self._check_sku_pairing_status(
+                        sku1, sku2, attrs1, attrs2, task_id=task_id
+                    )
                     if paired_position is None:
                         self._perform_relocation_if_needed(
                             task_id, production_line, sku1, sku2, sku1_positions, sku2_positions, attrs1, attrs2
@@ -947,7 +1080,7 @@ class WarehouseCore:
                 if self.check_blockage(aisle, production_line, current_time=current_time):
                     continue
                 # 检查产线组的顺序约束（前面的组是否完成）
-                if not self.can_start_outbound_task(task_id, production_line):
+                if not self.can_start_outbound_task(task_id, production_line, getattr(task_info, "group_idx", None)):
                     continue
 
             task_info.task_record = self.generate_task_record(task_info, current_time)
@@ -955,10 +1088,33 @@ class WarehouseCore:
             # 添加到运行任务字典
             self.running_tasks[task_id] = task_info
 
+            # 实时打印任务（含额外属性）
+            sku_info = self._format_task_skus(task_info)
+            pos_info = ""
+            if getattr(task_info, "positions", None):
+                pos_ids = [p.get_position_id() for p in task_info.positions]
+                pos_info = f" positions={pos_ids}"
+            if task_type == TASK_TYPE_INBOUND:
+                print(f"[dispatch][inbound_context] empty_slots_by_aisle={self._get_empty_slots_by_aisle()}")
+            elif task_type == TASK_TYPE_OUTBOUND:
+                task_demand, task_qty_by_aisle = self._get_task_qty_by_aisle(task_info)
+                task_paired_positions_by_aisle, task_paired_position_ids_by_aisle = (
+                    self._get_task_paired_positions_by_aisle(task_info)
+                )
+                print(
+                    f"[dispatch][outbound_context] current_task_demand={task_demand} "
+                    f"current_task_qty_by_aisle={task_qty_by_aisle} "
+                    f"task_paired_positions_by_aisle={task_paired_positions_by_aisle} "
+                    f"task_paired_position_ids_by_aisle={task_paired_position_ids_by_aisle}"
+                )
+            print(
+                f"[dispatch] {task_type} task={task_id} aisle={aisle} pl={production_line}{sku_info}{pos_info}"
+            )
+
             # 从等待队列中移除已开工的任务
             if task_type == TASK_TYPE_OUTBOUND:
                 self.pending_outbound_queue = [t for t in self.pending_outbound_queue if t.task_id != task_id]
-                # 出库：立即扣减库存
+                # 出库：日志打印后再扣减库存，保证上下文反映派发前快照
                 sku_ids_list = [s.get('skuId', None) for s in task_info.skus if 'skuId']
                 for idx, sku in enumerate(sku_ids_list):
                     pos = task_info.positions[min(idx, len(task_info.positions) - 1)]
@@ -969,16 +1125,6 @@ class WarehouseCore:
             else:
                 # 入库：在该巷道的等待队列中删除对应task_id
                 self.pending_inbound_by_aisle[aisle] = [t for t in self.pending_inbound_by_aisle[aisle] if t.task_id != task_id]
-
-            # 实时打印任务（含额外属性）
-            sku_info = self._format_task_skus(task_info)
-            pos_info = ""
-            if getattr(task_info, "positions", None):
-                pos_ids = [p.get_position_id() for p in task_info.positions]
-                pos_info = f" positions={pos_ids}"
-            print(
-                f"[dispatch] {task_type} task={task_id} aisle={aisle} pl={production_line}{sku_info}{pos_info}"
-            )
 
             ev_id = f"{EVENT_TASK_COMPLETE}_{task_info.task_id}"
             ev = Event(task_info.task_record['delivery_time'], ev_id, EVENT_TASK_COMPLETE, task_info)
@@ -1005,7 +1151,11 @@ class WarehouseCore:
                         if self.check_blockage(aisle, task_info.production_line, current_time=current_time):
                             print(f"[DEBUG][dispatch] aisle {aisle}: outbound blocked pl={task_info.production_line}")
                             continue
-                        if not self.can_start_outbound_task(task_info.task_id, task_info.production_line):
+                        if not self.can_start_outbound_task(
+                            task_info.task_id,
+                            task_info.production_line,
+                            getattr(task_info, "group_idx", None),
+                        ):
                             print(f"[DEBUG][dispatch] aisle {aisle}: outbound order blocked task={task_info.task_id}")
                             continue
                     print(
@@ -1088,12 +1238,13 @@ class WarehouseCore:
             return True
         return False
     
-    def can_start_outbound_task(self, task_id: str, production_line: int) -> bool:
+    def can_start_outbound_task(self, task_id: str, production_line: int, group_idx: Optional[int] = None) -> bool:
         """检查出库任务是否可以开始（考虑产线组的顺序约束）
         
         Args:
             task_id: 任务ID（格式：OUTBOUND_PL{pl}_GP{group}_{sku1}_{sku2}）
             production_line: 产线号
+            group_idx: 可选的 core 内部 0-based 组索引；API planIndex 会先转换后传入
             
         Returns:
             是否可以开始该任务
@@ -1101,19 +1252,25 @@ class WarehouseCore:
         if production_line is None:
             return True
         
-        # 从task_id中提取组号
-        try:
-            parts = task_id.split('_')
-            # 格式：OUTBOUND_PL{pl}_GP{group}_{sku1}_{sku2}
-            if len(parts) >= 3 and parts[0] == TASK_TYPE_OUTBOUND and parts[1].startswith('PL') and parts[2].startswith('GP'):
-                task_group_number = int(parts[2][2:])  # 去掉 'GP'
-                task_group_idx = task_group_number - 1
-            else:
-                # 无法解析，允许开始
+        if group_idx is not None:
+            try:
+                task_group_idx = int(group_idx)
+            except (TypeError, ValueError):
                 return True
-        except (ValueError, IndexError):
-            # 解析失败，允许开始
-            return True
+        else:
+            # 从task_id中提取组号
+            try:
+                parts = task_id.split('_')
+                # 格式：OUTBOUND_PL{pl}_GP{group}_{sku1}_{sku2}
+                if len(parts) >= 3 and parts[0] == TASK_TYPE_OUTBOUND and parts[1].startswith('PL') and parts[2].startswith('GP'):
+                    task_group_number = int(parts[2][2:])  # 去掉 'GP'
+                    task_group_idx = task_group_number - 1
+                else:
+                    # 无法解析，允许开始
+                    return True
+            except (ValueError, IndexError):
+                # 解析失败，允许开始
+                return True
         
         # 检查是否超出生产计划范围
         if production_line not in self.production_plan:
@@ -1124,8 +1281,8 @@ class WarehouseCore:
         
         # 检查是否是当前组
         current_group_idx = self.production_line_current_group.get(production_line, 0)
-        if task_group_idx > current_group_idx:
-            # 前面的组还没完成，不能开始
+        if task_group_idx != current_group_idx:
+            # 只允许当前组任务开始；public 1-based planIndex 已在API层转换为 core 0-based
             return False
         
         return True
@@ -1234,7 +1391,7 @@ class WarehouseCore:
             if len(task_skus) == 1:
                 # 单梁任务：只需检查是否有该SKU的库存
                 sku = task_skus[0]
-                total_qty = sum(self.inventory_manager.current_inventory[aisle][sku] 
+                total_qty = sum(self.inventory_manager.current_inventory[aisle].get(sku, 0) 
                               for aisle in self.aisles)
                 if total_qty > 0:
                     all_skus_available = True
@@ -1246,7 +1403,7 @@ class WarehouseCore:
                 enough = True
                 debug_need = []
                 for sku, req in need.items():
-                    total_qty = sum(self.inventory_manager.current_inventory[aisle][sku] for aisle in self.aisles)
+                    total_qty = sum(self.inventory_manager.current_inventory[aisle].get(sku, 0) for aisle in self.aisles)
                     debug_need.append((sku, req, total_qty))
                     if total_qty < req:
                         enough = False
@@ -1356,6 +1513,13 @@ class WarehouseCore:
         执行过程中可能需要添加task_complete与拥堵状态更新的event，直到event空结束
         """
         start_time = self.current_time
+        scheduled_task_ids = {
+            task.task_id
+            for task_sequence in (aisle_task_sequences or {}).values()
+            for task in task_sequence
+            if getattr(task, "task_id", None)
+        }
+        completed_before = len(self.completed_tasks)
         
         # 追踪每个巷道已经分配到第几个任务（索引）
         aisle_task_index = {aisle: 0 for aisle in aisle_task_sequences.keys()}
@@ -1415,7 +1579,9 @@ class WarehouseCore:
                         attrs_map = self._task_attrs_map(task_info)
                         attrs1 = attrs_map.get(sku1, {})
                         attrs2 = attrs_map.get(sku2, {})
-                        paired_position, sku1_positions, sku2_positions = self._check_sku_pairing_status(sku1, sku2, attrs1, attrs2)
+                        paired_position, sku1_positions, sku2_positions = self._check_sku_pairing_status(
+                            sku1, sku2, attrs1, attrs2, task_id=task_id
+                        )
                         if paired_position is None:
                             self._perform_relocation_if_needed(
                                 task_id, production_line, sku1, sku2, sku1_positions, sku2_positions, attrs1, attrs2
@@ -1424,7 +1590,7 @@ class WarehouseCore:
                     if self.check_blockage(aisle, production_line, current_time=self.current_time):
                         continue  # 被拥堵阻塞，暂不开始
                     # 检查产线组的顺序约束（前面的组是否完成）
-                    if not self.can_start_outbound_task(task_id, production_line):
+                    if not self.can_start_outbound_task(task_id, production_line, getattr(task_info, "group_idx", None)):
                         continue  # 前面的组还没完成，不能开始
                 
                 # 生成任务记录
@@ -1518,7 +1684,13 @@ class WarehouseCore:
         }
         inbound_wait_time = 0.0
 
-        for t in self.completed_tasks[-tasks_num:]:
+        newly_completed_tasks = self.completed_tasks[completed_before:]
+        relevant_completed_tasks = [
+            t for t in newly_completed_tasks
+            if getattr(t, "task_id", None) in scheduled_task_ids
+        ]
+
+        for t in relevant_completed_tasks:
             rec = t.task_record or {}
             pl = t.production_line
             aisle = t.assigned_aisle
@@ -1538,7 +1710,10 @@ class WarehouseCore:
                 except Exception:
                     pass
 
-        makespan = max(aisle_completion_times.values())-start_time if aisle_completion_times else last_time - start_time
+        if relevant_completed_tasks:
+            makespan = max(aisle_completion_times.values()) - start_time
+        else:
+            makespan = 0.0
         detailed_schedule = {
             'aisle_schedules': aisle_schedules,
             'production_line_times': production_line_times,
@@ -1643,6 +1818,14 @@ class WarehouseCore:
                        inbound_wait_penalty)
         
         details = {
+            'score_weights': {
+                'makespan_weight': makespan_weight,
+                'balance_weight': balance_weight,
+                'production_line_avg_time_weight': production_line_avg_time_weight,
+                'production_line_balance_weight': production_line_balance_weight,
+                'aisle_dispersion_weight': aisle_dispersion_weight,
+                'inbound_wait_weight': inbound_wait_weight,
+            },
             'total_score': total_score,
             'makespan_score': makespan_score,
             'balance_penalty': balance_penalty,
@@ -1650,9 +1833,16 @@ class WarehouseCore:
             'balance_before': balance_before,
             'balance_after': balance_after,
             'balance_change': balance_change,
+            'balance_raw_penalty': max(0, -balance_change) * 1000,
             'avg_production_line_time': avg_production_line_time,
             'production_line_balance_penalty': production_line_balance_penalty,
+            'production_line_balance_raw': balance_variance,
             'aisle_dispersion_penalty': aisle_dispersion_penalty,
+            'aisle_dispersion_raw': (
+                sum((c - mean_ct) ** 2 for c in aisle_counts) / len(aisle_counts)
+                if len(aisle_counts) > 1 else 0.0
+            ),
+            'aisle_task_counts': aisle_counts,
             'line_progress': line_progress,
             'line_totals': line_totals,
             'inbound_wait_time': inbound_wait,
@@ -1850,6 +2040,44 @@ class WarehouseCore:
         }
 
         return total_score, result_details
+
+    @staticmethod
+    def format_score_breakdown(
+        score_details: dict,
+        extra_terms: Optional[List[Tuple[str, float]]] = None,
+        extra_penalty: Optional[float] = None,
+        extra_penalty_label: str = "extra_penalty",
+    ) -> List[str]:
+        """Format score details for readable optimization logs."""
+        if not score_details:
+            return ["  [score] no details"]
+
+        weights = score_details.get('score_weights', {})
+        total_score = float(score_details.get('total_score', 0.0))
+        extra_terms = list(extra_terms or [])
+        if extra_penalty:
+            extra_terms.append((extra_penalty_label, extra_penalty))
+        final_score = total_score + sum(value for _, value in extra_terms)
+
+        def _f(value: Any) -> str:
+            if isinstance(value, (int, float)):
+                return f"{float(value):.4f}"
+            return str(value)
+
+        parts = [
+            f"{_f(weights.get('makespan_weight', 0.0))}*{_f(score_details.get('makespan'))}={_f(score_details.get('makespan_score', 0.0))}(makespan)",
+            f"{_f(weights.get('balance_weight', 0.0))}*{_f(score_details.get('balance_raw_penalty', 0.0))}={_f(score_details.get('balance_penalty', 0.0))}(balance_penalty)",
+            f"{_f(weights.get('production_line_avg_time_weight', 0.0))}*{_f(score_details.get('avg_production_line_time', 0.0))}={_f(score_details.get('production_line_avg_score', 0.0))}(production_line_avg)",
+            f"{_f(weights.get('production_line_balance_weight', 0.0))}*{_f(score_details.get('production_line_balance_raw', 0.0))}={_f(score_details.get('production_line_balance_penalty', 0.0))}(production_line_balance)",
+            f"{_f(weights.get('aisle_dispersion_weight', 0.0))}*{_f(score_details.get('aisle_dispersion_raw', 0.0))}={_f(score_details.get('aisle_dispersion_penalty', 0.0))}(aisle_dispersion)",
+            f"{_f(weights.get('inbound_wait_weight', 0.0))}*{_f(score_details.get('inbound_wait_time', 0.0))}={_f(score_details.get('inbound_wait_penalty', 0.0))}(inbound_wait)",
+        ]
+        for label, value in extra_terms:
+            if value:
+                parts.append(f"{label}={_f(value)}({label})")
+
+        formula = " + ".join(parts)
+        return [f"  [score] total={_f(final_score)} = {formula}"]
     
     def _save_simulation_state(self, affected_position_ids: set = None) -> dict:
         """保存仿真状态的快照（用于get_sol_score）
@@ -2043,7 +2271,7 @@ class WarehouseCore:
         # 遍历所有巷道和SKU，统计总数
         for aisle in self.inventory_manager.aisles:
             for sku in self.inventory_manager.sku_types:
-                total_beams += self.inventory_manager.current_inventory[aisle][sku]
+                total_beams += self.inventory_manager.current_inventory[aisle].get(sku, 0)
         return total_beams
 
     def _get_beam_details(self) -> dict:
@@ -2131,19 +2359,33 @@ class WarehouseCore:
                     task_id = f"{TASK_TYPE_OUTBOUND}_PL{production_line}_GP{current_group_idx+1}_{task_skus[0]}"
                 else:
                     task_id = f"{TASK_TYPE_OUTBOUND}_PL{production_line}_GP{current_group_idx+1}_{'_'.join(task_skus)}"
+                group_label = current_group_idx + 1
+                def _log_relocation_skip(reason: str) -> None:
+                    print(
+                        f"[DEBUG][relocation-scan] skip pl={production_line} gp={group_label} "
+                        f"task={task_id} reason={reason}"
+                    )
                 
                 # 跳过已完成或正在运行的任务
                 if task_id in completed_task_ids or task_id in running_task_ids:
+                    if task_id in completed_task_ids:
+                        _log_relocation_skip("already_completed_in_line")
+                    else:
+                        _log_relocation_skip("currently_running")
                     continue
                 if task_id in completed_task_ids_all:
+                    _log_relocation_skip("already_completed_global")
                     continue
                 if self._is_task_pending_completion(task_id):
+                    _log_relocation_skip("pending_task_complete_event")
                     continue
                 if task_id in self.relocation_task_ids:
+                    _log_relocation_skip("relocation_already_scheduled")
                     continue
                 
                 # 只处理双梁任务（需要两个SKU配对出库）
                 if len(task_skus) != 2:
+                    _log_relocation_skip("not_double_sku_task")
                     continue
                 
                 sku1, sku2 = task_skus[0], task_skus[1]
@@ -2156,12 +2398,18 @@ class WarehouseCore:
                 # 检查事件队列中是否有与该出库任务相关的入库任务
                 has_related_inbound = self._has_related_inbound_in_queue(sku1, sku2)
                 if has_related_inbound:
+                    _log_relocation_skip(f"related_inbound_in_queue skus={sku1},{sku2}")
                     continue  # 有相关入库任务，不需要移库
                 
                 # 检查库存配对情况
-                paired_position, sku1_positions, sku2_positions = self._check_sku_pairing_status(sku1, sku2, attrs1, attrs2)
+                paired_position, sku1_positions, sku2_positions = self._check_sku_pairing_status(
+                    sku1, sku2, attrs1, attrs2, task_id=task_id
+                )
                 
                 if paired_position is not None:
+                    _log_relocation_skip(
+                        f"already_paired position={getattr(paired_position, 'position_id', None)}"
+                    )
                     continue  # 已有配对好的货位，不需要移库
                 
                 # 判断移库原因和执行移库
@@ -2171,8 +2419,21 @@ class WarehouseCore:
                 
                 if relocation_result is not None:
                     if relocation_result.get("relocation_details", {}).get("operations"):
+                        print(
+                            f"[DEBUG][relocation-scan] schedule pl={production_line} gp={group_label} "
+                            f"task={task_id} reason={relocation_result.get('reason')}"
+                        )
                         self.relocation_task_ids.add(task_id)
+                    else:
+                        print(
+                            f"[DEBUG][relocation-scan] no-op pl={production_line} gp={group_label} "
+                            f"task={task_id} result={relocation_result}"
+                        )
                     relocation_records.append(relocation_result)
+                else:
+                    _log_relocation_skip(
+                        f"perform_relocation_returned_none sku1_pos={len(sku1_positions)} sku2_pos={len(sku2_positions)}"
+                    )
         
         return relocation_records
 
@@ -2222,7 +2483,8 @@ class WarehouseCore:
 
     def _check_sku_pairing_status(self, sku1: str, sku2: str,
                                   attrs1: Optional[Dict[str, Any]] = None,
-                                  attrs2: Optional[Dict[str, Any]] = None) -> Tuple[Optional[InventoryPosition], List[Tuple[str, InventoryPosition]], List[Tuple[str, InventoryPosition]]]:
+                                  attrs2: Optional[Dict[str, Any]] = None,
+                                  task_id: Optional[str] = None) -> Tuple[Optional[InventoryPosition], List[Tuple[str, InventoryPosition]], List[Tuple[str, InventoryPosition]]]:
         """检查两个SKU的配对状态
         
         Args:
@@ -2242,6 +2504,8 @@ class WarehouseCore:
         
         match_fields = self.match_fields or []
         for pos in self.inventory_manager.inventory_positions:
+            if self._is_position_reserved_for_other_task(pos, task_id):
+                continue
             if pos.is_double_layer:
                 # 检查是否已配对（两个SKU在同一货位的上下层且都有库存）
                 if (
@@ -2916,12 +3180,29 @@ class WarehouseCore:
         pos.reserved = True
         self.relocation_reserved_positions[pos_id] = task_id
 
+    def _is_position_reserved_for_other_task(self, pos: InventoryPosition, task_id: Optional[str] = None) -> bool:
+        if not getattr(pos, "reserved", False):
+            return False
+        owner_task_id = self.relocation_reserved_positions.get(pos.get_position_id())
+        return owner_task_id != task_id
+
     def _release_reserved_position(self, pos_id: str) -> None:
         task_id = self.relocation_reserved_positions.pop(pos_id, None)
         pos = self.inventory_manager.position_map.get(pos_id)
         if pos is not None:
             pos.reserved = False
         return task_id
+
+    def _release_reserved_positions_for_task(self, task_id: str) -> None:
+        if not task_id:
+            return
+        reserved_pos_ids = [
+            pos_id
+            for pos_id, owner_task_id in self.relocation_reserved_positions.items()
+            if owner_task_id == task_id
+        ]
+        for pos_id in reserved_pos_ids:
+            self._release_reserved_position(pos_id)
 
     def _schedule_relocation_ops(self, aisle: int, end_time: float, ops: List[dict]) -> None:
         if aisle not in self.relocation_ops_by_aisle:
@@ -2958,19 +3239,21 @@ class WarehouseCore:
                             if action == "add":
                                 self._release_reserved_position(pos_id)
                             continue
+                        add_succeeded = False
                         try:
                             if action == "remove":
                                 self.inventory_manager.remove_inventory(pos, sku, 1)
                             elif action == "add":
                                 attrs = op.get("attrs")
                                 self.inventory_manager.add_inventory(pos, sku, 1, layer, attrs=attrs)
+                                add_succeeded = True
                             print(f"[relocation-audit] apply t={current_time:.2f}s task={task_id} "
                                   f"action={action} sku={sku} pos={pos_id} result=ok")
                         except Exception as e:
                             print(f"[relocation-audit] apply t={current_time:.2f}s task={task_id} "
                                   f"action={action} sku={sku} pos={pos_id} result=fail err={e}")
                         finally:
-                            if action == "add":
+                            if action == "add" and not add_succeeded:
                                 self._release_reserved_position(pos_id)
                 else:
                     pending.append((end_time, ops))
@@ -3009,4 +3292,3 @@ class WarehouseCore:
             if target.intersection(task_skus):
                 return True
         return False
-

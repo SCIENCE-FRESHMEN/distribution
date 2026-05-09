@@ -69,11 +69,6 @@ async def task_feedback(
     try:
         # 根据状态处理
         if status == TaskStatus.EXECUTING:
-            # 确认任务开始执行 - 这是关键的确认点
-            if pending_task:
-                task_manager.confirm_task(task_id)
-                print(f"[API] 任务 {task_id} 已确认开始执行")
-            
             # 通知warehouse_core任务正在执行
             feedback_data = {
                 "taskId": task_id,
@@ -81,14 +76,14 @@ async def task_feedback(
                 "status": "EXECUTING",
                 "startTime": request.startTime,
             }
-            warehouse_service.apply_feedback(feedback_data)
+            if not warehouse_service.apply_feedback(feedback_data):
+                return ApiResponse(status="FAILED", message=f"反馈处理失败: {task_id}", data=None)
+            # 确认任务开始执行 - warehouse侧成功后再清理未确认状态
+            if pending_task:
+                task_manager.confirm_task(task_id)
+                print(f"[API] 任务 {task_id} 已确认开始执行")
             
         elif status == TaskStatus.COMPLETED:
-            # 标记任务完成
-            if pending_task:
-                task_manager.complete_task(task_id)
-                print(f"[API] 任务 {task_id} 已完成")
-            
             # 通知warehouse_core任务已完成
             feedback_data = {
                 "taskId": task_id,
@@ -96,14 +91,14 @@ async def task_feedback(
                 "status": "COMPLETED",
                 "startTime": request.startTime,
             }
-            warehouse_service.apply_feedback(feedback_data)
+            if not warehouse_service.apply_feedback(feedback_data):
+                return ApiResponse(status="FAILED", message=f"反馈处理失败: {task_id}", data=None)
+            # 标记任务完成
+            if pending_task:
+                task_manager.complete_task(task_id)
+                print(f"[API] 任务 {task_id} 已完成")
             
         elif status == TaskStatus.FAILED:
-            # 标记任务失败
-            if pending_task:
-                task_manager.fail_task(task_id)
-                print(f"[API] 任务 {task_id} 执行失败: {request.failureReason}")
-            
             # 通知warehouse_core任务失败
             feedback_data = {
                 "taskId": task_id,
@@ -112,7 +107,12 @@ async def task_feedback(
                 "startTime": request.startTime,
                 "reason": request.failureReason,
             }
-            warehouse_service.apply_feedback(feedback_data)
+            if not warehouse_service.apply_feedback(feedback_data):
+                return ApiResponse(status="FAILED", message=f"反馈处理失败: {task_id}", data=None)
+            # 标记任务失败
+            if pending_task:
+                task_manager.fail_task(task_id)
+                print(f"[API] 任务 {task_id} 执行失败: {request.failureReason}")
         
         return ApiResponse(status="SUCCESS", message="反馈处理成功", data=None)
         

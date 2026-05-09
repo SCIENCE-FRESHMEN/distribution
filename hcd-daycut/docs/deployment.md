@@ -146,9 +146,7 @@ python run_api.py
 
 | 方法 | 端点                     | 说明                 | 类型 |
 | ---- | ------------------------ | -------------------- | ---- |
-| POST | /api/v1/plan/production  | 设置生产计划         | 生产 |
-| GET  | /api/v1/plan/production  | 获取生产计划         | 生产 |
-| POST | /api/v1/schedule/mixed   | 混合调度（核心接口） | 调度 |
+| POST | /api/v1/schedule/mixed   | 混合调度（核心接口，内联 productionPlan + currentGroups） | 调度 |
 | POST | /api/v1/inbound/allocate | 入库巷道分配         | 入库 |
 | POST | /api/v1/task/feedback    | 任务执行状态反馈     | 反馈 |
 | GET  | /api/v1/task/unconfirmed | 查看未确认任务       | 调试 |

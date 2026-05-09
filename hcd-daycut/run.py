@@ -8,7 +8,7 @@ import heapq
 import pytz
 import datetime
 from typing import Optional, Dict, List, Tuple
-from simulation import WarehouseCore
+from simulation.warehouse_core import WarehouseCore
 from simulation.warehouse_core import load_warehouse_config
 from simulation.task_data import TaskData
 from simulation.event import Event, EVENT_INBOUND_UNASSIGNED, EVENT_INBOUND_ARRIVAL_AT_AISLE
@@ -34,7 +34,8 @@ class WarehouseSimulation:
                  transport_delay_s: Optional[float] = None,
                  scheduler_type: str = 'heuristic',
                  initial_inventory_count: int = 250,
-                 track_skus: Optional[List[str]] = ["2801022-TG360"]):
+                 track_skus: Optional[List[str]] = ["2801022-TG360"],
+                 config_path: Optional[str] = "config/warehouse.json"):
         """
         Args:
             num_aisles: 巷道数量
@@ -68,6 +69,7 @@ class WarehouseSimulation:
             inbound_aisle_strategy=inbound_aisle_strategy,
             inbound_allocation_strategy=inbound_allocation_strategy,
             initial_inventory_count=initial_inventory_count,
+            config_path=config_path,
         )
         if track_skus:
             try:
@@ -1032,13 +1034,15 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
          production_line_balance_weight: Optional[float] = None,
          aisle_dispersion_weight: Optional[float] = None,
          inbound_wait_weight: Optional[float] = None,
+         outbound_choice_bonus_weight: Optional[float] = None,
          initial_inventory_count: Optional[int] = None,
          inbound_rate_lambda: float = 1/100.0,
          real_time_days: Optional[int] = None,
          cutoff_hour: int = 6,
          date_str: Optional[str] = None,
          inbound_config_path: Optional[str] = None,
-         plan_config_path: Optional[str] = None):
+         plan_config_path: Optional[str] = None,
+         warehouse_config_path: str = "config/warehouse.json"):
     """仓库仿真主函数（事件驱动版本）
     
     Args:
@@ -1055,10 +1059,11 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
         date_str: 日期字符串（如20251012），用于指定运行特定日期的仿真
         inbound_config_path: 入库配置文件路径，用于指定特定日期的配置
         plan_config_path: 生产计划配置文件路径，用于指定特定日期的配置
+        warehouse_config_path: 仓库配置文件路径
     """
     # 入库策略交由 Core 内部配置
     
-    cfg = load_warehouse_config("config/warehouse.json")
+    cfg = load_warehouse_config(warehouse_config_path)
     def _resolve_param(value, key, fallback):
         if value is not None:
             return value
@@ -1075,11 +1080,15 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
     production_line_balance_weight = _resolve_param(production_line_balance_weight, "production_line_balance_weight", 0.3)
     aisle_dispersion_weight = _resolve_param(aisle_dispersion_weight, "aisle_dispersion_weight", 0.3)
     inbound_wait_weight = _resolve_param(inbound_wait_weight, "inbound_wait_weight", 0.01)
+    outbound_choice_bonus_weight = _resolve_param(
+        outbound_choice_bonus_weight, "outbound_choice_bonus_weight", 0.2
+    )
+    initial_inventory_count = _resolve_param(initial_inventory_count, "initial_inventory_count", None)
 
     # 创建仿真器
     simulator = WarehouseSimulation(
-        num_aisles=5,
-        num_production_lines=3,
+        num_aisles=int(cfg.get("num_aisles", 5)),
+        num_production_lines=int(cfg.get("num_production_lines", 3)),
         initial_inventory_ratio=0,
         random_seed=random_seed,
         use_magnetic_crane=use_magnetic_crane,
@@ -1088,8 +1097,9 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
         scheduler_type=scheduler_type,
         inbound_aisle_strategy=inbound_allocation_strategy,
         inbound_allocation_strategy=inbound_position_strategy,
-        initial_inventory_count=initial_inventory_count or 250,
+        initial_inventory_count=initial_inventory_count,
         inbound_rate_lambda=inbound_rate_lambda,
+        config_path=warehouse_config_path,
     )
     if initial_inventory_count is None:
         initial_inventory_count = simulator.warehouse_core.initial_inventory_count
@@ -1101,6 +1111,7 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
     simulator.warehouse_core.production_line_balance_weight = production_line_balance_weight
     simulator.warehouse_core.aisle_dispersion_weight = aisle_dispersion_weight
     simulator.warehouse_core.inbound_wait_weight = inbound_wait_weight
+    simulator.warehouse_core.outbound_choice_bonus_weight = outbound_choice_bonus_weight
 
     # 根据是否指定了特定日期配置来设置生产计划
     if date_str and inbound_config_path and plan_config_path:
@@ -1216,25 +1227,29 @@ if __name__ == "__main__":
     parser.set_defaults(use_magnetic_crane=None)
     parser.add_argument('--outbound-congestion-time', type=float, default=None, help='出库口拥堵时间（秒，默认用 config/warehouse.json）')
     parser.add_argument('--lr-balance-weight', type=float, default=None, help='左右均衡度权重（默认用 config/warehouse.json）')
-    parser.add_argument('--inbound-allocation-strategy', type=str, default='baseline', help='入库巷道分配策略')
-    parser.add_argument('--inbound-position-strategy', type=str, default='baseline', help='入库货位分配策略')
-    parser.add_argument('--scheduler-type', type=str, default='optimization', help='调度器类型')
+    parser.add_argument('--inbound-allocation-strategy', type=str, default='proposed', help='入库巷道分配策略')
+    parser.add_argument('--inbound-position-strategy', type=str, default='proposed', help='入库货位分配策略')
+    parser.add_argument('--scheduler-type', type=str, default='heuristic', help='调度器类型')
     parser.add_argument('--makespan-weight', type=float, default=None, help='makespan weight (optimization)')
     parser.add_argument('--balance-weight', type=float, default=None, help='inventory balance change weight (optimization)')
     parser.add_argument('--production-line-avg-time-weight', type=float, default=None, help='production line avg time weight (optimization)')
     parser.add_argument('--production-line-balance-weight', type=float, default=None, help='production line balance weight (optimization)')
     parser.add_argument('--aisle-dispersion-weight', type=float, default=None, help='aisle dispersion weight (optimization)')
     parser.add_argument('--inbound-wait-weight', type=float, default=None, help='inbound wait time weight (optimization)')
+    parser.add_argument('--outbound-choice-bonus-weight', type=float, default=None, help='outbound choice bonus weight (optimization)')
     parser.add_argument('--initial-inventory-count', type=int, default=None, help='用于初始化库存的入库任务记录数（默认使用 config/warehouse.json）')
-    parser.add_argument('--inbound-rate-lambda', type=float, default=1/100.0, help='(入库计划生成时)入库任务生成间隔的λ参数')
-    parser.add_argument('--real-time-days', type=int, default=2, help='使用真实时间数据时，模拟几天')
+    parser.add_argument('--inbound-rate-lambda', type=float, default=1/80.0, help='(入库计划生成时)入库任务生成间隔的λ参数')
+    parser.add_argument('--real-time-days', type=int, default=6, help='使用真实时间数据时，模拟几天')
     parser.add_argument('--cutoff-hour', type=int, default=4, help='切日小时')
     parser.add_argument('--no-cutoff', action='store_true', help='不分日，整段时间作为单日运行')
     parser.add_argument('--date-str', type=str, help='日期字符串（如20251012），用于指定运行特定日期的仿真')
     parser.add_argument('--inbound-config', type=str, help='入库配置文件路径')
     parser.add_argument('--plan-config', type=str, help='生产计划配置文件路径')
+    parser.add_argument('--warehouse-config', type=str, default='config/warehouse.json', help='仓库配置文件路径')
     
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
+    if unknown_args:
+        print(f"[WARN] 忽略未知命令行参数: {unknown_args}")
     
     main(
         random_seed=args.random_seed, 
@@ -1251,11 +1266,13 @@ if __name__ == "__main__":
         production_line_balance_weight=args.production_line_balance_weight,
         aisle_dispersion_weight=args.aisle_dispersion_weight,
         inbound_wait_weight=args.inbound_wait_weight,
+        outbound_choice_bonus_weight=args.outbound_choice_bonus_weight,
         initial_inventory_count=args.initial_inventory_count,  # 用于初始化库存的入库任务记录数
         inbound_rate_lambda=args.inbound_rate_lambda,  # (入库计划生成时)入库任务生成间隔的λ参数
         real_time_days=args.real_time_days, #设置为None时可以使用max_simulation_time
         cutoff_hour=None if args.no_cutoff else args.cutoff_hour,
         date_str=args.date_str,
         inbound_config_path=args.inbound_config,
-        plan_config_path=args.plan_config
+        plan_config_path=args.plan_config,
+        warehouse_config_path=args.warehouse_config
     )

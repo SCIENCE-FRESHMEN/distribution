@@ -3,9 +3,10 @@
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import JSONResponse
 
 from ..models import (
     InboundAllocateRequest,
@@ -68,6 +69,20 @@ async def allocate_inbound(
     实际的任务执行需要通过混合调度接口或直接调用。
     """
     try:
+        invalid_result = warehouse_service.find_invalid_skus(request.tasks)
+        if invalid_result["invalidSkus"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "FAILED",
+                    "message": "存在未维护在BOM中的SKU，无法执行入库分配。",
+                    "data": {
+                        **invalid_result,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }
+                }
+            )
+
         allocation_id = f"ALLOC-{uuid.uuid4().hex[:8].upper()}"
         assignments: List[InboundAssignmentResponse] = []
         
@@ -79,7 +94,7 @@ async def allocate_inbound(
                     skus.append(sku.model_dump())
                 else:
                     skus.append(sku.dict())
-            
+
             # 调用warehouse_service进行巷道分配
             recommended_aisle = warehouse_service.allocate_inbound_aisle(
                 task_id=task.taskId,

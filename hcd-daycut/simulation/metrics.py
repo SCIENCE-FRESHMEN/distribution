@@ -108,7 +108,7 @@ class MetricsCalculator:
         left_right_balance_scores = []
         
         for sku in self.sku_types:
-            quantities = [current_inventory[aisle][sku] for aisle in self.aisles]
+            quantities = [current_inventory[aisle].get(sku, 0) for aisle in self.aisles]
             total_qty = sum(quantities)
             
             if total_qty > 0:
@@ -120,8 +120,8 @@ class MetricsCalculator:
                 balance_scores.append(balance_score)
                 
                 # 
-                left_qty = sum(current_inventory[aisle][sku] for aisle in self.left_aisles)
-                right_qty = sum(current_inventory[aisle][sku] for aisle in self.right_aisles)
+                left_qty = sum(current_inventory[aisle].get(sku, 0) for aisle in self.left_aisles)
+                right_qty = sum(current_inventory[aisle].get(sku, 0) for aisle in self.right_aisles)
                 
                 expected_left = total_qty * len(self.left_aisles) / len(self.aisles)
                 expected_right = total_qty * len(self.right_aisles) / len(self.aisles)

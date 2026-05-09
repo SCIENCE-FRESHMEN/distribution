@@ -3,14 +3,16 @@ FastAPI应用入口
 仓库调度系统API服务
 """
 
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from .routes import schedule_router, feedback_router, inbound_router, plan_router, bom_router
+from .routes import schedule_router, feedback_router, inbound_router, bom_router
 from .services.warehouse_service import init_warehouse_service, get_warehouse_service
 from .state import reset_task_state_manager
+from .services.warehouse_service import reset_warehouse_service
 
 # API版本
 API_VERSION = "1.0.0"
@@ -50,8 +52,8 @@ app = FastAPI(
 ### 3. 入库分配 (/api/v1/inbound/allocate)
 - 为入库任务分配推荐的目标巷道
 
-### 4. 生产计划 (/api/v1/plan/production)
-- 设置或更新当日生产计划
+### 4. 生产计划
+- 生产计划随 `/api/v1/schedule/mixed` 请求内联传入
 
 ### 常用测试数据 (Examples)
 为了方便测试，可以使用以下真实的 SKU ID（基于库存）：
@@ -84,7 +86,6 @@ app.add_middleware(
 app.include_router(schedule_router, prefix="/api/v1")
 app.include_router(feedback_router, prefix="/api/v1")
 app.include_router(inbound_router, prefix="/api/v1")
-app.include_router(plan_router, prefix="/api/v1")
 app.include_router(bom_router, prefix="/api/v1")
 
 
@@ -179,6 +180,20 @@ async def system_status():
             "message": f"获取系统状态失败: {str(e)}",
             "data": None
         }
+
+
+if os.getenv("WMS_ENABLE_DEBUG_RESET") == "1":
+    @app.post("/api/v1/debug/reset", tags=["调试"])
+    async def debug_reset():
+        """
+        Reset in-memory warehouse service + task state.
+
+        This endpoint exists for automated tests and local debugging only.
+        """
+        reset_warehouse_service()
+        init_warehouse_service()
+        reset_task_state_manager()
+        return {"status": "SUCCESS", "message": "reset ok", "data": None}
 
 
 # ============================================================

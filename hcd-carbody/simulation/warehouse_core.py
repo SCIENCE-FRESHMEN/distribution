@@ -40,7 +40,7 @@ from schedule import get_scheduler
 
 
 def load_warehouse_config(path: Optional[str]) -> dict:
-    """Load warehouse initialization config from JSON/JSON5 if present."""
+    """从JSON/JSON5文件加载仓库初始化配置（如果存在）"""
     if not path:
         return {}
     p = Path(path)
@@ -48,12 +48,12 @@ def load_warehouse_config(path: Optional[str]) -> dict:
         return {}
     text = p.read_text(encoding="utf-8")
     try:
-        # Prefer JSON5 when available (supports comments, trailing commas).
+        # 优先使用JSON5（支持注释、尾随逗号等特性）
         if json5 is not None:
             return json5.loads(text)
         return json.loads(text)
     except Exception:
-        # Fallback to strict JSON parser when JSON5 parse fails.
+        # JSON5解析失败时，使用严格JSON解析器作为备选
         try:
             return json.loads(text)
         except Exception:
@@ -61,7 +61,7 @@ def load_warehouse_config(path: Optional[str]) -> dict:
 
 
 class WarehouseCore:
-    """仓库仿真核心类"""
+    """仓库仿真核心类，负责管理仓库的仿真运行状态和调度逻辑"""
     
     # 类变量，用于存储入库记录，确保只加载一次
     _inbound_records = None
@@ -85,6 +85,7 @@ class WarehouseCore:
                  relocation_delay_s: float = 80.0,
                  config_path: Optional[str] = "config/warehouse.json"):
         """
+        仓库核心初始化方法，设置各种参数和配置项
         Args:
             num_aisles: 巷道数量
             num_production_lines: 产线数量
@@ -107,6 +108,7 @@ class WarehouseCore:
         """
         cfg = load_warehouse_config(config_path)
 
+        # 从配置文件加载基本仓库参数
         self.num_aisles = int(cfg.get("num_aisles", num_aisles))
         self.num_rows = int(cfg.get("num_rows", num_rows))
         self.num_columns = int(cfg.get("num_columns", num_columns))
@@ -119,11 +121,17 @@ class WarehouseCore:
         self.initial_inventory_ratio = float(cfg.get("initial_inventory_ratio", initial_inventory_ratio))
         self.initial_inventory_count = int(cfg.get("initial_inventory_count", initial_inventory_count))
         self.aisles = list(range(1, self.num_aisles + 1))
+        # 加载巷道维度配置，支持不同巷道具有不同的行列层数
         self.aisle_dimensions = self._normalize_aisle_dimensions(cfg.get("aisle_dimensions", {}))
+        # 加载特征别名配置，用于规范化不同名称的特征
         self.feature_alias = self._normalize_feature_alias(cfg.get("feature_alias", {}))
+        # 加载巷道禁止规则，指定某些巷道不能存放特定特征的货物
         self.aisle_forbidden = self._normalize_aisle_forbidden(cfg.get("aisle_forbidden", {}))
+        # 加载禁用巷道列表
         self.disabled_aisles = self._normalize_disabled_aisles(cfg.get("disabled_aisles", []))
+        # 活跃巷道列表（非禁用巷道）
         self.active_aisles = [a for a in self.aisles if a not in self.disabled_aisles]
+        # 如果配置了巷道维度，则重新计算总仓位数
         if self.aisle_dimensions and "total_positions" not in cfg:
             self.total_positions = sum(
                 int(self.aisle_dimensions.get(a, {}).get("rows", self.num_rows))
@@ -141,6 +149,7 @@ class WarehouseCore:
         # 磁力吊和拥堵配置
         self.use_magnetic_crane = bool(cfg.get("use_magnetic_crane", use_magnetic_crane))
         self.outbound_congestion_time = float(cfg.get("outbound_congestion_time", outbound_congestion_time))
+        # 从环境变量或配置文件加载各种权重参数
         weight_env_map = {
             "lr_balance_weight": "OPT_LR_BALANCE_WEIGHT",
             "makespan_weight": "OPT_MAKESPAN_WEIGHT",
@@ -162,6 +171,7 @@ class WarehouseCore:
                         print(f"[WARN] invalid env {env_key}={raw}, fallback to config/default")
             return float(cfg.get(key, default_val))
 
+        # 权重参数
         self.lr_balance_weight = _read_weight("lr_balance_weight", lr_balance_weight)
         self.makespan_weight = _read_weight("makespan_weight", 0.3)
         self.balance_weight = _read_weight("balance_weight", 0.001)
@@ -169,24 +179,26 @@ class WarehouseCore:
         self.production_line_balance_weight = _read_weight("production_line_balance_weight", 0.3)
         self.aisle_dispersion_weight = _read_weight("aisle_dispersion_weight", 0.3)
         self.inbound_wait_weight = _read_weight("inbound_wait_weight", 0.01)
+        
+        # 出库匹配特征配置
         cfg_match_features = cfg.get("outbound_match_features", {}) or {}
-        # Per-line match features: {production_line: [features]}
+        # 按产线配置匹配特征: {production_line: [features]}
         if isinstance(cfg_match_features, dict):
             self.outbound_match_features_by_line = {
                 int(k): [self._canonical_feature_key(x) for x in list(v or [])] for k, v in cfg_match_features.items()
             }
-            # Default to RFID if not specified per-line.
+            # 如果未按产线指定，默认使用RFID
             self.outbound_match_features_default = ["rfid"]
         else:
             self.outbound_match_features_by_line = {}
             self.outbound_match_features_default = [self._canonical_feature_key(x) for x in list(cfg_match_features or ["rfid"])]
         
-        # 左右库定义
+        # 左右库定义，用于左右均衡计算
         mid_point = len(self.aisles) // 2
         self.left_aisles = self.aisles[:mid_point]
         self.right_aisles = self.aisles[mid_point:]
         
-        # 巷道-产线映射配置
+        # 巷道-产线映射配置，定义哪些巷道可以服务哪些产线
         cfg_mapping = cfg.get("aisle_production_line_mapping", None)
         if cfg_mapping is not None:
             try:
@@ -225,9 +237,11 @@ class WarehouseCore:
         
         self.inbound_records = WarehouseCore._inbound_records
         
+        # 加载时间估算器配置
         time_cfg = load_time_estimator_config("config/time_estimator.json")
         dock_map_in = time_cfg.get("dock_map_in", {})
         dock_map_out = time_cfg.get("dock_map_out", {})
+        # 加载禁用位置列表
         disabled_positions = list(cfg.get("disabled_positions", []))
         
         # 创建子模块
@@ -243,21 +257,22 @@ class WarehouseCore:
             disabled_positions=disabled_positions,
             aisle_dimensions=self.aisle_dimensions,
         )
+        # 创建指标计算器
         self.metrics_calculator = MetricsCalculator(
             self.aisles, self.sku_types, 
             left_aisles=self.left_aisles,
             right_aisles=self.right_aisles,
             lr_balance_weight=self.lr_balance_weight
         )
-        #NOTE: 时间估算器暂时不加载模型
+        # 创建时间估算器（注意：暂时不加载模型）
         self.time_estimator = TimeEstimator(load_model=False)
         
         # 仿真参数
         self.blockage_time = float(cfg.get("blockage_time", blockage_time))  # 拥堵时间（秒）
         self.magnetic_crane_time = float(cfg.get("magnetic_crane_time", magnetic_crane_time))  # 磁力吊工作时间（秒）
         self.transport_delay_s = float(cfg.get("transport_delay_s", transport_delay_s if transport_delay_s is not None else 30.0))  # 入库从分配巷道到达入口的运输延迟
-        # Max retries for inbound-arrival delay when all candidate aisles are projected full.
-        # Prevents infinite retry loops in simulation scoring mode.
+        # 当所有候选巷道预计已满时，入库到达延迟的最大重试次数
+        # 防止在仿真评分模式下的无限重试循环
         self.inbound_arrival_max_retries = int(cfg.get("inbound_arrival_max_retries", 12))
         
         # 统计数据
@@ -275,15 +290,16 @@ class WarehouseCore:
         # 记录每条产线每组完成的时间
         self.production_line_group_completion_times = {pl: [] for pl in range(1, self.num_production_lines + 1)}
         
-        # Blockage status: {(aisle, out_line): {'blocked': bool, 'unblock_time': float}}
+        # 拥堵状态: {(aisle, out_line): {'blocked': bool, 'unblock_time': float}}
         self.blockage_status = {}
+        # 获取出库线/产线列表
         out_lines = list(getattr(self.time_estimator, "dock_map_out", {}).keys())
         if not out_lines:
             out_lines = list(range(1, self.num_production_lines + 1))
         for aisle in self.aisles:
             for out_line in out_lines:
                 self.blockage_status[(aisle, out_line)] = {'blocked': False, 'unblock_time': 0.0}
-        # Allocation策略（可选，用于入库任务的巷道分配和货位分配）
+        # 分配策略（可选，用于入库任务的巷道分配和货位分配）
         self.inbound_aisle_allocator = None  # 需要外部设置
         self.inbound_position_allocator = None  # 需要外部设置，用于入库货位分配
 
@@ -330,7 +346,7 @@ class WarehouseCore:
         self.relocation_reserved_positions = {}
     
     def initialize(self):
-        """初始化仓库"""
+        """初始化仓库状态，包括库存管理和均衡度计算"""
         self.inventory_manager.initialize()
         self.inventory_manager.print_distribution()
         
@@ -348,6 +364,7 @@ class WarehouseCore:
         print(f"  左右均衡权重: {self.lr_balance_weight}")
     
     def _build_io_port_disabled_positions(self, dock_levels_by_col: Dict[int, Any]) -> List[str]:
+        """根据码头级别构建禁用位置列表"""
         disabled = []
         for col, levels in dock_levels_by_col.items():
             try:
@@ -376,8 +393,8 @@ class WarehouseCore:
         dock_out_col: int,
     ) -> Dict[int, List[int]]:
         """
-        Build a {col: [levels...]} map from time estimator dock maps.
-        Supports both legacy mapping (line -> level) and new mapping (line -> {col, level}).
+        从时间估算器码头映射构建 {col: [levels...]} 映射
+        支持旧版映射（line -> level）和新版映射（line -> {col, level}）
         """
         levels_by_col: Dict[int, set] = {}
         for default_col, dock_map in ((dock_in_col, dock_map_in), (dock_out_col, dock_map_out)):
@@ -400,6 +417,7 @@ class WarehouseCore:
         return {col: sorted(levels) for col, levels in levels_by_col.items()}
 
     def _normalize_aisle_dimensions(self, raw_dims: Any) -> Dict[int, Dict[str, int]]:
+        """标准化巷道维度配置"""
         result: Dict[int, Dict[str, int]] = {}
         if not isinstance(raw_dims, dict):
             return result
@@ -420,11 +438,12 @@ class WarehouseCore:
 
     @staticmethod
     def _normalize_text(v: Any) -> str:
+        """标准化文本，去除前后空白"""
         return str(v).strip()
 
     def _normalize_feature_alias(self, raw_alias: Any) -> Dict[str, List[str]]:
         """
-        Normalize feature_alias config:
+        标准化特征别名配置：
         {
           "skid_state": ["skid_state", "滑橇状态"],
           "skid_type": ["skid_type", "滑橇类型"]
@@ -454,12 +473,14 @@ class WarehouseCore:
         return result
 
     def _canonical_feature_key(self, key: Any) -> str:
+        """获取规范化的特征键"""
         k = self._normalize_text(key)
         if not k:
             return k
         return self._feature_alias_lookup.get(k.lower(), k)
 
     def _normalize_feature_dict(self, feats: Any) -> Dict[str, Any]:
+        """标准化特征字典"""
         normalized: Dict[str, Any] = {}
         if not isinstance(feats, dict):
             return normalized
@@ -473,7 +494,7 @@ class WarehouseCore:
 
     def _normalize_aisle_forbidden(self, raw_rules: Any) -> Dict[int, Dict[str, set]]:
         """
-        Normalize aisle_forbidden config:
+        标准化巷道禁止规则配置：
         {
           "1": {"color": "W1", "model": ["A", "B"]},
           "2": {"color": "R1"}
@@ -506,6 +527,7 @@ class WarehouseCore:
         return result
 
     def _normalize_disabled_aisles(self, raw: Any) -> set:
+        """标准化禁用巷道列表"""
         result = set()
         if raw is None:
             return result
@@ -521,12 +543,12 @@ class WarehouseCore:
         return result
 
     def _is_aisle_enabled(self, aisle: int) -> bool:
+        """检查巷道是否启用"""
         return int(aisle) not in self.disabled_aisles
 
     def _reassign_pending_inbound_from_disabled_aisles(self) -> None:
         """
-        Move pending inbound tasks away from disabled aisles to currently
-        enabled and valid aisles when possible.
+        将禁用巷道的待处理入库任务移动到当前启用的、有效的巷道
         """
         for aisle in list(self.disabled_aisles):
             if aisle not in self.pending_inbound_by_aisle:
@@ -543,15 +565,17 @@ class WarehouseCore:
                     task.assigned_aisle = new_aisle
                     self.pending_inbound_by_aisle[new_aisle].append(task)
                 else:
-                    # No available aisle now; keep task in original queue.
+                    # 没有可用巷道；将任务保留在原始队列中
                     self.pending_inbound_by_aisle[aisle].append(task)
 
     def set_disabled_aisles(self, aisles: List[int]) -> None:
+        """设置禁用巷道"""
         self.disabled_aisles = self._normalize_disabled_aisles(aisles)
         self.active_aisles = [a for a in self.aisles if a not in self.disabled_aisles]
         self._reassign_pending_inbound_from_disabled_aisles()
 
     def disable_aisle(self, aisle: int) -> None:
+        """禁用巷道"""
         try:
             aisle = int(aisle)
         except Exception:
@@ -565,6 +589,7 @@ class WarehouseCore:
         self._reassign_pending_inbound_from_disabled_aisles()
 
     def enable_aisle(self, aisle: int) -> None:
+        """启用巷道"""
         try:
             aisle = int(aisle)
         except Exception:
@@ -576,6 +601,7 @@ class WarehouseCore:
         self.active_aisles = [a for a in self.aisles if a not in self.disabled_aisles]
 
     def _is_task_forbidden_in_aisle(self, task_or_stub: Any, aisle: int) -> bool:
+        """检查任务是否被禁止在指定巷道中执行"""
         rules = self.aisle_forbidden.get(int(aisle), {})
         if not rules:
             return False
@@ -590,6 +616,7 @@ class WarehouseCore:
         return False
 
     def _get_valid_inbound_aisles(self, task_or_stub: Any, production_line: Optional[int]) -> List[int]:
+        """获取有效的入库巷道列表"""
         if production_line is not None:
             base = [a for a in self.aisles if production_line in self.aisle_production_line_mapping.get(a, [])]
         else:
@@ -599,6 +626,7 @@ class WarehouseCore:
         return valid
 
     def _count_empty_positions_in_aisle(self, aisle: int) -> int:
+        """统计巷道中的空仓位数量"""
         cnt = 0
         for p in self.inventory_manager.inventory_positions:
             if p.aisle != aisle:
@@ -613,6 +641,7 @@ class WarehouseCore:
         return cnt
 
     def _count_running_inbound_in_aisle(self, aisle: int) -> int:
+        """统计巷道中正在运行的入库任务数量"""
         cnt = 0
         for t in self.running_tasks.values():
             try:
@@ -624,8 +653,8 @@ class WarehouseCore:
 
     def _get_projected_free_slots(self, aisle: int) -> int:
         """
-        Projected free slots after considering:
-        current empty slots - pending inbound queue - running inbound tasks.
+        预测空闲槽位数，考虑：
+        当前空槽 - 待处理入库队列 - 正在运行的入库任务
         """
         empty_cnt = self._count_empty_positions_in_aisle(int(aisle))
         pending_cnt = len(self.pending_inbound_by_aisle.get(int(aisle), []))
@@ -954,7 +983,7 @@ class WarehouseCore:
                         )
                     return new_events
             
-            # Record when inbound task actually enters aisle pending queue.
+            # 添加任务到待处理列表
             task.pending_enter_time = float(current_time)
             self.pending_inbound_by_aisle[aisle].append(task)
             if str(skid_type).strip() == "1":
@@ -1373,15 +1402,13 @@ class WarehouseCore:
             except Exception as e:
                 print(f"[DEBUG][dispatch] 生成空派发摘要失败: {e}")
 
-
-        # log
-        # with open(f'log_{self.scheduler_type}.txt', 'a') as f:
-        #     f.write(f"当前时间: {self.current_time:.2f}s, 事件: {events}\n")
-        #     f.write(f"aisle_task_sequences: {aisle_task_sequences}\n")
-
         return events
 
-    def set_production_plan(self, production_plan: Dict[int, List[List[List[str]]]]):
+    def set_production_plan(
+        self,
+        production_plan: Dict[int, List[List[List[str]]]],
+        current_groups: Optional[Dict[int, int]] = None,
+    ):
         """设置当日生产计划
         
         Args:
@@ -1391,9 +1418,16 @@ class WarehouseCore:
                 ...
             ]}
         """
-        self.production_plan = production_plan
-        # Validate outbound match features against production plan payload.
-        for pl, groups in production_plan.items():
+        normalized_plan = {
+            pl: list((production_plan or {}).get(pl, []) or [])
+            for pl in range(1, self.num_production_lines + 1)
+        }
+        for pl, groups in (production_plan or {}).items():
+            if pl not in normalized_plan:
+                normalized_plan[pl] = list(groups or [])
+        self.production_plan = normalized_plan
+        # 检查出库匹配特征
+        for pl, groups in self.production_plan.items():
             match_features = self._get_outbound_match_features(pl)
             required = [f for f in match_features if str(f).lower() != "rfid"]
             if not required:
@@ -1414,16 +1448,23 @@ class WarehouseCore:
                 
         # 重置进度
         for pl in range(1, self.num_production_lines + 1):
-            self.production_line_current_group[pl] = 0
+            group_count = len(self.production_plan.get(pl, []))
+            current_idx = 0
+            if current_groups is not None:
+                try:
+                    current_idx = int(current_groups.get(pl, 0) or 0)
+                except Exception:
+                    current_idx = 0
+            self.production_line_current_group[pl] = max(0, min(current_idx, group_count))
             self.production_line_completed_tasks[pl] = set()
             self.production_line_group_completion_times[pl] = []
         print(f"\n设置生产计划:")
-        for pl, groups in production_plan.items():
+        for pl, groups in self.production_plan.items():
             print(f"  产线{pl}: {len(groups)}组，每组{len(groups[0]) if groups else 0}个task")
     
     def update_blockage_status(self, aisle: int, out_line: int,
                                blocked: bool, unblock_time: float = 0.0):
-        """Update outbound blockage status.
+        """更新(aisle, out_line)的堵塞状态
         
         Args:
             aisle: aisle id
@@ -1437,7 +1478,7 @@ class WarehouseCore:
         }
     
     def check_blockage(self, aisle: int, out_line: int, current_time: float = 0.0) -> bool:
-        """Check whether (aisle, out_line) is blocked.
+        """检查(aisle, out_line)是否被堵塞
         
         Args:
             aisle: aisle id

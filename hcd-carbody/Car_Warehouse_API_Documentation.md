@@ -514,6 +514,25 @@ planIndex: [                     // 组列表
 
 **重要**: 若存在未确认任务（已派发但未收到 EXECUTING 反馈），接口返回 HTTP 409，拒绝新的调度请求，并在 `data.unconfirmed_tasks` 返回未确认任务列表。
 
+**生产计划输入模式（当前推荐）**:
+
+- `productionPlan` 推荐随 `POST /api/v1/schedule/mixed` 一起内联传入，调度服务会将其视为本次请求的最新计划约束。
+- `productionPlan` 结构与 `/api/v1/plan/production` 一致，支持一次传入多个产线的计划。
+- `currentGroups` 推荐使用对外 public 1-based 组号，例如 `{"LINE-1": 1}` 表示 LINE-1 当前可执行第 1 组。
+- `currentGroups` 也支持数组形式：`[{"lineId": "LINE-1", "currentGroup": 1}]`。
+- 旧客户端可继续传 `productionLineCurrentGroup`，其值直接使用 core 0-based 索引，例如 `{"LINE-1": 0}`。
+- 若 `currentGroups` 与 `productionLineCurrentGroup` 同时传入，以 `currentGroups` 为准。
+- 出库任务请求和响应中的 `planIndex` 保持 public 1-based；API 内部会转换为 core 0-based 后执行顺序约束。
+
+**补充请求参数（生产计划相关）**:
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| currentTime | String | 否 | 当前时间，格式 `YYYY-MM-DD HH:mm:ss` |
+| productionPlan | Object | 否 | 内联生产计划；推荐在每次调度请求中传入当前有效的 future plan |
+| currentGroups | Object / Array | 否 | 当前产线执行组号；推荐使用 public 1-based 组号 |
+| productionLineCurrentGroup | Object | 否 | 旧版当前组索引；直接使用 core 0-based 索引 |
+
 **请求参数**:
 
 | 字段        | 类型  | 必填 | 说明                                     |
@@ -605,6 +624,59 @@ planIndex: [                     // 组列表
 
 ```json
 {
+  "currentTime": "2026-01-21 10:15:00",
+  "productionPlan": {
+    "operationType": "ADD",
+    "planDate": "2026-01-21 09:00:00",
+    "plans": [
+      {
+        "planId": "PLAN-LINE1-20260121",
+        "lineId": "LINE-1",
+        "planIndex": [
+          {
+            "requiredSkus": [
+              [
+                {
+                  "skuId": "1RAT000001",
+                  "quantity": 1,
+                  "features": {
+                    "color": "W1",
+                    "skid_type": "0",
+                    "skid_state": "1"
+                  }
+                }
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "planId": "PLAN-LINE2-20260121",
+        "lineId": "LINE-2",
+        "planIndex": [
+          {
+            "requiredSkus": [
+              [
+                {
+                  "skuId": "1RAK000005",
+                  "quantity": 1,
+                  "features": {
+                    "color": "W1",
+                    "skid_type": "0",
+                    "skid_state": "1"
+                  }
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "currentGroups": {
+    "LINE-1": 1,
+    "LINE-2": 1
+  },
   "inventory": [],
   "aisleStatus": [
     {
@@ -1462,7 +1534,27 @@ INBOUND_A_1RAT000789
 
 ## 六、最佳实践与注意事项
 
-### 6.1 任务确认机制
+### 6.1 数据流程
+
+```
+外部系统                    API服务                    WarehouseCore
+    |                          |                           |
+    |-- POST /schedule/mixed ->|                           |
+    |(含productionPlan+currentGroups)                    |
+    |                          |-- set_production_plan() ->|
+    |                          |<- 确认 -------------------|
+    |<-- 调度响应 --------------|                           |
+    |                          |                           |
+    |-- POST /inbound/allocate>|                           |
+    |                          |-- allocate_inbound_aisle()|
+    |                          |<- 推荐巷道 --------------- |
+    |<-- 分配结果 -------------|                           |
+    |                          |                           |
+    |-- POST /schedule/mixed ->|                           |
+    |   (含productionPlan+currentGroups+aisleStatus+inventory)
+```
+
+### 6.2 任务确认机制
 
 **规则**: 系统每次只能处理一个未确认的任务。
 
@@ -1482,7 +1574,7 @@ INBOUND_A_1RAT000789
 2. 调用 `GET /api/v1/task/unconfirmed` 查看未确认任务
 3. 补发 `EXECUTING` 反馈或等待任务超时
 
-### 6.2 生产计划约束
+### 6.3 生产计划约束
 
 **规则**: 同一产线的任务必须按组顺序执行。
 
@@ -1497,7 +1589,7 @@ INBOUND_A_1RAT000789
 2. 组内任务数量不宜过多（建议 2-5 个）
 3. 定期检查生产计划进度（`GET /api/v1/plan/production`）
 
-### 6.3 库存同步策略
+### 6.4 库存同步策略
 
 **场景选择**:
 
@@ -1521,7 +1613,7 @@ INBOUND_A_1RAT000789
 - 如果只是想调度任务而不改变库存，请传入空数组 `[]`
 - 增量更新不会影响任务队列，适合频繁调用
 
-### 6.4 巷道拥堵管理
+### 6.5 巷道拥堵管理
 
 **拥堵设置时机**:
 
@@ -1543,7 +1635,7 @@ INBOUND_A_1RAT000789
 - 默认值：5.0
 - 示例：设置为 3.0 表示拥堵持续 3 秒
 
-### 6.5 错误处理建议
+### 6.6 错误处理建议
 
 | 错误类型       | HTTP 状态码 | 处理建议                           |
 | -------------- | ----------- | ---------------------------------- |

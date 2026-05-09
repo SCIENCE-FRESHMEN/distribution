@@ -7,6 +7,7 @@ import joblib
 from datetime import time, timedelta
 from math import sqrt
 
+from config_loader import load_jsonc
 from simulation.position import InventoryPosition
 
 import warnings
@@ -25,7 +26,7 @@ def load_time_estimator_config(path: Optional[str]) -> dict:
     if not cfg_path.exists():
         return {}
     try:
-        return json.loads(cfg_path.read_text(encoding="utf-8"))
+        return load_jsonc(cfg_path)
     except Exception:
         return {}
 

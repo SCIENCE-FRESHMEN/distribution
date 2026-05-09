@@ -188,40 +188,72 @@
 
 ---
 
-## 4. 生产计划接口
+## 4. 生产计划输入
 
-### 4.1 设置/更新生产计划 (POST /plan/production)
+### 4.1 内联生产计划 (POST /schedule/mixed)
 
-添加或更新当日生产计划。
+生产计划随 `POST /api/v1/schedule/mixed` 内联传入，调度服务以本次请求中的 `productionPlan` 和当前组进度作为最新计划约束。
 
 #### 请求参数
 
 ```json
 {
-  "operationType": "ADD|UPDATE",    // 必填，操作类型
-  "planDate": "2024-01-01 00:00:00", // 必填，计划日期
-  "plans": [
-    {
-      "planId": "string",           // 必填，计划ID
-      "lineId": "string",           // 必填，产线ID
-      "requiredSkus": [             // 必填，需求货物列表
-        {
-          "skuId": "string",        // 必填，货物ID
-          "quantity": 1             // 必填，需求数量
-        }
-      ]
-    }
+  "currentTime": "2026-01-21 10:15:00",
+  "productionPlan": {
+    "operationType": "ADD|UPDATE",
+    "planDate": "2026-01-21 09:00:00",
+    "plans": [
+      {
+        "planId": "string",
+        "lineId": "LINE-1",
+        "planIndex": [
+          {
+            "requiredSkus": [
+              [
+                {"skuId": "string", "quantity": 1}
+              ]
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "currentGroups": {"LINE-1": 1},
+  "inventory": [],
+  "aisleStatus": [],
+  "tasks": []
+}
+```
+
+`currentGroups` 是推荐字段，使用对外 public 1-based 组号；`{"LINE-1": 1}` 表示 LINE-1 当前可执行第 1 组。也支持列表形式：
+
+```json
+{
+  "currentGroups": [
+    {"lineId": "LINE-1", "currentGroup": 1}
   ]
 }
 ```
 
-#### 响应参数
+旧客户端可继续传 `productionLineCurrentGroup`，其值直接使用 core 0-based 索引：
 
 ```json
 {
-  "status": "SUCCESS|FAILED",       // 操作状态
-  "message": "string",              // 描述信息
-  "data": null                      // 业务数据（此接口为null）
+  "productionLineCurrentGroup": {"LINE-1": 0}
+}
+```
+
+若 `currentGroups` 与 `productionLineCurrentGroup` 同时传入，`currentGroups` 优先。出库任务请求和响应中的 `planIndex` 保持 public 1-based，API 内部转换为 core 0-based 后执行顺序约束。
+
+#### 响应参数
+
+响应沿用 `/schedule/mixed` 的统一响应结构：
+
+```json
+{
+  "status": "SUCCESS|FAILED",
+  "message": "string",
+  "data": {}
 }
 ```
 
@@ -247,10 +279,11 @@
 ```
 外部系统                    API服务                    WarehouseCore
     |                          |                           |
-    |-- POST /plan/production->|                           |
+    |-- POST /schedule/mixed ->|                           |
+    |   (含productionPlan+currentGroups)                    |
     |                          |-- set_production_plan() ->|
     |                          |<- 确认 -------------------|
-    |<-- SUCCESS --------------|                           |
+    |<-- 调度响应 --------------|                           |
     |                          |                           |
     |-- POST /inbound/allocate>|                           |
     |                          |-- allocate_inbound_aisle()|
@@ -258,7 +291,7 @@
     |<-- 分配结果 -------------|                           |
     |                          |                           |
     |-- POST /schedule/mixed ->|                           |
-    |   (含aisleStatus+inventory)                          |
+    |   (含productionPlan+currentGroups+aisleStatus+inventory)
     |                          |-- sync_aisle_status() --->|  ← 同步巷道状态
     |                          |-- sync_inventory() ------>|  ← 同步库存状态
     |                          |-- decide_for_idle_aisles()|

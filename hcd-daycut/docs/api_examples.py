@@ -11,6 +11,12 @@ from typing import Dict, List, Optional
 # API基础配置
 BASE_URL = "http://localhost:8000/api/v1"
 HEADERS = {"Content-Type": "application/json"}
+EXAMPLE_SKU_ATTRS = {
+    "version": "00",
+    "productionAttribute": "D",
+    "militaryCivilianMark": "M",
+    "salesArea": "N",
+}
 
 
 def format_timestamp() -> str:
@@ -19,45 +25,73 @@ def format_timestamp() -> str:
 
 
 # ============================================================
-# 1. 生产计划接口示例
+# 1. 内联生产计划示例
 # ============================================================
 
 def example_set_production_plan():
-    """示例：设置生产计划"""
-    url = f"{BASE_URL}/plan/production"
-    
+    """示例：通过混合调度接口内联设置生产计划"""
+    url = f"{BASE_URL}/schedule/mixed"
+
     payload = {
         "operationType": "ADD",
         "planDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "plans": [
             {
                 "planId": "PLAN-001",
-                "lineId": "LINE-1",
-                "requiredSkus": [
-                    {"skuId": "SKU-A1", "quantity": 10},
-                    {"skuId": "SKU-A2", "quantity": 10}
+                "lineId": "1",
+                "planIndex": [
+                    {
+                        "requiredSkus": [
+                            [
+                                {"skuId": "SKU-A1", "quantity": 10, **EXAMPLE_SKU_ATTRS},
+                                {"skuId": "SKU-A2", "quantity": 10, **EXAMPLE_SKU_ATTRS}
+                            ]
+                        ]
+                    }
                 ]
             },
             {
                 "planId": "PLAN-002",
-                "lineId": "LINE-2",
-                "requiredSkus": [
-                    {"skuId": "SKU-B1", "quantity": 8},
-                    {"skuId": "SKU-B2", "quantity": 8}
+                "lineId": "2",
+                "planIndex": [
+                    {
+                        "requiredSkus": [
+                            [
+                                {"skuId": "SKU-B1", "quantity": 8, **EXAMPLE_SKU_ATTRS},
+                                {"skuId": "SKU-B2", "quantity": 8, **EXAMPLE_SKU_ATTRS}
+                            ]
+                        ]
+                    }
                 ]
             },
             {
                 "planId": "PLAN-003",
-                "lineId": "LINE-3",
-                "requiredSkus": [
-                    {"skuId": "SKU-C1", "quantity": 12},
-                    {"skuId": "SKU-C2", "quantity": 12}
+                "lineId": "3",
+                "planIndex": [
+                    {
+                        "requiredSkus": [
+                            [
+                                {"skuId": "SKU-C1", "quantity": 12, **EXAMPLE_SKU_ATTRS},
+                                {"skuId": "SKU-C2", "quantity": 12, **EXAMPLE_SKU_ATTRS}
+                            ]
+                        ]
+                    }
                 ]
             }
         ]
     }
     
-    print("=== 设置生产计划 ===")
+    plan_payload = payload
+    payload = {
+        "currentTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "productionPlan": plan_payload,
+        "currentGroups": {"LINE-1": 1, "LINE-2": 1, "LINE-3": 1},
+        "inventory": [],
+        "aisleStatus": [],
+        "tasks": [],
+    }
+
+    print("=== 通过混合调度内联设置生产计划 ===")
     print(f"请求URL: {url}")
     print(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
     
@@ -78,16 +112,16 @@ def example_inbound_allocation():
     payload = {
         "tasks": [
             {
-                "taskId": "INBOUND-001",
+                "taskId": "INBOUND_SKU-A1_SKU-A2_20260330143000_001",
                 "skus": [
-                    {"skuId": "SKU-A1", "quantity": 1},
-                    {"skuId": "SKU-A2", "quantity": 1}
+                    {"skuId": "SKU-A1", "quantity": 1, "version": "00", "生产属性": "默认"},
+                    {"skuId": "SKU-A2", "quantity": 1, "version": "00", "生产属性": "默认"}
                 ]
             },
             {
-                "taskId": "INBOUND-002",
+                "taskId": "INBOUND_SKU-B1_20260330143000_001",
                 "skus": [
-                    {"skuId": "SKU-B1", "quantity": 1}
+                    {"skuId": "SKU-B1", "quantity": 1, "version": "00", "生产属性": "默认"}
                 ]
             }
         ]
@@ -115,34 +149,34 @@ def example_mixed_scheduling():
         "tasks": [
             # 入库任务
             {
-                "taskId": "INBOUND-003",
+                "taskId": "INBOUND_SKU-A1_SKU-A2_20260330143000_001",
                 "taskType": "INBOUND",
-                "targetAisle": "1",
+                "targetAisle": "4",
                 "skus": [
-                    {"skuId": "SKU-A1", "quantity": 1},
-                    {"skuId": "SKU-A2", "quantity": 1}
+                    {"skuId": "SKU-A1", "quantity": 1, "version": "00", "生产属性": "默认"},
+                    {"skuId": "SKU-A2", "quantity": 1, "version": "00", "生产属性": "默认"}
                 ],
                 "inboundUrgent": False
             },
             # 出库任务
             {
-                "taskId": "OUTBOUND-001",
+                "taskId": "OUTBOUND_PL1_GP1_SKU-A1_SKU-A2_20260330143000_001",
                 "taskType": "OUTBOUND",
                 "planId": "PLAN-001",
                 "planIndex": 1,
                 "skus": [
-                    {"skuId": "SKU-A1", "quantity": 1},
-                    {"skuId": "SKU-A2", "quantity": 1}
+                    {"skuId": "SKU-A1", "quantity": 1, "version": "00", "生产属性": "默认"},
+                    {"skuId": "SKU-A2", "quantity": 1, "version": "00", "生产属性": "默认"}
                 ]
             },
             {
-                "taskId": "OUTBOUND-002",
+                "taskId": "OUTBOUND_PL2_GP1_SKU-B1_SKU-B2_20260330143000_001",
                 "taskType": "OUTBOUND",
                 "planId": "PLAN-002",
                 "planIndex": 1,
                 "skus": [
-                    {"skuId": "SKU-B1", "quantity": 1},
-                    {"skuId": "SKU-B2", "quantity": 1}
+                    {"skuId": "SKU-B1", "quantity": 1, "version": "00", "生产属性": "默认"},
+                    {"skuId": "SKU-B2", "quantity": 1, "version": "00", "生产属性": "默认"}
                 ]
             }
         ],
@@ -211,7 +245,7 @@ def example_mixed_scheduling():
                 "column": 1,
                 "level": 1,
                 "shelf": "UPPER",
-                "positions": [{"skuId": "SKU-A1", "quantity": 1}]
+                "positions": [{"skuId": "SKU-A1", "quantity": 1, "version": "00", "生产属性": "默认"}]
             },
             {
                 "aisleId": "1",
@@ -219,7 +253,7 @@ def example_mixed_scheduling():
                 "column": 1,
                 "level": 1,
                 "shelf": "LOWER",
-                "positions": [{"skuId": "SKU-A2", "quantity": 1}]
+                "positions": [{"skuId": "SKU-A2", "quantity": 1, "version": "00", "生产属性": "默认"}]
             },
             {
                 "aisleId": "2",
@@ -227,7 +261,7 @@ def example_mixed_scheduling():
                 "column": 2,
                 "level": 2,
                 "shelf": "UPPER",
-                "positions": [{"skuId": "SKU-B1", "quantity": 1}]
+                "positions": [{"skuId": "SKU-B1", "quantity": 1, "version": "00", "生产属性": "默认"}]
             },
             {
                 "aisleId": "2",
@@ -235,7 +269,7 @@ def example_mixed_scheduling():
                 "column": 2,
                 "level": 2,
                 "shelf": "LOWER",
-                "positions": [{"skuId": "SKU-B2", "quantity": 1}]
+                "positions": [{"skuId": "SKU-B2", "quantity": 1, "version": "00", "生产属性": "默认"}]
             }
         ]
     }
@@ -254,10 +288,10 @@ def example_mixed_scheduling():
 # 4. 任务执行反馈接口示例
 # ============================================================
 
-def example_task_feedback_executing(task_id: str, task_type: str = "OUTBOUND"):
+def example_task_feedback_executing(task_id: str = "OUTBOUND_PL1_GP1_SKU-A1_SKU-A2_20260330143000_001", task_type: str = "OUTBOUND"):
     """示例：报告任务开始执行"""
     url = f"{BASE_URL}/task/feedback"
-    
+
     payload = {
         "taskId": task_id,
         "taskType": task_type,
@@ -276,10 +310,10 @@ def example_task_feedback_executing(task_id: str, task_type: str = "OUTBOUND"):
     return response.json()
 
 
-def example_task_feedback_completed(task_id: str, task_type: str = "OUTBOUND"):
+def example_task_feedback_completed(task_id: str = "OUTBOUND_PL1_GP1_SKU-A1_SKU-A2_20260330143000_001", task_type: str = "OUTBOUND"):
     """示例：报告任务完成"""
     url = f"{BASE_URL}/task/feedback"
-    
+
     payload = {
         "taskId": task_id,
         "taskType": task_type,
@@ -298,10 +332,10 @@ def example_task_feedback_completed(task_id: str, task_type: str = "OUTBOUND"):
     return response.json()
 
 
-def example_task_feedback_failed(task_id: str, task_type: str = "OUTBOUND", reason: str = "设备故障"):
+def example_task_feedback_failed(task_id: str = "OUTBOUND_PL1_GP1_SKU-A1_SKU-A2_20260330143000_001", task_type: str = "OUTBOUND", reason: str = "设备故障"):
     """示例：报告任务失败"""
     url = f"{BASE_URL}/task/feedback"
-    
+
     payload = {
         "taskId": task_id,
         "taskType": task_type,
@@ -329,7 +363,7 @@ def example_full_workflow():
     示例：完整的工作流程
     
     流程说明：
-    1. 设置生产计划
+    1. 通过混合调度接口内联提交生产计划
     2. 请求入库巷道分配
     3. 发起混合调度
     4. 接收调度结果后，报告任务开始执行（EXECUTING）
@@ -339,8 +373,8 @@ def example_full_workflow():
     print("完整工作流程示例")
     print("=" * 60)
     
-    # 步骤1：设置生产计划
-    print("\n>>> 步骤1：设置生产计划")
+    # 步骤1：通过混合调度接口内联设置生产计划
+    print("\n>>> 步骤1：内联设置生产计划")
     plan_result = example_set_production_plan()
     
     # 步骤2：请求入库巷道分配
@@ -391,13 +425,22 @@ class WarehouseAPIClient:
         self.headers = {"Content-Type": "application/json"}
         self.pending_tasks: Dict[str, dict] = {}  # 待确认的任务
     
-    def set_production_plan(self, plans: List[dict], operation_type: str = "ADD") -> dict:
-        """设置生产计划"""
-        url = f"{self.base_url}/plan/production"
-        payload = {
+    def set_production_plan(self, plans: List[dict], operation_type: str = "ADD",
+                            current_groups: Optional[Dict[str, int]] = None) -> dict:
+        """通过混合调度接口内联设置生产计划"""
+        url = f"{self.base_url}/schedule/mixed"
+        plan_payload = {
             "operationType": operation_type,
             "planDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "plans": plans
+        }
+        payload = {
+            "currentTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "productionPlan": plan_payload,
+            "currentGroups": current_groups or {"LINE-1": 1, "LINE-2": 1, "LINE-3": 1},
+            "inventory": [],
+            "aisleStatus": [],
+            "tasks": [],
         }
         response = requests.post(url, json=payload, headers=self.headers)
         return response.json()
@@ -409,8 +452,10 @@ class WarehouseAPIClient:
         response = requests.post(url, json=payload, headers=self.headers)
         return response.json()
     
-    def request_schedule(self, tasks: List[dict], aisle_status: List[dict], 
-                        inventory: List[dict]) -> dict:
+    def request_schedule(self, tasks: List[dict], aisle_status: List[dict],
+                        inventory: List[dict], production_plan: Optional[dict] = None,
+                        current_groups: Optional[Dict[str, int]] = None,
+                        production_line_current_group: Optional[Dict[str, int]] = None) -> dict:
         """请求混合调度"""
         url = f"{self.base_url}/schedule/mixed"
         payload = {
@@ -418,6 +463,12 @@ class WarehouseAPIClient:
             "aisleStatus": aisle_status,
             "inventory": inventory
         }
+        if production_plan is not None:
+            payload["productionPlan"] = production_plan
+        if current_groups is not None:
+            payload["currentGroups"] = current_groups
+        elif production_line_current_group is not None:
+            payload["productionLineCurrentGroup"] = production_line_current_group
         response = requests.post(url, json=payload, headers=self.headers)
         result = response.json()
         
@@ -489,8 +540,8 @@ if __name__ == "__main__":
     elif args.example == "schedule":
         example_mixed_scheduling()
     elif args.example == "feedback":
-        example_task_feedback_executing("TEST-001", "OUTBOUND")
-        example_task_feedback_completed("TEST-001", "OUTBOUND")
+        example_task_feedback_executing("OUTBOUND_PL1_GP1_SKU-A1_SKU-A2_20260330143000_001", "OUTBOUND")
+        example_task_feedback_completed("OUTBOUND_PL1_GP1_SKU-A1_SKU-A2_20260330143000_001", "OUTBOUND")
     else:
         example_full_workflow()
 

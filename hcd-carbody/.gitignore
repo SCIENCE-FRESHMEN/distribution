@@ -26,10 +26,5 @@ dist/
 *.xlsx
 simulation/data/
 *.txt
-*.json
-
-*.png
-*.xlsx
-simulation/data/
-*.txt
-*.json
+*.csv
+logs/

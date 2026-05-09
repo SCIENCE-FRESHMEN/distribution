@@ -93,6 +93,86 @@ class WarehouseService:
 
     def _get_match_fields(self, production_line: Optional[int] = None) -> List[str]:
         return list(self._core._get_outbound_match_features(production_line) or [])
+
+    def _normalize_line_id(self, value: Any) -> Optional[int]:
+        return self._to_int_or_none(value)
+
+    def _build_core_production_plan(self, production_plan: Any) -> Dict[int, List[Any]]:
+        plans = production_plan.plans if hasattr(production_plan, "plans") else production_plan.get("plans", [])
+        core_plan: Dict[int, List[Any]] = {}
+
+        for plan in plans or []:
+            line_id_raw = plan.lineId if hasattr(plan, "lineId") else plan.get("lineId")
+            line_id = self._normalize_line_id(line_id_raw)
+            if line_id is None:
+                continue
+
+            match_fields = list(self._core._get_outbound_match_features(line_id) or [])
+            feature_fields = [f for f in match_fields if str(f).lower() != "rfid"]
+            groups = []
+            plan_groups = plan.planIndex if hasattr(plan, "planIndex") else plan.get("planIndex", [])
+            for group in plan_groups or []:
+                tasks_in_group = []
+                required_skus = group.requiredSkus if hasattr(group, "requiredSkus") else group.get("requiredSkus", [])
+                for task_skus in required_skus or []:
+                    sku_list = []
+                    for sku in task_skus or []:
+                        sku_entry = {"skuId": sku.skuId if hasattr(sku, "skuId") else sku.get("skuId")}
+                        quantity = sku.quantity if hasattr(sku, "quantity") else sku.get("quantity", 1)
+                        for _ in range(int(quantity or 0)):
+                            item = dict(sku_entry)
+                            if feature_fields:
+                                features = {}
+                                for field in feature_fields:
+                                    value = getattr(sku, field, None) if hasattr(sku, field) else sku.get(field)
+                                    if value is not None:
+                                        features[field] = value
+                                raw_features = sku.features if hasattr(sku, "features") else sku.get("features")
+                                if isinstance(raw_features, dict):
+                                    for field in feature_fields:
+                                        if field in raw_features and raw_features[field] is not None:
+                                            features[field] = raw_features[field]
+                                if features:
+                                    item["features"] = features
+                            sku_list.append(item)
+                    tasks_in_group.append(sku_list)
+                groups.append(tasks_in_group)
+            core_plan[line_id] = groups
+
+        return core_plan
+
+    def _normalize_current_groups(
+        self,
+        current_groups: Any = None,
+        legacy_current_groups: Any = None,
+    ) -> Optional[Dict[int, int]]:
+        normalized: Dict[int, int] = {}
+
+        if current_groups is not None:
+            if isinstance(current_groups, dict):
+                rows = [{"lineId": key, "currentGroup": value} for key, value in current_groups.items()]
+            else:
+                rows = current_groups
+            for row in rows or []:
+                line_id = self._normalize_line_id(
+                    row.lineId if hasattr(row, "lineId") else row.get("lineId")
+                )
+                group_num = row.currentGroup if hasattr(row, "currentGroup") else row.get("currentGroup")
+                if line_id is None or group_num is None:
+                    continue
+                normalized[line_id] = max(0, int(group_num) - 1)
+            return normalized
+
+        if legacy_current_groups is None:
+            return None
+
+        rows = legacy_current_groups.items() if isinstance(legacy_current_groups, dict) else []
+        for line_key, group_idx in rows:
+            line_id = self._normalize_line_id(line_key)
+            if line_id is None or group_idx is None:
+                continue
+            normalized[line_id] = max(0, int(group_idx))
+        return normalized
     @staticmethod
     def _to_int_or_none(value: Any) -> Optional[int]:
         if value is None:
@@ -568,7 +648,7 @@ class WarehouseService:
             if out_line is not None:
                 task_data.out_line = out_line
             task_data.plan_id = plan_id
-            task_data.group_idx = plan_index
+            task_data.group_idx = (int(plan_index) - 1) if plan_index is not None else None
             if self._is_empty_skid_request(sku_list):
                 # Empty-skid outbound is an ad-hoc operational request rather than
                 # a production-plan step: do not bind it to plan/group progression.
@@ -836,13 +916,25 @@ class WarehouseService:
         if task is None:
             return task_id in self._core.running_tasks
 
+        if task_type == "OUTBOUND":
+            self._core.pending_outbound_queue = [t for t in self._core.pending_outbound_queue if t.task_id != task_id]
+        else:
+            for aisle in list(self._core.pending_inbound_by_aisle.keys()):
+                self._core.pending_inbound_by_aisle[aisle] = [
+                    t for t in self._core.pending_inbound_by_aisle[aisle] if t.task_id != task_id
+                ]
+
         if not getattr(task, "task_record", None):
             task.task_record = self._core.generate_task_record(task, self._core.current_time)
         self._core.running_tasks[task_id] = task
         return True
 
     def _complete_task_execution(self, task_id: str) -> bool:
+        self._pending_execution_tasks.pop(task_id, None)
         task = self._core.running_tasks.pop(task_id, None)
+        self._core.pending_outbound_queue = [t for t in self._core.pending_outbound_queue if t.task_id != task_id]
+        for aisle in list(self._core.pending_inbound_by_aisle.keys()):
+            self._core.pending_inbound_by_aisle[aisle] = [t for t in self._core.pending_inbound_by_aisle[aisle] if t.task_id != task_id]
         if task is None:
             return False
         self._core.completed_tasks.append(task)
@@ -858,14 +950,41 @@ class WarehouseService:
             self._core.pending_inbound_by_aisle[aisle] = [t for t in self._core.pending_inbound_by_aisle[aisle] if t.task_id != task_id]
         return True
 
-    def set_production_plan(self, production_plan: Any, update: bool = False) -> bool:
+    def set_production_plan(
+        self,
+        production_plan: Any,
+        update: bool = False,
+        current_groups: Any = None,
+        legacy_current_groups: Any = None,
+    ) -> bool:
         self._sync_time()
         try:
-            core_plan = production_plan.get("production_plan", {}) if isinstance(production_plan, dict) and "production_plan" in production_plan else production_plan
-            self._core.set_production_plan(core_plan)
+            if isinstance(production_plan, dict) and "production_plan" in production_plan:
+                core_plan = production_plan.get("production_plan", {}) or {}
+            elif isinstance(production_plan, dict) and "plans" in production_plan:
+                core_plan = self._build_core_production_plan(production_plan)
+            elif hasattr(production_plan, "plans"):
+                core_plan = self._build_core_production_plan(production_plan)
+            else:
+                core_plan = production_plan or {}
+
+            current_group_map = self._normalize_current_groups(current_groups, legacy_current_groups)
+            self._core.set_production_plan(core_plan, current_groups=current_group_map)
             return True
         except Exception:
             return False
+
+    def set_current_groups(self, current_groups: Any = None, legacy_current_groups: Any = None) -> bool:
+        self._sync_time()
+        current_group_map = self._normalize_current_groups(current_groups, legacy_current_groups)
+        if current_group_map is None:
+            return True
+        for line_id, group_idx in current_group_map.items():
+            group_count = len(self._core.production_plan.get(line_id, []) or [])
+            self._core.production_line_current_group[line_id] = max(0, min(int(group_idx), group_count))
+            self._core.production_line_completed_tasks[line_id] = set()
+            self._core.production_line_group_completion_times[line_id] = []
+        return True
 
     def get_production_plan(self) -> Dict[int, List]:
         return self._core.production_plan

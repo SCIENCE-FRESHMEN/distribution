@@ -3,8 +3,9 @@
 
 """
 
+import math
 import time
-from typing import Dict, List
+from typing import Any, Dict, List
 from simulation.task_data import TaskData, TASK_TYPE_INBOUND, TASK_TYPE_OUTBOUND
 import random
 
@@ -28,6 +29,63 @@ class HeuristicScheduler:
         
         # 入库货位分配器（如果warehouse_core有设置）
         self.position_allocator = None
+
+    def _fifo_enabled(self) -> bool:
+        return bool(getattr(self.warehouse_core, "outbound_fifo_enabled", False))
+
+    def _extract_position_inbound_time(self, pos, sku_id: str, attrs: dict) -> float:
+        times = []
+        if getattr(pos, "is_double_layer", False):
+            if pos.matches_sku(sku_id, attrs, self.warehouse_core.match_fields, shelf='upper'):
+                times.append((getattr(pos, "upper_attrs", {}) or {}).get("_inbound_time"))
+            if pos.matches_sku(sku_id, attrs, self.warehouse_core.match_fields, shelf='lower'):
+                times.append((getattr(pos, "lower_attrs", {}) or {}).get("_inbound_time"))
+        else:
+            if pos.matches_sku(sku_id, attrs, self.warehouse_core.match_fields):
+                times.append((getattr(pos, "sku_attrs", {}) or {}).get("_inbound_time"))
+
+        parsed = []
+        for value in times:
+            if value is None:
+                parsed.append(0.0)
+                continue
+            try:
+                parsed.append(float(value))
+            except Exception:
+                parsed.append(0.0)
+        return min(parsed) if parsed else math.inf
+
+    def _position_fifo_time(self, task: TaskData, pos) -> float:
+        sku_ids = task.get_sku_ids()
+        if not sku_ids:
+            return math.inf
+
+        sku_attrs_map = {}
+        for s in (task.skus or []):
+            sku_dict = self._sku_entry_to_dict(s)
+            sku_id = sku_dict.get("skuId")
+            if sku_id and sku_id not in sku_attrs_map:
+                sku_attrs_map[sku_id] = self._extract_sku_attrs(sku_dict)
+
+        times = [
+            self._extract_position_inbound_time(pos, sku_id, sku_attrs_map.get(sku_id, {}))
+            for sku_id in sku_ids
+        ]
+        return min(times) if times else math.inf
+
+    def _select_outbound_position(self, task: TaskData, positions: List[Any]):
+        if not positions:
+            return None
+        if not self._fifo_enabled():
+            return random.choice(positions)
+        return min(
+            positions,
+            key=lambda p: (
+                self._position_fifo_time(task, p),
+                -p.column,
+                p.level,
+            ),
+        )
 
     def _sku_entry_to_dict(self, sku):
         if isinstance(sku, dict):
@@ -141,6 +199,8 @@ class HeuristicScheduler:
                         and pos.matches_pair(sku1, attrs1, sku2, attrs2, self.warehouse_core.match_fields)
                         and pos.upper_quantity > 0 
                         and pos.lower_quantity > 0):
+                        if self.warehouse_core._is_position_reserved_for_other_task(pos, task.task_id):
+                            continue
                         if pos.aisle not in available_positions_by_aisle:
                             available_positions_by_aisle[pos.aisle] = []
                         available_positions_by_aisle[pos.aisle].append(pos)
@@ -194,9 +254,15 @@ class HeuristicScheduler:
                 
                 # 从有效巷道中选择任务最少的巷道
                 if valid_aisles:
-                    best_aisle = min(valid_aisles, key=lambda a: aisle_task_count[a])
-                    # 在该巷道中选择最优位置,随便选一个
-                    best_position = random.choice(available_positions_by_aisle[best_aisle])
+                    best_aisle = min(
+                        valid_aisles,
+                        key=lambda a: (
+                            aisle_task_count[a],
+                            self._position_fifo_time(task, self._select_outbound_position(task, available_positions_by_aisle[a])) if self._fifo_enabled() else 0.0,
+                            a,
+                        ),
+                    )
+                    best_position = self._select_outbound_position(task, available_positions_by_aisle[best_aisle])
                     aisle_task_count[best_aisle] += 1
                     task_position_assignments[task.task_id] = [best_position]
         

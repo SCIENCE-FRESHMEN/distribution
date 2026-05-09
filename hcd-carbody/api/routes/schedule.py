@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends
 from ..models import MixedScheduleRequest, PositionInfo, TaskType
 from ..response import fail, ok
 from ..services.warehouse_service import WarehouseService, get_warehouse_service
-from ..state import TaskStateManager, get_task_state_manager
+from ..state import PendingTaskStatus, TaskStateManager, get_task_state_manager
 
 router = APIRouter(prefix="/schedule", tags=["schedule"])
 
@@ -207,6 +207,23 @@ async def mixed_schedule(
 
     current_stage = "init"
     try:
+        current_stage = "sync_production_context"
+        if request.productionPlan is not None:
+            success = warehouse_service.set_production_plan(
+                request.productionPlan,
+                current_groups=request.currentGroups,
+                legacy_current_groups=request.productionLineCurrentGroup,
+            )
+            if not success:
+                return fail(message="生产计划同步失败", http_status=400, data={"stage": current_stage})
+        elif request.currentGroups is not None or request.productionLineCurrentGroup is not None:
+            success = warehouse_service.set_current_groups(
+                current_groups=request.currentGroups,
+                legacy_current_groups=request.productionLineCurrentGroup,
+            )
+            if not success:
+                return fail(message="当前组进度同步失败", http_status=400, data={"stage": current_stage})
+
         current_stage = "sync_aisle_status"
         warehouse_service.sync_aisle_status(request.aisleStatus)
 
@@ -315,7 +332,8 @@ async def mixed_schedule(
 
             task_type = TaskType.OUTBOUND.value if assigned_task.task_type == "OUTBOUND" else TaskType.INBOUND.value
             plan_id = getattr(assigned_task, "plan_id", None)
-            plan_index = getattr(assigned_task, "group_idx", None)
+            raw_group_idx = getattr(assigned_task, "group_idx", None)
+            plan_index = (int(raw_group_idx) + 1) if raw_group_idx is not None else None
             if (plan_id is None or plan_index is None) and isinstance(getattr(assigned_task, "task_id", None), str):
                 m = re.match(r"^OUTBOUND_PL(\d+)_GP(\d+)_", assigned_task.task_id)
                 if m:
@@ -371,7 +389,13 @@ async def mixed_schedule(
                     assigned_response["outLine"] = meta_out
 
             aisle_assignments.append({"aisleId": str(aisle_id), "assignedTask": assigned_response})
-            task_manager.add_pending_task(task_id=assigned_task.task_id, task_type=assigned_task.task_type, aisle_id=str(aisle_id))
+            existing_pending = task_manager.get_task(str(assigned_task.task_id))
+            if existing_pending is None or existing_pending.status == PendingTaskStatus.PENDING:
+                task_manager.add_pending_task(
+                    task_id=assigned_task.task_id,
+                    task_type=assigned_task.task_type,
+                    aisle_id=str(aisle_id),
+                )
 
         forbidden_check = _build_aisle_forbidden_checks(warehouse_service.core, aisle_assignments, task_skus_map)
         code = 0 if forbidden_check.get("passed", True) else 1001

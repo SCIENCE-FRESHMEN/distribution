@@ -287,6 +287,16 @@ class InventoryPositionRequest(BaseModel):
 
 class MixedScheduleRequest(BaseModel):
     """混合调度请求"""
+    currentTime: Optional[str] = Field(None, description="当前时间，格式：YYYY-MM-DD HH:mm:ss")
+    productionPlan: Optional["ProductionPlanRequest"] = Field(None, description="内联生产计划（可选）")
+    currentGroups: Optional[Union[Dict[str, int], List["CurrentGroupRequest"]]] = Field(
+        None,
+        description="当前产线执行组号；推荐使用 public 1-based 组号",
+    )
+    productionLineCurrentGroup: Optional[Dict[str, int]] = Field(
+        None,
+        description="旧版当前组索引，直接使用 core 0-based 索引",
+    )
     tasks: List[ScheduleTaskRequest] = Field(..., description="任务列表")
     aisleStatus: List[AisleStatusRequest] = Field(..., description="巷道状态列表")
     inventory: List[InventoryPositionRequest] = Field(..., description="库存信息")
@@ -384,6 +394,21 @@ class MixedScheduleRequest(BaseModel):
                         }
                     ]
                 }]
+            }
+        }
+    }
+
+
+class CurrentGroupRequest(BaseModel):
+    """当前产线执行组号"""
+    lineId: str = Field(..., description="产线ID")
+    currentGroup: int = Field(..., ge=1, description="当前可执行组号（public 1-based）")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "lineId": "LINE-1",
+                "currentGroup": 1,
             }
         }
     }
@@ -885,4 +910,7 @@ class BomUpdateResponse(BaseModel):
             }
         }
     }
+
+
+MixedScheduleRequest.model_rebuild()
 

@@ -6,22 +6,29 @@ import argparse
 import re
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 import numpy as np
 
-plt.style.use("seaborn-v0_8-whitegrid")
-plt.rcParams.update(
-    {
-        "font.sans-serif": ["SimHei", "Arial Unicode MS", "DejaVu Sans"],
-        "axes.unicode_minus": False,
-        "font.size": 12,
-        "axes.titlesize": 16,
-        "axes.labelsize": 13,
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 11,
-        "legend.fontsize": 11,
-    }
-)
+if plt is not None:
+    try:
+        plt.style.use("seaborn-v0_8-whitegrid")
+    except OSError:
+        plt.style.use("seaborn-whitegrid")
+    plt.rcParams.update(
+        {
+            "font.sans-serif": ["SimHei", "Arial Unicode MS", "DejaVu Sans"],
+            "axes.unicode_minus": False,
+            "font.size": 12,
+            "axes.titlesize": 16,
+            "axes.labelsize": 13,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "legend.fontsize": 11,
+        }
+    )
 
 # 需要展示的策略及显示名称
 STRATEGIES = {
@@ -32,7 +39,7 @@ STRATEGIES = {
 }
 
 # 仅使用的天数；设为空集合表示不筛选
-DAYS_FILTER = {1,2,4,5,6}
+DAYS_FILTER = set()
 
 # 为每个策略指定固定颜色，所有图保持一致（仿照示例：灰/浅蓝/深蓝）
 COLORS = {
@@ -45,7 +52,21 @@ COLORS = {
 OUTPUT_DIR = Path("visualization/compare")
 
 
+def read_log_text(file_path: Path) -> str:
+    """Read log text with common Windows/terminal encoding fallbacks."""
+    raw = file_path.read_bytes()
+    for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
 def save_fig(filename: str) -> None:
+    if plt is None:
+        print("[WARN] matplotlib unavailable; skip figure output")
+        return
     out_path = OUTPUT_DIR / filename
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
@@ -74,7 +95,7 @@ def parse_log_file(file_path: Path):
         "production_lines": {},
     }
 
-    content = file_path.read_text(encoding="utf-8")
+    content = read_log_text(file_path)
     if "全部天汇总" in content:
         content_for_days = content.split("全部天汇总", 1)[1]
     else:
@@ -298,15 +319,16 @@ def calculate_aisle_busy_times(task_details):
     return day_stats
 
 
-def load_all_data(log_dir="logs"):
+def load_all_data(log_dir="logs", days_filter=None):
     all_data = {}
     log_path = Path(log_dir)
+    effective_days_filter = DAYS_FILTER if days_filter is None else set(days_filter)
     for strategy_file, strategy_name in STRATEGIES.items():
         file_path = log_path / f"{strategy_file}.txt"
         if file_path.exists():
             print(f"正在解析 {strategy_file}.txt...")
             parsed = parse_log_file(file_path)
-            all_data[strategy_file] = _filter_days(parsed, DAYS_FILTER)
+            all_data[strategy_file] = _filter_days(parsed, effective_days_filter)
         else:
             print(f"警告: 找不到文件 {file_path}")
     return all_data
@@ -477,11 +499,11 @@ def plot_completion_times(all_data):
         heights = []
         for day in days_list:
             outbound_tasks = [t for t in day_tasks.get(day, []) if t["type"] == "出库"]
-            heights.append(max((t["end_time"] for t in outbound_tasks), default=0))
+            heights.append(max((t["end_time"] for t in outbound_tasks), default=0) / 3600.0)
         valid_heights = [h for h in heights if h > 0]
         if valid_heights:
             avg_val = sum(valid_heights) / len(valid_heights)
-            legend_label = f"{strategy_name}: {avg_val:.2f}s"
+            legend_label = f"{strategy_name}: {avg_val:.2f}h"
         else:
             legend_label = strategy_name
         offsets = x + (idx_strategy - (len(strategies) - 1) / 2) * bar_width
@@ -495,11 +517,11 @@ def plot_completion_times(all_data):
         for bar in bars:
             h = bar.get_height()
             if h > 0:
-                plt.text(bar.get_x() + bar.get_width() / 2, h + 0.5, f"{h:.1f}", ha="center", va="bottom", fontsize=10)
+                plt.text(bar.get_x() + bar.get_width() / 2, h + 0.02, f"{h:.2f}", ha="center", va="bottom", fontsize=10)
 
     plt.xticks(x, [f"Day {d}" for d in days_list])
     plt.xlabel("天数")
-    plt.ylabel("最后出库任务完成时间 (s)")
+    plt.ylabel("最后出库任务完成时间 (h)")
     title = "每日最后出库任务完成时间"
     plt.grid(True, axis="y", linestyle="--", alpha=0.4)
     plt.legend(frameon=False, ncol=len(strategies), loc="upper center", bbox_to_anchor=(0.5, 1.1))
@@ -508,6 +530,83 @@ def plot_completion_times(all_data):
     save_fig("completion_times.png")
     plt.show()
 
+
+def _plot_daily_hourly_throughput(all_data, task_type_label: str, out_name: str, y_label: str, title: str):
+    plt.figure(figsize=(12, 7))
+    strategies = list(STRATEGIES.items())
+    if DAYS_FILTER:
+        days_list = sorted(DAYS_FILTER)
+    else:
+        day_set = set()
+        for data in all_data.values():
+            day_set |= set(data.get("task_completion_details", {}).keys())
+        days_list = sorted(day_set)
+    if not days_list:
+        print("No task completion data, skip throughput chart")
+        return
+
+    x = np.arange(len(days_list))
+    total_width = 0.75
+    bar_width = total_width / len(strategies)
+
+    for idx_strategy, (strategy_file, strategy_name) in enumerate(strategies):
+        data = all_data.get(strategy_file, {})
+        day_tasks = data.get("task_completion_details", {})
+        heights = []
+        for day in days_list:
+            tasks = [t for t in day_tasks.get(day, []) if t["type"] == task_type_label]
+            count = len(tasks)
+            last_hours = max((t["end_time"] for t in tasks), default=0) / 3600.0
+            throughput = (count / last_hours) if (count > 0 and last_hours > 0) else 0.0
+            heights.append(throughput)
+        valid_heights = [h for h in heights if h > 0]
+        if valid_heights:
+            avg_val = sum(valid_heights) / len(valid_heights)
+            legend_label = f"{strategy_name}: {avg_val:.2f}"
+        else:
+            legend_label = strategy_name
+        offsets = x + (idx_strategy - (len(strategies) - 1) / 2) * bar_width
+        bars = plt.bar(
+            offsets,
+            heights,
+            width=bar_width,
+            label=legend_label,
+            color=COLORS.get(strategy_file),
+        )
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2, h + 0.02, f"{h:.2f}", ha="center", va="bottom", fontsize=10)
+
+    plt.xticks(x, [f"Day {d}" for d in days_list])
+    plt.xlabel("天数")
+    plt.ylabel(y_label)
+    plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+    plt.legend(frameon=False, ncol=len(strategies), loc="upper center", bbox_to_anchor=(0.5, 1.1))
+    plt.subplots_adjust(bottom=0.12)
+    plt.figtext(0.5, 0.005, title, ha="center", fontsize=14)
+    save_fig(out_name)
+    plt.show()
+
+
+def plot_outbound_hourly_throughput(all_data):
+    _plot_daily_hourly_throughput(
+        all_data=all_data,
+        task_type_label="出库",
+        out_name="outbound_hourly_throughput.png",
+        y_label="日均出库每小时节拍 (任务数/小时)",
+        title="每日平均出库每小时节拍",
+    )
+
+
+def plot_inbound_hourly_throughput(all_data):
+    _plot_daily_hourly_throughput(
+        all_data=all_data,
+        task_type_label="入库",
+        out_name="inbound_hourly_throughput.png",
+        y_label="日均入库每小时节拍 (任务数/小时)",
+        title="每日平均入库每小时节拍",
+    )
 
 
 def plot_relocation_counts_by_day(all_data):
@@ -751,7 +850,17 @@ def print_relocation_counts_by_day(all_data):
         print("  移库数量(天):", info)
 
 
+def parse_days_filter(days_text: str):
+    if not days_text:
+        return set()
+    return {int(part.strip()) for part in days_text.split(",") if part.strip()}
+
+
 def main():
+    if plt is None:
+        print("错误: matplotlib 未安装，无法生成可视化图表。")
+        return
+
     parser = argparse.ArgumentParser(description="可视化分析仓储策略仿真结果")
     parser.add_argument(
         "--rate-type",
@@ -780,6 +889,8 @@ def main():
     plot_pairing_start_by_day(all_data)
     plot_tasks_completed_per_day(all_data)
     plot_completion_times(all_data)
+    plot_outbound_hourly_throughput(all_data)
+    plot_inbound_hourly_throughput(all_data)
     plot_relocation_counts_by_day(all_data)
     plot_avg_utilization_by_day(all_data)
     print("\n图表已生成并保存到当前目录")

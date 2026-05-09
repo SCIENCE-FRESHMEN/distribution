@@ -3,6 +3,7 @@ Baseline Strategy
 """
 
 from typing import List, Dict, Optional, Tuple
+from copy import deepcopy
 import sys
 sys.path.append('..')
 from simulation.position import InventoryPosition
@@ -24,6 +25,7 @@ class BaselineAisleAllocator:
         self.config_data = SKUConfigBuilder.load_json("simulation/data/sku_config.json")
         self.sku_pairs = self.config_data["sku_pairs"]
         self.sku_solo = self.config_data["sku_solo"]
+        self.position_allocator = BaselinePositionAllocator(warehouse_core)
 
     def _extract_attrs(self, sku_entry: Optional[Dict]) -> Dict:
         if not self.match_fields or not isinstance(sku_entry, dict):
@@ -45,6 +47,114 @@ class BaselineAisleAllocator:
             if attrs_a.get(field) != attrs_b.get(field):
                 return False
         return True
+
+    def _build_task_for_simulation(self, skus_data: List[Dict], aisle: int,
+                                   task_id: Optional[str] = None) -> TaskData:
+        return TaskData(
+            task_id=task_id or f"SIM_INBOUND_{aisle}",
+            task_type="INBOUND",
+            skus=deepcopy(skus_data),
+            assigned_aisle=aisle,
+        )
+
+    def _resolve_inbound_layer(self, pos: InventoryPosition,
+                               allocated_positions: List[InventoryPosition],
+                               sku_count: int,
+                               non_null_idx: int) -> Optional[str]:
+        if pos.is_double_layer and sku_count > 1:
+            if len(allocated_positions) == 2:
+                if allocated_positions[0] == allocated_positions[1]:
+                    if pos.row == 1:
+                        return 'upper' if non_null_idx == 0 else 'lower'
+                    if pos.row == 2:
+                        return 'lower' if non_null_idx == 0 else 'upper'
+                    return None
+                if ((pos.upper_sku is not None and pos.upper_sku != '') and
+                    (pos.lower_sku is None or pos.lower_sku == '')):
+                    return 'lower'
+                if ((pos.upper_sku is None or pos.upper_sku == '') and
+                    (pos.lower_sku is None or pos.lower_sku == '')):
+                    return 'upper'
+                return None
+            return 'upper' if non_null_idx == 0 else 'lower'
+
+        if pos.is_double_layer and sku_count == 1:
+            if pos.upper_quantity == 0:
+                return 'upper'
+            if pos.lower_quantity == 0:
+                return 'lower'
+            return None
+
+        return None
+
+    def _apply_simulated_inbound(self, allocated_positions: List[InventoryPosition],
+                                 skus_data: List[Dict]) -> bool:
+        sku_entries = [s for s in skus_data if isinstance(s, dict)]
+        sku_ids = [s.get('skuId') for s in sku_entries if s.get('skuId') is not None]
+        non_null_idx = 0
+
+        for sku_entry in sku_entries:
+            sku_id = sku_entry.get('skuId')
+            if sku_id is None:
+                continue
+
+            pos = allocated_positions[min(non_null_idx, len(allocated_positions) - 1)]
+            layer = self._resolve_inbound_layer(pos, allocated_positions, len(sku_ids), non_null_idx)
+
+            if pos.is_double_layer:
+                if layer == 'upper':
+                    if pos.upper_quantity > 0:
+                        return False
+                    pos.upper_sku = sku_id
+                    pos.upper_quantity = 1
+                    pos.upper_attrs = self._extract_attrs(sku_entry)
+                elif layer == 'lower':
+                    if pos.lower_quantity > 0:
+                        return False
+                    pos.lower_sku = sku_id
+                    pos.lower_quantity = 1
+                    pos.lower_attrs = self._extract_attrs(sku_entry)
+                else:
+                    return False
+            else:
+                if not pos.is_empty():
+                    return False
+                pos.sku = sku_id
+                pos.quantity = 1
+                pos.sku_attrs = self._extract_attrs(sku_entry)
+
+            non_null_idx += 1
+
+        return True
+
+    def _can_accept_task_in_aisle(self, aisle: int,
+                                  inventory_positions: List[InventoryPosition],
+                                  skus_data: List[Dict],
+                                  current_task_id: Optional[str] = None) -> bool:
+        aisle_positions = [deepcopy(p) for p in inventory_positions if p.aisle == aisle]
+        if not aisle_positions:
+            return False
+
+        pending_by_aisle = getattr(self.warehouse_core, 'pending_inbound_by_aisle', {}) or {}
+        pending_tasks = list(pending_by_aisle.get(aisle, []))
+
+        for pending_task in pending_tasks:
+            if current_task_id and getattr(pending_task, 'task_id', None) == current_task_id:
+                continue
+            sim_task = self._build_task_for_simulation(
+                getattr(pending_task, 'skus', []) or [],
+                aisle,
+                getattr(pending_task, 'task_id', None),
+            )
+            allocated = self.position_allocator.allocate(aisle_positions, sim_task)
+            if not allocated or not self._apply_simulated_inbound(allocated, sim_task.skus):
+                return False
+
+        current_task = self._build_task_for_simulation(skus_data, aisle, current_task_id)
+        allocated = self.position_allocator.allocate(aisle_positions, current_task)
+        if not allocated:
+            return False
+        return self._apply_simulated_inbound(allocated, current_task.skus)
 
     def allocate(self, task_info: TaskData,
                 inventory_positions: List[InventoryPosition]) -> Optional[int]:
@@ -85,10 +195,10 @@ class BaselineAisleAllocator:
                 
                 if is_match:
                     # 对应 allocateEmptyLocationForMatchedBeam
-                    result = self._allocate_empty_location_for_matched_beam(sku1, sku2, inventory_positions)
+                    result = self._allocate_empty_location_for_matched_beam(sku1, sku2, inventory_positions, skus_data, task_id)
                 else:
                     # 对应 allocateForNotMatched
-                    result = self._allocate_for_not_matched(sku1, sku2, inventory_positions, attrs1, attrs2)
+                    result = self._allocate_for_not_matched(sku1, sku2, inventory_positions, attrs1, attrs2, skus_data, task_id)
 
             # 对应 Java: else (单梁分配)
             elif len(sku_ids) == 1:
@@ -102,7 +212,7 @@ class BaselineAisleAllocator:
                         preferred_side = 'A'  # SKU在A侧(Side A)
                 # 调用改进的单梁分配方法
                 single_attrs = self._get_sku_attrs(skus_data, sku_ids[0])
-                result = self._allocate_single_for_beam_code(sku_ids[0], inventory_positions, preferred_side, single_attrs)
+                result = self._allocate_single_for_beam_code(sku_ids[0], inventory_positions, preferred_side, single_attrs, skus_data, task_id)
 
             if result is None:
                 print(f"[WARN][allocator] BaselineAisleAllocator: no aisle allocated task={task_id} skus={sku_ids}")
@@ -181,7 +291,8 @@ class BaselineAisleAllocator:
         return sorted(available_roadway_list, key=rank_key)
 
     def _allocate_for_not_matched(self, sku1: str, sku2: str, inventory_positions: List[InventoryPosition],
-                                  attrs1: Optional[Dict] = None, attrs2: Optional[Dict] = None) -> Optional[int]:
+                                  attrs1: Optional[Dict] = None, attrs2: Optional[Dict] = None,
+                                  skus_data: Optional[List[Dict]] = None, task_id: Optional[str] = None) -> Optional[int]:
         """
         对应 Java: allocateForNotMatched
         """
@@ -205,6 +316,8 @@ class BaselineAisleAllocator:
         good_result_list = []   # High + High
 
         for roadway_id in ranked_roadway_list:
+            if not self._can_accept_task_in_aisle(roadway_id, inventory_positions, skus_data or [], task_id):
+                continue
             # 尝试在 Side A 分配 SKU1
             res_a = self._allocate_single_in_roadway(sku1, roadway_id, inventory_positions, side='A', sku_attrs=attrs1)
             # 尝试在 Side B 分配 SKU2
@@ -228,7 +341,8 @@ class BaselineAisleAllocator:
             
         return None
 
-    def _allocate_empty_location_for_matched_beam(self, sku1: str, sku2: str, inventory_positions: List[InventoryPosition]) -> Optional[int]:
+    def _allocate_empty_location_for_matched_beam(self, sku1: str, sku2: str, inventory_positions: List[InventoryPosition],
+                                                  skus_data: Optional[List[Dict]] = None, task_id: Optional[str] = None) -> Optional[int]:
         """
         对应 Java: allocateEmptyLocationForMatchedBeam
         """
@@ -243,14 +357,14 @@ class BaselineAisleAllocator:
         
         # 只在empty里找
         for roadway_id in ranked_roadway_list:
-            has_empty = any(p.aisle == roadway_id and p.is_empty() for p in empty_location_list)
-            if has_empty:
+            if self._can_accept_task_in_aisle(roadway_id, inventory_positions, skus_data or [], task_id):
                 return roadway_id
         
         return None
 
     def _allocate_single_for_beam_code(self, sku: str, inventory_positions: List[InventoryPosition],
-                                       preferred_side: Optional[str] = None, sku_attrs: Optional[Dict] = None) -> Optional[int]:
+                                       preferred_side: Optional[str] = None, sku_attrs: Optional[Dict] = None,
+                                       skus_data: Optional[List[Dict]] = None, task_id: Optional[str] = None) -> Optional[int]:
         """
         Corresponds to Java: allocateSingleForBeamCodeA
         """
@@ -274,6 +388,8 @@ class BaselineAisleAllocator:
         sides_to_try += [s for s in ('A', 'B') if s not in sides_to_try]
         
         for roadway_id in ranked_roadway_list:
+            if not self._can_accept_task_in_aisle(roadway_id, inventory_positions, skus_data or [], task_id):
+                continue
             found_placement = False
             found_low = False
             
@@ -366,6 +482,31 @@ class BaselinePositionAllocator:
             if isinstance(entry, dict) and entry.get('skuId') == sku_id:
                 return self._extract_attrs(entry)
         return {}
+
+    def _resolve_single_beam_side(self, skus_data: List[Dict], sku_slots: List[Optional[str]]) -> Optional[str]:
+        for entry in skus_data or []:
+            if not isinstance(entry, dict) or not entry.get("skuId"):
+                continue
+            beam_side = getattr(entry.get("beamSide"), "value", entry.get("beamSide"))
+            if beam_side:
+                side_str = str(beam_side).upper()
+                if side_str == "LEFT":
+                    return "A"
+                if side_str == "RIGHT":
+                    return "B"
+
+            legacy_side = getattr(entry.get("side"), "value", entry.get("side"))
+            if legacy_side:
+                legacy_str = str(legacy_side).upper()
+                if legacy_str in {"A", "B"}:
+                    return legacy_str
+
+        if len(sku_slots) == 2:
+            if sku_slots[0] is None and sku_slots[1] is not None:
+                return "B"
+            if sku_slots[0] is not None and sku_slots[1] is None:
+                return "A"
+        return None
     def _attrs_equal(self, attrs_a: Optional[Dict], attrs_b: Optional[Dict]) -> bool:
         if not self.match_fields:
             return True
@@ -386,36 +527,32 @@ class BaselinePositionAllocator:
         if aisle is None:
             print(f"[WARN][allocator] BaselinePositionAllocator: no aisle assigned task={task_id}")
             return []
-            
+        aisle_positions = [p for p in inventory_positions if p.aisle == aisle]
         skus_data = task_info.skus
         sku_slots = [sku.get('skuId') if isinstance(sku, dict) else None for sku in skus_data]
         sku_ids = [sku for sku in sku_slots if sku is not None]
-        aisle_positions = [p for p in inventory_positions if p.aisle == aisle]
 
         if len(sku_ids) == 2:
             sku1, sku2 = sku_ids
-            
             attrs1 = self._get_sku_attrs(skus_data, sku1)
             attrs2 = self._get_sku_attrs(skus_data, sku2)
             is_pair = self._is_match_sku(sku1, sku2) and self._attrs_equal(attrs1, attrs2)
-            
+
             if is_pair:
                 # Matched: 找一个空货位放两个
                 result = self._allocate_matched_positions(aisle_positions, sku1, sku2)
             else:
                 # Not Matched: 分别找
                 result = self._allocate_not_matched_positions(aisle_positions, sku1, sku2, attrs1, attrs2)
-
         elif len(sku_ids) == 1:
-            preferred_side = None
-            if len(sku_slots) == 2:
-                preferred_side = 'A' if sku_slots[0] is not None else 'B'
+            preferred_side = self._resolve_single_beam_side(skus_data, sku_slots)
             single_attrs = self._get_sku_attrs(skus_data, sku_ids[0])
             result = self._allocate_single_position(aisle_positions, sku_ids[0], side=preferred_side or "A", sku_attrs=single_attrs)
         else:
             result = []
 
         if not result:
+            sku_ids = [sku.get('skuId') for sku in (task_info.skus or []) if isinstance(sku, dict) and sku.get('skuId') is not None]
             print(f"[WARN][allocator] BaselinePositionAllocator: no position allocated task={task_id} aisle={aisle} skus={sku_ids}")
         return result
 

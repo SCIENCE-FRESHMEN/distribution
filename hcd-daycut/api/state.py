@@ -4,7 +4,7 @@
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set
 from dataclasses import dataclass, field
 from enum import Enum
@@ -36,7 +36,11 @@ class PendingTask:
         """检查是否超时"""
         if self.status != PendingTaskStatus.PENDING:
             return False
-        elapsed = (datetime.utcnow() - self.created_at).total_seconds()
+        created_at = self.created_at
+        if created_at.tzinfo is None:
+            # Backward compatibility: treat naive timestamps as UTC.
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
         return elapsed > self.timeout_seconds
 
 
@@ -54,12 +58,19 @@ class TaskStateManager:
                          timeout_seconds: Optional[float] = None) -> PendingTask:
         """添加待反馈任务"""
         with self._lock:
+            existing = self._pending_tasks.get(task_id)
+            if existing is not None:
+                if existing.status != PendingTaskStatus.PENDING:
+                    return existing
+                if aisle_id is not None:
+                    existing.aisle_id = aisle_id
+                return existing
             task = PendingTask(
                 task_id=task_id,
                 task_type=task_type,
                 aisle_id=aisle_id,
                 status=PendingTaskStatus.PENDING,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
                 timeout_seconds=timeout_seconds or self.default_timeout
             )
             self._pending_tasks[task_id] = task
@@ -71,7 +82,7 @@ class TaskStateManager:
             if task_id in self._pending_tasks:
                 task = self._pending_tasks[task_id]
                 task.status = PendingTaskStatus.CONFIRMED
-                task.confirmed_at = datetime.utcnow()
+                task.confirmed_at = datetime.now(timezone.utc)
                 self._confirmed_tasks.add(task_id)
                 return True
             return False
@@ -82,7 +93,7 @@ class TaskStateManager:
             if task_id in self._pending_tasks:
                 task = self._pending_tasks[task_id]
                 task.status = PendingTaskStatus.COMPLETED
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(timezone.utc)
                 self._confirmed_tasks.discard(task_id)
                 # 从pending中移除已完成的任务
                 del self._pending_tasks[task_id]
@@ -95,7 +106,7 @@ class TaskStateManager:
             if task_id in self._pending_tasks:
                 task = self._pending_tasks[task_id]
                 task.status = PendingTaskStatus.FAILED
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(timezone.utc)
                 self._confirmed_tasks.discard(task_id)
                 del self._pending_tasks[task_id]
                 return True

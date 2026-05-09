@@ -54,6 +54,16 @@ class TaskStateManager:
                          timeout_seconds: Optional[float] = None) -> PendingTask:
         """添加待反馈任务"""
         with self._lock:
+            existing = self._pending_tasks.get(task_id)
+            # Idempotent guard: avoid downgrading CONFIRMED task back to PENDING.
+            if existing is not None and existing.status in (
+                PendingTaskStatus.PENDING,
+                PendingTaskStatus.CONFIRMED,
+            ):
+                if aisle_id is not None:
+                    existing.aisle_id = aisle_id
+                return existing
+
             task = PendingTask(
                 task_id=task_id,
                 task_type=task_type,

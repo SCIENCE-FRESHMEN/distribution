@@ -547,6 +547,37 @@ SCENARIOS: List[Dict[str, Any]] = [
         "method": "POST",
         "endpoint": "/schedule/mixed",
         "data": {
+            "currentTime": "2026-01-21 10:15:00",
+            "productionPlan": {
+                "operationType": "ADD",
+                "planDate": "2026-01-21 09:00:00",
+                "plans": [
+                    {
+                        "planId": "PLAN-LINE1-20260121",
+                        "lineId": "LINE-1",
+                        "planIndex": [
+                            {"requiredSkus": [[{"skuId": "1RAT000001", "quantity": 1}]]},
+                            {"requiredSkus": [[{"skuId": "1RAT000002", "quantity": 1}]]},
+                            {"requiredSkus": [[{"skuId": "1RAT000003", "quantity": 1}]]},
+                            {"requiredSkus": [[{"skuId": "1RAT000004", "quantity": 1}]]},
+                            {"requiredSkus": [[{"skuId": "1RAT000005", "quantity": 1}]]},
+                            {"requiredSkus": [[{"skuId": "1RAT000006", "quantity": 1}]]},
+                        ],
+                    },
+                    {
+                        "planId": "PLAN-LINE2-20260121",
+                        "lineId": "LINE-2",
+                        "planIndex": [
+                            {"requiredSkus": [[{"skuId": "1RAK000005", "quantity": 1}]]},
+                            {"requiredSkus": [[{"skuId": "1RAK000006", "quantity": 1}]]},
+                        ],
+                    },
+                ],
+            },
+            "currentGroups": {
+                "LINE-1": 1,
+                "LINE-2": 1
+            },
             "inventory": [],
             "aisleStatus": [
                 {

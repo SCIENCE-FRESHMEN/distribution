@@ -1,5 +1,7 @@
 """
 仓库仿真主程序 - 事件驱动版本
+此程序模拟仓库中的入库和出库操作，使用事件驱动方式处理任务调度
+整个系统包括入库任务分配、出库任务处理、库存管理和移库操作等功能
 """
 
 
@@ -25,6 +27,14 @@ _original_stderr = sys.stderr
 
 
 def _restore_stdio(log_file: Optional[object]):
+    """恢复标准输入输出流到原始状态，关闭日志文件句柄
+    
+    此函数在程序退出时被调用，确保标准输出和错误输出恢复到原始状态，
+    并且关闭日志文件句柄以释放资源。
+    
+    Args:
+        log_file: 日志文件对象，如果为None则只恢复stdio
+    """
     try:
         sys.stdout = _original_stdout
         sys.stderr = _original_stderr
@@ -39,20 +49,19 @@ def _restore_stdio(log_file: Optional[object]):
             log_file.close()
         except Exception:
             pass
+
+# 输出流复制类，同时向控制台和日志文件输出内容
 class _TeeStream:
     def __init__(self, *streams):
+        """初始化TeeStream对象，接收多个输出流
+        
+        Args:
+            *streams: 可变数量的输出流对象
+        """
         self.streams = streams
 
-    def write(self, data):
-        for stream in self.streams:
-            try:
-                stream.write(data)
-                stream.flush()
-            except Exception:
-                pass
-        return len(data)
-
     def flush(self):
+        """刷新所有输出流的缓冲区"""
         for stream in self.streams:
             try:
                 stream.flush()
@@ -60,6 +69,7 @@ class _TeeStream:
                 pass
 
     def close(self):
+        """关闭所有输出流"""
         for stream in self.streams:
             try:
                 stream.close()
@@ -68,17 +78,32 @@ class _TeeStream:
 
 
     def write(self, data):
+        """将数据写入所有输出流并刷新
+        
+        Args:
+            data: 要写入的数据字符串
+            
+        Returns:
+            写入的数据长度
+        """
         for stream in self.streams:
             stream.write(data)
             stream.flush()
         return len(data)
 
-    def flush(self):
-        for stream in self.streams:
-            stream.flush()
-
 
 def configure_log_output(log_path: Optional[str]) -> Optional[object]:
+    """配置日志输出到指定文件，同时保持控制台输出
+    
+    此函数将stdout和stderr重定向到既输出到控制台又输出到日志文件的流，
+    便于调试和问题追踪。
+    
+    Args:
+        log_path: 日志文件路径，如果为None则不输出日志
+        
+    Returns:
+        日志文件对象，如果未创建则返回None
+    """
     if not log_path:
         return None
     log_dir = os.path.dirname(log_path)
@@ -94,7 +119,11 @@ def configure_log_output(log_path: Optional[str]) -> Optional[object]:
 
 
 class WarehouseSimulation:
-    """仓库仿真器 - 事件驱动版本"""
+    """仓库仿真器 - 事件驱动版本，主要负责管理仿真流程和事件队列
+    
+    该类封装了仓库仿真的核心逻辑，包括事件队列管理、时间推进、任务处理等。
+    使用事件驱动的方式来模拟仓库中的各种操作，如入库、出库、移库等。
+    """
     
     def __init__(self, num_aisles: int = 5, num_production_lines: int = 3,
                  initial_inventory_ratio: float = 0.3, random_seed: Optional[int] = None,
@@ -105,31 +134,32 @@ class WarehouseSimulation:
                  inbound_allocation_strategy: Optional[str] = None,
                  inbound_aisle_allocator = None,
                  inbound_position_allocator = None,
-                 inbound_rate_lambda: float = 1/100.0,  # 泊松到达率(1/秒)
+                 inbound_rate_lambda: float = 1/85.0,  # 泊松到达率(1/秒)
                  transport_delay_s: Optional[float] = None,
                  scheduler_type: str = 'heuristic',
                  initial_inventory_count: int = 250,
                  track_skus: Optional[List[str]] = ["2801022-TG360"]):
         """
+        初始化仓库仿真器参数
+
         Args:
-            num_aisles: 巷道数量
-            num_production_lines: 产线数量
-            initial_inventory_ratio: 初始库存占比
-            random_seed: 随机种子
-            use_magnetic_crane: 是否使用磁力吊（默认True）
-            outbound_congestion_time: 出库口拥堵时间（秒）
-            aisle_production_line_mapping: 巷道-产线映射配置
-            lr_balance_weight: 左右均衡度权重（0-1），默认0.3
+            num_aisles: 巷道数量，代表仓库中的存储通道数
+            num_production_lines: 产线数量，代表下游生产线的数量
+            initial_inventory_ratio: 初始库存占比，决定仿真开始时的库存水平
+            random_seed: 随机种子，用于保证仿真的可重现性
+            use_magnetic_crane: 是否使用磁力吊（默认True），影响任务处理逻辑
+            outbound_congestion_time: 出库口拥堵时间（秒），模拟出库时的等待时间
+            aisle_production_line_mapping: 巷道-产线映射配置，定义哪些巷道服务于哪些产线
+            lr_balance_weight: 左右均衡度权重（0-1），默认0.3，影响库存分布策略
             inbound_aisle_allocator: 入库任务的巷道分配策略（可选）
             inbound_position_allocator: 入库任务的货位分配策略（可选）
+            inbound_rate_lambda: 入库任务到达的泊松分布参数（lambda值）
+            transport_delay_s: 运输延迟时间（秒），影响任务执行时间
             scheduler_type: 调度器类型 ('heuristic' 或 'optimization')
-            num_iterations: 随机优化调度器的迭代次数（仅当scheduler_type='optimization'时有效）
-            makespan_weight: makespan权重（仅当scheduler_type='optimization'时有效）
-            balance_weight: 均衡度变化权重（仅当scheduler_type='optimization'时有效）
-            production_line_avg_time_weight: 产线平均完成时间权重（仅当scheduler_type='optimization'时有效）
             initial_inventory_count: 初始库存任务记录数量（仅当initial_inventory为None时有效）
+            track_skus: 需要跟踪的SKU列表，用于监控特定产品的流动情况
         """
-        # 仓库核心
+        # 仓库核心组件，处理具体的业务逻辑和状态管理
         self.warehouse_core = WarehouseCore(
             num_aisles=num_aisles,
             num_production_lines=num_production_lines,
@@ -157,8 +187,8 @@ class WarehouseSimulation:
             self.warehouse_core.transport_delay_s = transport_delay_s
 
         # 事件驱动仿真相关（Simulation 仅做派发与推进）
-        self.event_queue = []  # 优先队列（最小堆）
-        self.current_time = 0.0  # 当前仿真时间
+        self.event_queue = []  # 优先队列（最小堆），存储待处理事件，按时间排序
+        self.current_time = 0.0  # 当前仿真时间，随事件处理逐步推进
     
     def run_simulation(self, production_plan: Dict[int, List[List[str]]] = None,
                       max_simulation_time: float = 3600.0, initial_inventory: Optional[dict] = None,
@@ -166,12 +196,22 @@ class WarehouseSimulation:
                       real_time_days: Optional[int] = None,
                       cutoff_hour: Optional[int] = None,
                       creation_times: Optional[Dict[int, List[float]]] = None):
-        """事件驱动仿真
+        """事件驱动仿真 - 主仿真循环，处理入库出库任务，分天执行
+        
+        该方法将根据时间把任务分成多天执行，每天独立处理各自的入库出库任务，
+        在每天内部按事件驱动方式进行仿真。支持真实时间数据和模拟数据两种模式。
+        
+        仿真流程：
+        1. 将任务按时间分桶到不同的"天"
+        2. 每天开始时初始化相关状态
+        3. 生成当天的入库任务事件
+        4. 循环处理事件直到当天结束或任务完成
+        5. 汇总当天的执行结果
+        6. 重复步骤2-5直到所有天完成
         
         Args:
             production_plan: 生产计划 {production_line: [['A1', 'A2', 'A3', 'A4'], ...]}
             max_simulation_time: 最大仿真时间（秒）
-            use_optimization: 是否使用优化调度
             initial_inventory: 初始库存字典（可选）
             initial_inventory_count: 初始库存任务记录数量
             real_time_days: 使用真实时间数据时，模拟几天（从最早记录的cutoff_hour切日开始）
@@ -539,7 +579,20 @@ class WarehouseSimulation:
     
     def _print_daily_summary(self, day_idx: int, day_completed=None, cumulative_completed=None, total_plan_groups=None,
                              day_time=None, pairing_logs=None, return_lines: bool = False):
-        """输出当日完成情况（参考总结果格式）"""
+        """输出当日完成情况（参考总结果格式）
+        
+        Args:
+            day_idx: 当前天的索引
+            day_completed: 当天完成的任务数
+            cumulative_completed: 累计完成的任务数
+            total_plan_groups: 总计划组数
+            day_time: 当天结束时的时间
+            pairing_logs: 配对率记录
+            return_lines: 是否返回行列表而不打印
+            
+        Returns:
+            如果return_lines为True，则返回行列表
+        """
         lines: List[str] = []
         lines.append("\n" + "-" * 60)
         lines.append(f"第 {day_idx} 天汇总")
@@ -614,6 +667,17 @@ class WarehouseSimulation:
             print(ln)
 
     def _normalize_skus(self, sku_raw):
+        """标准化SKU数据格式，确保每项都有正确的结构和数量信息
+        
+        此方法将不同格式的SKU数据转换为统一的格式，便于后续处理。
+        支持字典和简单列表两种输入格式。
+        
+        Args:
+            sku_raw: 原始SKU数据，可能是列表或字典格式
+            
+        Returns:
+            标准化的SKU列表，每个元素都包含skuId、quantity和side等必要字段
+        """
         skus = []
         for idx_slot, sku in enumerate(sku_raw or []):
             side = 'A' if idx_slot == 0 else 'B'
@@ -628,7 +692,12 @@ class WarehouseSimulation:
                 skus.append({'skuId': sku, 'quantity': 1, 'side': side})
         return skus
     def _seed_inbound_poisson(self, lambda_rate: float, horizon_s: float):
-        """使用真实入库配置 + 泊松触发生成入库事件"""
+        """使用泊松过程生成入库事件，模拟真实的到达时间间隔
+        
+        Args:
+            lambda_rate: 泊松分布的λ参数，表示单位时间内的平均到达率
+            horizon_s: 时间范围（秒），在此范围内生成事件
+        """
         t = 0.0
         idx_inbound_unassigned = 0
 
@@ -722,7 +791,7 @@ class WarehouseSimulation:
             if horizon_s is not None and arrive >= horizon_s:
                 continue
             max_used_ts = arrive_abs if (max_used_ts is None or arrive_abs > max_used_ts) else max_used_ts
-            skus = self._normalize_skus(skus_raw)
+            skus = self._normalize_skus(sku_raw)
             task = TaskData(
                 task_id=f"IN_UNASSIGNED_{idx:05d}",
                 task_type=TASK_TYPE_INBOUND_UNASSIGNED,
@@ -742,7 +811,12 @@ class WarehouseSimulation:
         return True, anchor_ts, max_used_ts
 
     def _seed_inbound_for_records(self, records: List, horizon_s: float = 24*3600):
-        """基于给定的入库记录列表，按泊松间隔生成到达事件（当天起点为0）。"""
+        """基于给定的入库记录列表，按泊松间隔生成到达事件（当天起点为0）。
+        
+        Args:
+            records: 入库记录列表
+            horizon_s: 时间范围（秒），在此范围内生成事件
+        """
         t = 0.0
         idx_inbound_unassigned = 0
         for rec in records:
@@ -775,7 +849,14 @@ class WarehouseSimulation:
             idx_inbound_unassigned += 1
 
     def _flush_remaining_inbound(self, current_time: float):
-        """将队列中尚未到达的入库事件立即处理完（用于当日出库完成后加速结束当天）。"""
+        """将队列中尚未到达的入库事件立即处理完（用于当日出库完成后加速结束当天）。
+        
+        此方法主要用于仿真收尾阶段，当出库任务完成后，将剩余的入库任务快速处理完毕，
+        避免仿真因等待入库任务时间到达而停滞。
+        
+        Args:
+            current_time: 当前仿真时间
+        """
         # 将剩余事件统一拉平到 current_time 并处理到底（主要是入库到达→入库完成）
         while self.event_queue:
             ev = heapq.heappop(self.event_queue)
@@ -785,7 +866,15 @@ class WarehouseSimulation:
                 heapq.heappush(self.event_queue, ne.copy())
 
     def _debug_outbound_blockers(self, production_line: int, day_groups: List):
-        """当出库无法继续时，输出剩余任务的缺货情况"""
+        """当出库无法继续时，输出剩余任务的缺货情况
+        
+        此方法用于调试目的，当出库任务因为库存不足而无法完成时，
+        分析具体缺少哪些SKU，帮助定位问题。
+        
+        Args:
+            production_line: 产线编号
+            day_groups: 当天该产线的出库任务组列表
+        """
         current_idx = self.warehouse_core.production_line_current_group.get(production_line, 0)
         if current_idx >= len(day_groups):
             print(f"[DEBUG] 产线{production_line} 当前组索引({current_idx})已超过计划组数({len(day_groups)})")
@@ -854,7 +943,15 @@ class WarehouseSimulation:
                     else:
                         print(f"    task {ti+1}: need {need}, inventory ok (dist { {k: dist.get(k,0) for k in need} })")
     def _print_final_analysis(self, cumulative_completed=None, total_plan_groups=None):
-        """输出最终分析"""
+        """输出最终分析
+        
+        此方法在仿真结束后提供完整的性能指标和统计数据，
+        包括任务完成情况、生产计划执行情况、移库数量和库存均衡度等。
+        
+        Args:
+            cumulative_completed: 累计完成任务数
+            total_plan_groups: 总计划组数
+        """
         print("\n" + "=" * 80)
         print("仿真结束 - 最终统计")
         print("=" * 80)
@@ -928,7 +1025,7 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
          aisle_dispersion_weight: Optional[float] = None,
          inbound_wait_weight: Optional[float] = None,
          initial_inventory_count: Optional[int] = None,
-         inbound_rate_lambda: float = 1/100.0,
+         inbound_rate_lambda: float = 1/85.0,
          real_time_days: Optional[int] = None,
          cutoff_hour: int = 6,
          date_str: Optional[str] = None,
@@ -937,16 +1034,22 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
          plan_config_path: Optional[str] = None):
     """仓库仿真主函数（事件驱动版本）
     
+    该函数是整个仓库仿真的入口点，负责加载配置、初始化仿真器、执行仿真流程。
+    参数优先级：命令行参数 > config/warehouse.json > 代码默认值
+    
+    仿真系统支持多种策略配置，包括入库巷道分配策略、入库货位分配策略、
+    调度策略等，可以根据需要选择不同的策略组合进行对比实验。
+    
     Args:
         random_seed: 随机种子，None表示不设置
         max_simulation_time: 最大仿真时间（秒）
-        use_magnetic_crane: 是否使用磁力吊（None 时使用 config/warehouse.json）
-        outbound_congestion_time: 出库口拥堵时间（秒，None 时使用 config/warehouse.json）
-        lr_balance_weight: 左右均衡度权重（0-1，None 时使用 config/warehouse.json）
+        use_magnetic_crane: 是否使用磁力吊（优先级：函数参数 > config/warehouse.json > 默认值True）
+        outbound_congestion_time: 出库口拥堵时间（秒，优先级：函数参数 > config/warehouse.json > 默认值0.0）
+        lr_balance_weight: 左右均衡度权重（0-1，优先级：函数参数 > config/warehouse.json > 默认值0.3）
         inbound_allocation_strategy: 入库巷道分配策略 ('proposed', 'baseline_random', 'baseline_round_robin', 'baseline_most_empty', None)
         inbound_position_strategy: 入库货位分配策略 ('proposed', 'first_available', 'lowest_level', 'nearest')
         scheduler_type: 调度器类型 ('heuristic' 或 'optimization')
-        initial_inventory_count: 用于初始化库存的入库任务记录数（None 时使用 config/warehouse.json）
+        initial_inventory_count: 用于初始化库存的入库任务记录数（优先级：函数参数 > config/warehouse.json > 默认值200）
         cutoff_hour: 切日小时
         date_str: 日期字符串（如20251012），用于指定运行特定日期的仿真
         inbound_config_path: 入库配置文件路径，用于指定特定日期的配置
@@ -957,6 +1060,19 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
     
     cfg = load_warehouse_config("config/warehouse.json")
     def _resolve_param(value, key, fallback):
+        """解析参数值，按优先级顺序：函数参数 > 配置文件 > 默认值
+        
+        这个辅助函数实现了参数的三级优先级解析机制，确保系统可以灵活地从
+        多个来源获取配置参数，同时保持一致的行为。
+        
+        Args:
+            value: 函数参数传入的值
+            key: 配置文件中的键名
+            fallback: 默认值
+            
+        Returns:
+            实际使用的参数值
+        """
         if value is not None:
             return value
         if key in cfg:
@@ -1003,8 +1119,11 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
     if outbound_config_path is None and plan_config_path:
         outbound_config_path = plan_config_path
 
-    if date_str and inbound_config_path and outbound_config_path:
-        print(f"正在运行日期 {date_str} 的仿真..")
+    if inbound_config_path and outbound_config_path:
+        if date_str:
+            print(f"正在运行日期 {date_str} 的仿真..")
+        else:
+            print("正在运行自定义配置仿真..")
         print(f"使用入库配置: {inbound_config_path}")
         print(f"使用出库配置: {outbound_config_path}")
 
@@ -1106,7 +1225,7 @@ if __name__ == "__main__":
     # - plan_config_path: 兼容旧参数，等同 outbound_config_path
 
     
-
+    # 未在json中定义的参数可以在下面修改，例如仿真天数，入库速率等。
     import argparse
     
     parser = argparse.ArgumentParser(description='仓库仿真系统')
@@ -1126,9 +1245,9 @@ if __name__ == "__main__":
     parser.add_argument('--production-line-balance-weight', type=float, default=None, help='production line balance weight (optimization)')
     parser.add_argument('--aisle-dispersion-weight', type=float, default=None, help='aisle dispersion weight (optimization)')
     parser.add_argument('--inbound-wait-weight', type=float, default=None, help='inbound wait time weight (optimization)')
-    parser.add_argument('--initial-inventory-count', type=int, default=None, help='用于初始化库存的入库任务记录数（默认使用 config/warehouse.json）')
-    parser.add_argument('--inbound-rate-lambda', type=float, default=1/100.0, help='(入库计划生成时)入库任务生成间隔的λ参数')
-    parser.add_argument('--real-time-days', type=int, default=10, help='使用真实时间数据时，模拟几天')
+    parser.add_argument('--initial-inventory-count', type=int, default=None, help='用于初始化库存的入库任务记录数')
+    parser.add_argument('--inbound-rate-lambda', type=float, default=1/60.0, help='(入库计划生成时)入库任务生成间隔的λ参数')
+    parser.add_argument('--real-time-days', type=int, default=15, help='使用真实时间数据时，模拟几天')
     parser.add_argument('--cutoff-hour', type=int, default=4, help='切日小时')
     parser.add_argument('--no-cutoff', action='store_true', help='不分日，整段时间作为单日运行')
     parser.add_argument('--date-str', type=str, help='日期字符串（如20251012），用于指定运行特定日期的仿真')
@@ -1142,7 +1261,7 @@ if __name__ == "__main__":
     
     main(
         random_seed=args.random_seed, 
-        max_simulation_time=args.max_simulation_time,
+        max_simulation_time=args.max_simulation_time, # 最大仿真时间
         use_magnetic_crane=args.use_magnetic_crane,  # 是否使用磁力吊
         outbound_congestion_time=args.outbound_congestion_time,  # 出库口拥堵时间（秒）
         lr_balance_weight=args.lr_balance_weight,  # 左右均衡度权重

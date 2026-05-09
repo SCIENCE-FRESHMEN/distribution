@@ -719,14 +719,3 @@ class TimeEstimator:
         df_seq.loc[:, "residual"] = (df_seq["移动时间_sec"] - df["physics_time_total"]).values
 
         return df_seq
-    
-
-    # -------------- 更多可扩展的方法 --------------
-    def update_with_new_data(self, new_data: pd.DataFrame, task_type: str = "inbound"):
-        """
-        占位：接收新数据（历史任务），可以用于后续微调/增量训练 residual 模型
-        """
-        # 这里只做接口占位；实际训练逻辑交由调用者或单独训练脚本实现
-        print(f"[INFO] Received {len(new_data)} records to update {task_type} model. Implement training externally.")
-
-

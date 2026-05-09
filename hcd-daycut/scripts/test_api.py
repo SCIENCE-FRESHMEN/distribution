@@ -8,6 +8,8 @@ import json
 import time
 from datetime import datetime
 
+__test__ = False
+
 BASE_URL = "http://localhost:8000/api/v1"
 HEADERS = {"Content-Type": "application/json"}
 
@@ -111,6 +113,12 @@ def test_set_production_plan():
     # 使用动态获取的可用SKU配对
     line1_skus = AVAILABLE_SKUS["line1_pair1"]
     line2_skus = AVAILABLE_SKUS["line2_pair1"]
+    sku_attrs = {
+        "version": "00",
+        "productionAttribute": "D",
+        "militaryCivilianMark": "M",
+        "salesArea": "N",
+    }
     
     payload = {
         "operationType": "ADD",
@@ -118,25 +126,41 @@ def test_set_production_plan():
         "plans": [
             {
                 "planId": "PLAN-LINE1",
-                "lineId": "1",
-                "requiredSkus": [
-                    {"skuId": line1_skus[0], "quantity": 2},
-                    {"skuId": line1_skus[1], "quantity": 2}
+                "lineId": "LINE-1",
+                "planIndex": [
+                    {
+                        "requiredSkus": [[
+                            {"skuId": line1_skus[0], "quantity": 2, **sku_attrs},
+                            {"skuId": line1_skus[1], "quantity": 2, **sku_attrs}
+                        ]]
+                    }
                 ]
             },
             {
                 "planId": "PLAN-LINE2",
-                "lineId": "2",
-                "requiredSkus": [
-                    {"skuId": line2_skus[0], "quantity": 2},
-                    {"skuId": line2_skus[1], "quantity": 2}
+                "lineId": "LINE-2",
+                "planIndex": [
+                    {
+                        "requiredSkus": [[
+                            {"skuId": line2_skus[0], "quantity": 2, **sku_attrs},
+                            {"skuId": line2_skus[1], "quantity": 2, **sku_attrs}
+                        ]]
+                    }
                 ]
             }
         ]
     }
     print(f"[信息] 使用产线1 SKU: {line1_skus}")
     print(f"[信息] 使用产线2 SKU: {line2_skus}")
-    resp = requests.post(f"{BASE_URL}/plan/production", json=payload, headers=HEADERS)
+    mixed_payload = {
+        "currentTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "productionPlan": payload,
+        "currentGroups": {"LINE-1": 1, "LINE-2": 1, "LINE-3": 1},
+        "inventory": [],
+        "aisleStatus": [],
+        "tasks": [],
+    }
+    resp = requests.post(f"{BASE_URL}/schedule/mixed", json=mixed_payload, headers=HEADERS)
     print_response(resp)
     return resp.status_code == 200
 

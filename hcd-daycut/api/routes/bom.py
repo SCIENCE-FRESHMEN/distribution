@@ -2,7 +2,7 @@
 BOM配置接口路由
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 
 from ..models import (
@@ -81,7 +81,7 @@ async def update_bom_config(
         # 调用 warehouse_service 更新配置
         success = warehouse_service.update_sku_config(config_data)
         
-        timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if success:
             return ApiResponse(
                 status="SUCCESS",

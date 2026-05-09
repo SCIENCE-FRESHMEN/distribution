@@ -11,7 +11,7 @@ else:
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 # 默认日志文件列表
-DEFAULT_LOGS = ['prop-prop-opt.txt', 'log.txt']  # 默认日志
+DEFAULT_LOGS = ['base-base-heu.txt', 'log.txt']  # 默认日志
 LOG_PATH = os.path.join(os.path.dirname(__file__), 'logs')
 DAILY_LOG_PATH = os.path.join(LOG_PATH, 'daily')
 OUT_DIR = os.path.join(os.path.dirname(__file__), 'gantt_charts')
@@ -19,8 +19,8 @@ DATE_RE = re.compile(r"\b(20\d{6})\b")
 # Match run_daily suffix: "-lam{POISSON_X}".
 POISSON_X = 50  # [50,70,100,120]
 SELECT_DATES = []
-START_DATE = "20251012"
-END_DATE = "20251012"
+START_DATE = ""
+END_DATE = ""
 
 # 修改正则表达式以支持移库操作
 TASK_RE = re.compile(r"第\s*\d+个(出库任务|入库任务|移库操作)\s+([A-Z0-9_\-]+|IN_\d+|OUTBOUND[\w_\-]+).*?\(巷道\s*(\d+)\)，起止\s*([0-9.]+)s~([0-9.]+)s", re.UNICODE)
@@ -279,7 +279,7 @@ def plot_day(tasks, day, out_dir=OUT_DIR, show_labels=False, title_label=None, f
     legend_elements = [
         Patch(facecolor=colors['出库'], label='出库任务'),
         Patch(facecolor=colors['入库'], label='入库任务'),
-        Patch(facecolor=colors['移库'], label='移库操作'),
+        # Patch(facecolor=colors['移库'], label='移库操作'),
         Patch(facecolor='#d62728', label='巷道内冲突')
     ]
     ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.0, 1.0))

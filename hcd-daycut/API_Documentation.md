@@ -123,18 +123,26 @@ python run_api.py
 - 组内任务可并行，组间任务串行
 
 #### 任务 ID 命名规范
-- **出库任务**：`OUTBOUND_PL{pl}_GP{group}_{sku1}_{sku2}`
+- **出库任务**：`OUTBOUND_PL{pl}_GP{group}_{sku1}_{sku2}_{yyyymmddhhmmss}_{xxxx}`
   - `pl`: 产线编号（1, 2, 3, ...）
   - `group`: 组号（1, 2, 3, ...）
   - `sku1`, `sku2`: SKU ID
-  - 示例：`OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0`
+  - `yyyymmddhhmmss`: 时间戳（年月日时分秒）
+  - `xxxx`: 唯一性标识（序列号、UUID缩写等，由调用方自定义，至少1位）
+  - 示例：`OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001`
 
-- **入库任务（执行）**：`INBOUND_{sku1}_{sku2}`
-  - 示例：`INBOUND_2801021-KR8H4_2801037-KR8H4`
+- **入库任务（执行）**：`INBOUND_{sku1}_{sku2}_{yyyymmddhhmmss}_{xxxx}`
+  - `yyyymmddhhmmss`: 时间戳（年月日时分秒）
+  - `xxxx`: 唯一性标识（序列号、UUID缩写等，由调用方自定义，至少1位）
+  - 示例：`INBOUND_2801021-KR8H4_2801037-KR8H4_20260121101500_001`
 
-- **入库任务（分配推荐）**：`INBOUND_A_{sku1}_{sku2}`
+- **入库任务（分配推荐）**：`INBOUND_A_{sku1}_{sku2}_{yyyymmddhhmmss}_{xxxx}`
   - `A` 表示 Allocate（分配）
-  - 示例：`INBOUND_A_2801021-KR8H4_2801037-KR8H4`
+  - `yyyymmddhhmmss`: 时间戳（年月日时分秒）
+  - `xxxx`: 唯一性标识（序列号、UUID缩写等，由调用方自定义，至少1位）
+  - 示例：`INBOUND_A_2801021-KR8H4_2801037-KR8H4_20260121101500_001`
+
+> **重要**：时间戳和唯一性标识后缀是**必需的**，以保证任务ID全局唯一性。即使SKU组合相同，通过不同的时间戳和标识可以区分不同的任务。
 
 ---
 
@@ -147,6 +155,21 @@ python run_api.py
 - **默认端口**: 8000
 - **数据格式**: JSON
 - **字符编码**: UTF-8
+
+### 2.1.1 任务ID时间戳格式说明
+
+任务ID中的 `yyyymmddhhmmss` 格式说明：
+- `yyyy`: 4位年份，例如 2026
+- `mm`: 2位月份，01-12
+- `dd`: 2位日期，01-31
+- `hh`: 2位小时，00-23
+- `mm`: 2位分钟，00-59
+- `ss`: 2位秒数，00-59
+
+唯一性标识 `xxxx` 说明：
+- 最少1位，可为多位
+- 可使用数字（001, 002, ...）、UUID缩写（a1b2c3d4）、或其他标识方式
+- 由调用方自由选择，用于在同一秒内区分多个任务
 
 ### 2.2 请求头
 
@@ -222,161 +245,41 @@ Accept: application/json
 
 ## 三、API 接口详细说明
 
-### 3.1 生产计划管理
+### 3.1 生产计划
 
-#### 3.1.1 设置生产计划
+独立生产计划接口已移除。生产计划会随每次 `POST /api/v1/schedule/mixed` 请求内联传入，调度服务以本次请求中的计划和进度作为最新约束。
 
-**接口**: `POST /api/v1/plan/production`
-
-**说明**: 设置或更新各产线的生产计划。
-
-**请求参数**:
+内联字段：
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| operationType | String | 是 | 操作类型：ADD（新增）或 UPDATE（更新） |
-| planDate | String | 是 | 计划日期，格式：YYYY-MM-DD HH:mm:ss |
-| plans | Array | 是 | 生产计划列表 |
-| plans[].planId | String | 是 | 计划唯一标识符 |
-| plans[].lineId | String | 是 | 产线唯一标识符（如 "LINE-1"） |
-| plans[].planIndex | Array | 是 | 计划组列表，每个元素代表一组任务 |
-| plans[].planIndex[].requiredSkus | Array | 是 | 该组的任务列表，每个元素是一个任务的 SKU 列表 |
-| plans[].planIndex[].requiredSkus[][] | Array | 是 | 单个任务的 SKU 列表 |
-| plans[].planIndex[].requiredSkus[][].skuId | String | 是 | SKU 唯一标识符 |
-| plans[].planIndex[].requiredSkus[][].quantity | Integer | 是 | 需求数量 |
+| productionPlan | Object | 否 | 本次调度使用的最新生产计划，结构沿用原 ProductionPlanRequest |
+| productionPlan.operationType | String | 是 | `ADD` 合并到现有计划，`UPDATE` 替换现有计划；动态计划建议使用 `UPDATE` |
+| productionPlan.planDate | String | 是 | 计划日期，格式：YYYY-MM-DD HH:mm:ss |
+| productionPlan.plans | Array | 是 | 当下所有生产计划列表 |
+| productionPlan.plans[].planId | String | 是 | 计划唯一标识符 |
+| productionPlan.plans[].lineId | String | 是 | 产线唯一标识符，例如 `LINE-1` |
+| productionPlan.plans[].planIndex | Array | 是 | 计划组列表；数组索引 + 1 是对外组号 |
+| productionPlan.plans[].planIndex[].requiredSkus | Array | 是 | 该组的任务列表，每个元素是一个任务的 SKU 列表 |
+| currentGroups | Object/Array | 否 | 推荐字段，各产线当前可执行组号，使用对外 public 1-based 组号，例如 `{"LINE-1": 1}` |
+| productionLineCurrentGroup | Object | 否 | 兼容字段，各产线当前可执行组索引，直接使用 core 0-based 索引，例如 `{"LINE-1": 0}` |
 
-**附加属性要求**:
-- 任何 `skuId` 有值且 `quantity > 0` 的 SKU，必须包含 `match_fields` 中定义的所有附加属性字段（如 `version`、`生产属性`）。
+`currentGroups` 示例：`{"LINE-1": 1, "LINE-2": 2}`。其中 `1` 表示当前可执行第 1 组，`2` 表示当前可执行第 2 组。也支持列表形式：`[{"lineId": "LINE-1", "currentGroup": 1}]`。`productionLineCurrentGroup` 仅作为兼容字段保留，使用 core 0-based 索引，例如 `{"LINE-1": 0}` 表示当前可执行第 1 组。两个字段同时传入时，`currentGroups` 优先。出库任务请求与响应中的 `planIndex` 保持 public 1-based 组号，API 内部会转换为 core 0-based 后用于顺序约束和完成进度处理。
 
-**请求示例**:
-
-```json
-{
-  "operationType": "ADD",
-  "planDate": "2026-01-21 09:00:00",
-  "plans": [
-    {
-      "planId": "PLAN-LINE1-20260121",
-      "lineId": "LINE-1",
-      "planIndex": [
-        {
-          "requiredSkus": [
-            [
-              {"skuId": "2801021-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"},
-              {"skuId": "2801037-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"}
-            ],
-            [
-              {"skuId": "2801021-KFDD0", "quantity": 1, "version": "00", "生产属性": "默认"},
-              {"skuId": "2801037-KFDD0", "quantity": 1, "version": "00", "生产属性": "默认"}
-            ]
-          ]
-        },
-        {
-          "requiredSkus": [
-            [
-              {"skuId": "2801021-TR200", "quantity": 1, "version": "00", "生产属性": "默认"},
-              {"skuId": "2801037-TR200", "quantity": 1, "version": "00", "生产属性": "默认"}
-            ]
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-**响应示例**:
+planIndex 结构：
 
 ```json
-{
-  "status": "SUCCESS",
-  "message": "生产计划设置成功",
-  "data": null
-}
-```
-
-或失败时：
-
-```json
-{
-  "status": "FAILED",
-  "message": "生产计划设置失败",
-  "data": null
-}
-```
-
-**响应字段说明**:
-- `status`: 操作结果状态（SUCCESS / FAILED）
-- `message`: 操作描述信息
-- `data`: 业务数据（此接口为 null）
-
-**planIndex 结构说明**:
-
-```
-planIndex: [        // 数组，每个元素是一个组
+"planIndex": [
   {
-    requiredSkus: [  // 数组，每个元素是该组内的一个任务
-      [             // 数组，该任务包含的 SKU 列表
-        {skuId: "...", quantity: 1, version: "00", 生产属性: "默认"},
-        {skuId: "...", quantity: 1, version: "00", 生产属性: "默认"}
-      ],
-      [             // 第二个任务
-        {skuId: "...", quantity: 1, version: "00", 生产属性: "默认"},
-        {skuId: "...", quantity: 1, version: "00", 生产属性: "默认"}
+    "requiredSkus": [
+      [
+        {"skuId": "2801021-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"},
+        {"skuId": "2801037-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"}
       ]
-    ]
-  },
-  {               // 第二组
-    requiredSkus: [
-      [...]
     ]
   }
 ]
 ```
-
-#### 3.1.2 获取生产计划
-
-**接口**: `GET /api/v1/plan/production`
-
-**说明**: 获取当前所有产线的生产计划。
-
-**响应示例**:
-
-```json
-{
-  "status": "SUCCESS",
-  "message": "获取生产计划成功",
-  "data": {
-    "production_plan": {
-      "1": [
-        [
-          ["2801021-H19H0", "2801037-H19H0"],
-          ["2801021-KFDD0", "2801037-KFDD0"]
-        ],
-        [
-          ["2801021-TR200", "2801037-TR200"]
-        ]
-      ],
-      "2": [
-        [
-          ["2801022-H19H0", "2801038-H19H0"]
-        ]
-      ]
-    }
-  }
-}
-```
-
-**响应字段说明**:
-- `status`: 操作状态（"SUCCESS" 或 "FAILED"）
-- `message`: 操作描述信息
-- `data.production_plan`: 各产线的计划，格式为 `{产线ID: [组1[任务1[SKU列表], 任务2[...]], 组2[...]]}`
-  - 产线ID为数字字符串（"1", "2", "3", ...）
-  - 组索引从 0 开始计数
-  - 每个任务是一个 SKU ID 列表
-
-**注意**: 此接口不返回 `currentGroups`（当前执行进度），如需查询进度请使用系统状态接口。
-
 ---
 
 ### 3.2 混合调度
@@ -393,10 +296,22 @@ planIndex: [        // 数组，每个元素是一个组
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| currentTime | String | 是 | 当前时间，格式：YYYY-MM-DD HH:mm:ss（当前实现中此字段可选，建议提供以便后续功能扩展） |
+| currentTime | String | 否 | 当前时间，格式：YYYY-MM-DD HH:mm:ss（当前实现不使用此字段，传入将被静默忽略，预留供后续扩展） |
 | inventory | Array | 是 | 库存列表，用于同步库存状态（可为空数组） |
 | aisleStatus | Array | 是 | 巷道状态列表 |
 | tasks | Array | 是 | 待调度的任务列表（可为空数组） |
+| productionPlan | Object | 否 | 内联生产计划，结构见 3.1；动态计划建议每次传当下完整计划 |
+| currentGroups | Object/Array | 否 | 推荐字段，各产线 public 1-based 当前可执行组号，例如 `{"LINE-1": 1}` |
+| productionLineCurrentGroup | Object | 否 | 兼容字段，各产线 core 0-based 当前可执行组索引，例如 `{"LINE-1": 0}` |
+
+**productionPlan / currentGroups 字段（内联生产计划）**:
+
+- `productionPlan` 沿用原生产计划 payload：`operationType`、`planDate`、`plans`。
+- `productionPlan.plans[].planIndex` 是计划组数组；数组索引 + 1 是外部 `planIndex`。
+- `currentGroups` 是推荐字段，值使用 public 1-based 组号；支持 dict 或 `[{lineId, currentGroup}]` 列表。
+- `productionLineCurrentGroup` 是兼容字段，值直接写入 core 的 0-based `production_line_current_group`。
+- 出库任务里的 `planIndex` 仍为 public 1-based。API 转换为 core 0-based 后检查是否等于当前可执行组。
+- 如果不传 `productionPlan`，系统沿用当前内存中的计划；如果只传 `currentGroups` 或 `productionLineCurrentGroup`，仅同步产线进度。
 
 **inventory 字段（库存同步）**:
 
@@ -440,6 +355,7 @@ planIndex: [        // 数组，每个元素是一个组
 |------|------|------|------|
 | aisleId | String | 是 | 巷道ID |
 | isAvailable | Boolean | 是 | 巷道是否可用 |
+| unavailableReason | String | 否 | 巷道不可用原因（isAvailable 为 false 时建议填写） |
 | bank | String | 是 | 货位面："LEFT" 或 "RIGHT" |
 | exitCongestion | Array | 是 | 各产线的出口拥堵状态 |
 | exitCongestion[].lineId | String | 是 | 产线ID |
@@ -453,18 +369,54 @@ planIndex: [        // 数组，每个元素是一个组
 | taskType | String | 是 | 任务类型："OUTBOUND" 或 "INBOUND" |
 | planId | String | 出库必填 | 所属生产计划ID |
 | planIndex | Integer | 出库必填 | 所属组号（从 1 开始） |
+| targetAisle | String | 入库必填 | 目标入库巷道ID |
+| inboundUrgent | Boolean | 否 | 是否紧急入库，默认 false |
 | skus | Array | 是 | 任务包含的 SKU 列表 |
 | skus[].skuId | String | 是 | SKU ID |
 | skus[].quantity | Integer | 是 | 数量 |
+| skus[].beamSide | String | 单梁入库必填 | 单梁左右位置，取值 `LEFT` / `RIGHT` |
 
 **附加属性要求**:
 - 任何 `skuId` 有值且 `quantity > 0` 的 SKU，必须包含 `match_fields` 中定义的所有附加属性字段（如 `version`、`生产属性`）。
+
+**单梁 / 双梁规则**:
+- 入库任务 `skus` 长度为 1 时，视为单梁入库，必须显式传入 `skus[0].beamSide`。
+- `beamSide=LEFT` 表示单梁在左侧，分配货位时不能使用堆垛机右侧高位。
+- `beamSide=RIGHT` 表示单梁在右侧，分配货位时不能使用堆垛机左侧高位。
+- 入库任务 `skus` 长度为 2 时，视为双梁场景，`beamSide` 非必填。
+- `beamSide` 是 API 契约字段；系统不会根据 SKU 编码前缀自动推断左右侧。
+
+**BOM 校验规则**:
+- `mixed schedule` 仅对 `INBOUND` 任务执行 BOM 校验。
+- `OUTBOUND` 任务允许基于本次请求提交的 `inventory` 做运行时库存定位，即使该 SKU 不在当前 BOM 中。
+- 若 `INBOUND` 任务包含未维护在 BOM 中的 SKU，接口返回 `400 FAILED`，并在 `data.invalidSkus`、`data.taskIds` 中给出明细。
 
 **请求示例**:
 
 ```json
 {
   "currentTime": "2026-01-21 10:15:00",
+  "productionPlan": {
+    "operationType": "UPDATE",
+    "planDate": "2026-01-21 09:00:00",
+    "plans": [
+      {
+        "planId": "PLAN-LINE1-20260121",
+        "lineId": "LINE-1",
+        "planIndex": [
+          {
+            "requiredSkus": [
+              [
+                {"skuId": "2801021-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"},
+                {"skuId": "2801037-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"}
+              ]
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "currentGroups": {"LINE-1": 1},
   "inventory": [],
   "aisleStatus": [
     {
@@ -490,13 +442,49 @@ planIndex: [        // 数组，每个元素是一个组
   ],
   "tasks": [
     {
-      "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0",
+      "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
       "taskType": "OUTBOUND",
       "planId": "PLAN-LINE1-20260121",
       "planIndex": 1,
       "skus": [
         {"skuId": "2801021-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"},
         {"skuId": "2801037-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"}
+      ]
+    },
+    {
+      "taskId": "INBOUND_2801021-KR8H4_2801037-KR8H4_20260121101500_001",
+      "taskType": "INBOUND",
+      "targetAisle": "3",
+      "inboundUrgent": false,
+      "skus": [
+        {"skuId": "2801021-KR8H4", "quantity": 1, "version": "00", "生产属性": "默认"},
+        {"skuId": "2801037-KR8H4", "quantity": 1, "version": "00", "生产属性": "默认"}
+      ]
+    }
+  ]
+}
+```
+
+**请求示例 - 单梁入库**:
+
+```json
+{
+  "currentTime": "2026-04-03 05:42:25",
+  "inventory": [],
+  "aisleStatus": [],
+  "tasks": [
+    {
+      "taskId": "INBOUND_666666",
+      "taskType": "INBOUND",
+      "targetAisle": "1",
+      "skus": [
+        {
+          "skuId": "2801022-TG150",
+          "quantity": 1,
+          "beamSide": "LEFT",
+          "version": "00",
+          "生产属性": "默认"
+        }
       ]
     }
   ]
@@ -516,7 +504,7 @@ planIndex: [        // 数组，每个元素是一个组
       {
         "aisleId": "1",
         "assignedTask": {
-          "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0",
+          "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
           "taskType": "OUTBOUND",
           "planId": "PLAN-LINE1-20260121",
           "planIndex": 1,
@@ -542,11 +530,21 @@ planIndex: [        // 数组，每个元素是一个组
               "生产属性": "默认"
             }
           ]
-        }
+        },
+        "matchedTasks": [
+          {
+            "taskId": "OUTBOUND_PL1_GP2_2801021-H19H0_2801037-H19H0_20260121101500_002",
+            "taskType": "OUTBOUND",
+            "planId": "PLAN-LINE1-20260121",
+            "planIndex": 2,
+            "positions": []
+          }
+        ]
       },
       {
         "aisleId": "2",
-        "assignedTask": null
+        "assignedTask": null,
+        "matchedTasks": null
       }
     ]
   }
@@ -560,8 +558,22 @@ planIndex: [        // 数组，每个元素是一个组
   "status": "FAILED",
   "message": "存在未确认的任务，请等待反馈后再请求调度。",
   "data": {
-    "unconfirmed_tasks": ["OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0"],
+    "unconfirmed_tasks": ["OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001"],
     "timestamp": "2026-01-21T10:15:00Z"
+  }
+}
+```
+
+**400 失败示例（入库任务 BOM 不存在）**:
+
+```json
+{
+  "status": "FAILED",
+  "message": "存在未维护在BOM中的SKU，无法执行调度。",
+  "data": {
+    "invalidSkus": ["NOT_IN_BOM_1", "NOT_IN_BOM_2"],
+    "taskIds": ["INBOUND_BAD_BOM"],
+    "timestamp": "2026-04-03T05:42:25Z"
   }
 }
 ```
@@ -574,6 +586,9 @@ planIndex: [        // 数组，每个元素是一个组
 - `data.aisleAssignments`: 各巷道的任务分配结果
 - `data.aisleAssignments[].aisleId`: 巷道ID
 - `data.aisleAssignments[].assignedTask`: 分配给该巷道的任务（null 表示无任务分配）
+- `data.aisleAssignments[].matchedTasks`: 当前请求中可匹配到该巷道的任务预览列表；无匹配时返回 `null`。
+- `matchedTasks` 包含本次请求中已匹配到该巷道的任务。如果其中某个任务同时被下发执行，它也会出现在 `assignedTask` 中；如果该巷道已有历史 `EXECUTING` 任务，历史任务保持为 `assignedTask`，本次新匹配任务只作为预览出现在 `matchedTasks`。
+- 仅 `assignedTask` 会进入待确认下发状态；仅出现在 `matchedTasks` 的预览任务不会替换当前执行任务，也不会被视为已下发。
 - `assignedTask.taskId`: 任务ID
 - `assignedTask.taskType`: 任务类型（OUTBOUND / INBOUND）
 - `assignedTask.planId`: 出库任务所属计划ID（入库任务为 null）
@@ -600,9 +615,19 @@ planIndex: [        // 数组，每个元素是一个组
 | tasks[].skus | Array | 是 | SKU 列表 |
 | tasks[].skus[].skuId | String | 是 | SKU ID |
 | tasks[].skus[].quantity | Integer | 是 | 数量 |
+| tasks[].skus[].beamSide | String | 单梁入库必填 | 单梁左右位置，取值 `LEFT` / `RIGHT` |
 
 **附加属性要求**:
 - 任何 `skuId` 有值且 `quantity > 0` 的 SKU，必须包含 `match_fields` 中定义的所有附加属性字段（如 `version`、`生产属性`）。
+
+**单梁规则**:
+- `tasks[].skus` 长度为 1 时，必须显式传入 `beamSide`。
+- `LEFT` 表示单梁在左侧，`RIGHT` 表示单梁在右侧。
+- 该字段会影响后续货位分配侧向约束，因此调用方不能省略或自行改用 SKU 前缀推断。
+
+**BOM 校验规则**:
+- `/api/v1/inbound/allocate` 对所有入库任务执行 BOM 校验。
+- 若存在未维护在 BOM 中的 SKU，接口返回 `400 FAILED`，并在 `data.invalidSkus`、`data.taskIds` 中返回明细。
 
 **请求示例**:
 
@@ -614,6 +639,27 @@ planIndex: [        // 数组，每个元素是一个组
       "skus": [
         {"skuId": "2801021-KR8H4", "quantity": 1, "version": "00", "生产属性": "默认"},
         {"skuId": "2801037-KR8H4", "quantity": 1, "version": "00", "生产属性": "默认"}
+      ]
+    }
+  ]
+}
+```
+
+**请求示例 - 单梁巷道分配**:
+
+```json
+{
+  "tasks": [
+    {
+      "taskId": "ALLOCATE_20260403002",
+      "skus": [
+        {
+          "skuId": "2801022-TG150",
+          "quantity": 1,
+          "beamSide": "LEFT",
+          "version": "00",
+          "生产属性": "默认"
+        }
       ]
     }
   ]
@@ -634,6 +680,20 @@ planIndex: [        // 数组，每个元素是一个组
         "recommendedAisle": "2"
       }
     ]
+  }
+}
+```
+
+**400 失败示例（BOM 不存在）**:
+
+```json
+{
+  "status": "FAILED",
+  "message": "存在未维护在BOM中的SKU，无法执行入库分配。",
+  "data": {
+    "invalidSkus": ["NOT_IN_BOM_1", "NOT_IN_BOM_2"],
+    "taskIds": ["ALLOCATE_BAD_BOM"],
+    "timestamp": "2026-04-03T05:42:25Z"
   }
 }
 ```
@@ -848,6 +908,29 @@ planIndex: [        // 数组，每个元素是一个组
 
 ---
 
+#### 3.5.3 重置内存状态（本地测试专用）
+
+**接口**: `POST /api/v1/debug/reset`
+
+**说明**: 重置内存中的仓库服务、库存索引、任务状态和待确认队列。此接口仅在环境变量 `WMS_ENABLE_DEBUG_RESET=1` 时注册，用于自动化测试和本地调试；生产部署不要开启该环境变量。
+
+**响应示例**:
+
+```json
+{
+  "status": "SUCCESS",
+  "message": "reset ok",
+  "data": null
+}
+```
+
+**响应字段说明**:
+- `status`: 操作状态（SUCCESS / FAILED）
+- `message`: 操作描述信息
+- `data`: 固定为 null
+
+---
+
 ### 3.6 BOM 配置更新接口
 
 #### 3.6.1 更新 BOM 配置
@@ -1004,8 +1087,8 @@ sequenceDiagram
     participant Core as Warehouse Core
 
     Note over Client,Core: 步骤1: 设置生产计划
-    Client->>API: POST /api/v1/plan/production
-    API->>Core: 设置计划
+    Client->>API: POST /api/v1/schedule/mixed (内联 productionPlan + currentGroups)
+    API->>Core: 设置计划和产线进度
     Core-->>API: 计划已保存
     API-->>Client: 200 OK
 
@@ -1198,7 +1281,7 @@ INBOUND_A_2801021-KR8H4_2801037-KR8H4
 **最佳实践**:
 1. 设计生产计划时，将紧急任务放在前面的组
 2. 组内任务数量不宜过多（建议 2-5 个）
-3. 定期检查生产计划进度（`GET /api/v1/plan/production`）
+3. 每次调度请求传入 `currentGroups` 同步生产计划进度；旧客户端可继续传 `productionLineCurrentGroup`
 
 ### 6.3 库存同步策略
 
@@ -1265,30 +1348,7 @@ INBOUND_A_2801021-KR8H4_2801037-KR8H4
 
 #### 步骤 0: 设置生产计划
 
-```bash
-curl -X POST http://localhost:8000/api/v1/plan/production \
-  -H "Content-Type: application/json" \
-  -d '{
-    "operationType": "ADD",
-    "planDate": "2026-01-21 09:00:00",
-    "plans": [
-      {
-        "planId": "PLAN-LINE1-20260121",
-        "lineId": "LINE-1",
-        "planIndex": [
-          {
-            "requiredSkus": [
-              [
-                {"skuId": "2801021-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"},
-                {"skuId": "2801037-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"}
-              ]
-            ]
-          }
-        ]
-      }
-    ]
-  }'
-```
+生产计划不再单独提交；请在后续 `POST /api/v1/schedule/mixed` 请求中传入 `productionPlan` 和 `currentGroups`。
 
 #### 步骤 1: 初始化库存
 
@@ -1314,6 +1374,27 @@ curl -X POST http://localhost:8000/api/v1/schedule/mixed \
   -H "Content-Type: application/json" \
   -d '{
     "currentTime": "2026-01-21 10:15:00",
+    "productionPlan": {
+      "operationType": "UPDATE",
+      "planDate": "2026-01-21 09:00:00",
+      "plans": [
+        {
+          "planId": "PLAN-LINE1-20260121",
+          "lineId": "LINE-1",
+          "planIndex": [
+            {
+              "requiredSkus": [
+                [
+                  {"skuId": "2801021-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"},
+                  {"skuId": "2801037-H19H0", "quantity": 1, "version": "00", "生产属性": "默认"}
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "currentGroups": {"LINE-1": 1},
     "inventory": [],
     "aisleStatus": [...],
     "tasks": [
@@ -1463,9 +1544,9 @@ python test_api_flow.py --base-url http://192.168.1.100:8000
 4. 生产计划顺序约束未满足（前一组未完成）
 
 **解决方案**:
-1. 检查库存数据（调用 `GET /api/v1/plan/production` 查看）
+1. 检查本次 `schedule/mixed` 请求中的库存数据和 `productionPlan`
 2. 检查巷道状态（aisleStatus）
-3. 检查生产计划进度（currentGroups）
+3. 检查生产计划进度（推荐 `currentGroups`，public 1-based；兼容 `productionLineCurrentGroup`，core 0-based）
 4. 等待拥堵解除（5 秒）
 
 ### 8.5 生产计划设置失败
@@ -1499,7 +1580,6 @@ python test_api_flow.py --base-url http://192.168.1.100:8000
 2. **调用调试接口**: 
    - `GET /api/v1/task/pending` - 查看待处理任务
    - `GET /api/v1/task/unconfirmed` - 查看未确认任务
-   - `GET /api/v1/plan/production` - 查看当前生产计划
    - `GET /api/v1/status` - 查看系统运行状态
 3. **联系技术支持**: 提供完整的请求和响应日志
 
@@ -1511,6 +1591,7 @@ python test_api_flow.py --base-url http://192.168.1.100:8000
 
 - **版本号**: v1.1
 - **API 前缀**: `/api/v1`
+- **兼容前缀**: 无。当前仅注册 `/api/v1`，`/api/v2`、`/api/v3` 不再作为兼容别名暴露。
 - **发布日期**: 2026-01-21
 - **状态**: 稳定
 
@@ -1521,13 +1602,12 @@ python test_api_flow.py --base-url http://192.168.1.100:8000
 
 | 方法 | 端点 | 说明 | 类型 |
 |------|------|------|------|
-| POST | /api/v1/plan/production | 设置生产计划 | 生产 |
-| GET | /api/v1/plan/production | 获取生产计划 | 生产 |
 | POST | /api/v1/schedule/mixed | 混合调度（核心接口） | 调度 |
 | POST | /api/v1/inbound/allocate | 入库巷道分配 | 入库 |
 | POST | /api/v1/task/feedback | 任务执行状态反馈 | 反馈 |
 | GET | /api/v1/task/unconfirmed | 查看未确认任务 | 调试 |
 | GET | /api/v1/status | 获取系统状态 | 调试 |
+| POST | /api/v1/debug/reset | 重置内存状态（本地测试专用） | 调试 |
 | GET | / | 服务信息 | 基础 |
 
 ### B. 快速参考卡片

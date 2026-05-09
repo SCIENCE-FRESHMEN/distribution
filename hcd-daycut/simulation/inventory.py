@@ -188,6 +188,7 @@ class InventoryManager:
                 for idx, sku in enumerate(skus):
                     sku_id = sku['skuId']
                     sku_attrs = {k: sku.get(k) for k in self.match_fields} if self.match_fields else {}
+                    sku_attrs["_inbound_time"] = 0.0
                     position = positions[min(idx, len(positions) - 1)]
                     try:
                         layer = None
@@ -330,13 +331,28 @@ class InventoryManager:
             if position.is_double_layer:
                 # 
                 if position.upper_quantity > 0 and position.upper_sku:
+                    self._register_sku_if_needed(position.upper_sku)
                     self.current_inventory[position.aisle][position.upper_sku] += position.upper_quantity
                 if position.lower_quantity > 0 and position.lower_sku:
+                    self._register_sku_if_needed(position.lower_sku)
                     self.current_inventory[position.aisle][position.lower_sku] += position.lower_quantity
             else:
                 # 
                 if not position.is_empty():
+                    self._register_sku_if_needed(position.sku)
                     self.current_inventory[position.aisle][position.sku] += position.quantity
+
+    def _register_sku_if_needed(self, sku: Optional[str]):
+        if not sku:
+            return
+        if sku not in self.sku_types:
+            self.sku_types.append(sku)
+        if sku not in self.sku_position_index:
+            self.sku_position_index[sku] = []
+        for aisle in self.aisles:
+            if aisle not in self.current_inventory:
+                self.current_inventory[aisle] = {}
+            self.current_inventory[aisle].setdefault(sku, 0)
     
     def get_empty_positions(self, aisle: int = None) -> List[InventoryPosition]:
         """
@@ -435,6 +451,7 @@ class InventoryManager:
         # 跳过无效 sku
         if sku is None:
             return
+        self._register_sku_if_needed(sku)
         
         if actual_position is None:
             raise ValueError(f"位置 {position_id} 不存在于 position_map 中")
@@ -552,7 +569,7 @@ class InventoryManager:
             'total_occupied': sum(1 for p in self.inventory_positions if not p.is_empty()),
             'total_beams': sum(p.quantity for p in self.inventory_positions),
             'sku_distribution': {
-                sku: sum(self.current_inventory[aisle][sku] for aisle in self.aisles)
+                sku: sum(self.current_inventory[aisle].get(sku, 0) for aisle in self.aisles)
                 for sku in self.sku_types
             }
         }
@@ -572,7 +589,7 @@ class InventoryManager:
             if total_qty > 0:
                 aisle_dist = {}
                 for aisle in self.aisles:
-                    qty = self.current_inventory[aisle][sku]
+                    qty = self.current_inventory[aisle].get(sku, 0)
                     if qty > 0:
                         aisle_dist[aisle] = qty
                 

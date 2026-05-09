@@ -8,7 +8,20 @@ from typing import List, Optional, Dict, Any
 import json
 from pathlib import Path
 from enum import Enum
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
+
+try:
+    from pydantic import model_validator
+except ImportError:
+    model_validator = None
+    from pydantic import root_validator
+else:
+    root_validator = None
+
+if not hasattr(BaseModel, "model_dump"):
+    BaseModel.model_dump = BaseModel.dict
+
+from config_loader import load_jsonc
 
 
 _MATCH_FIELDS: Optional[List[str]] = None
@@ -20,8 +33,7 @@ def _load_match_fields() -> List[str]:
         return _MATCH_FIELDS
     config_path = Path(__file__).resolve().parents[1] / "config" / "warehouse.json"
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        cfg = load_jsonc(config_path)
         _MATCH_FIELDS = list(cfg.get("match_fields", []) or [])
     except Exception:
         _MATCH_FIELDS = []
@@ -31,12 +43,15 @@ def _load_match_fields() -> List[str]:
 class SkuAttrsMixin(BaseModel):
     """SKU附加属性校验混入"""
 
-    model_config = {
-        "extra": "allow",
-    }
+    if model_validator is not None:
+        model_config = {
+            "extra": "allow",
+        }
+    else:
+        class Config:
+            extra = "allow"
 
-    @model_validator(mode="after")
-    def _validate_match_fields(self):
+    def _check_match_fields(self):
         match_fields = _load_match_fields()
         if not match_fields:
             return self
@@ -48,6 +63,17 @@ class SkuAttrsMixin(BaseModel):
         if missing:
             raise ValueError(f"缺少SKU附加属性: {', '.join(missing)}")
         return self
+
+    if model_validator is not None:
+        @model_validator(mode="after")
+        def _validate_match_fields(self):
+            return self._check_match_fields()
+    else:
+        @root_validator(skip_on_failure=True)
+        def _validate_match_fields(cls, values):
+            instance = cls.construct(**values)
+            instance._check_match_fields()
+            return values
 
 
 # ============================================================
@@ -94,6 +120,12 @@ class ShelfPosition(str, Enum):
     LOWER = "LOWER"               # 下层
 
 
+class BeamSide(str, Enum):
+    """单梁所在侧"""
+    LEFT = "LEFT"
+    RIGHT = "RIGHT"
+
+
 class UnavailableReason(str, Enum):
     """巷道不可用原因"""
     MAINTENANCE = "MAINTENANCE"   # 维护
@@ -109,6 +141,7 @@ class SkuInfo(SkuAttrsMixin):
     """SKU信息"""
     skuId: str = Field(..., description="货物ID")
     quantity: int = Field(..., ge=0, description="货物数量（0表示空货位，1表示有货）")
+    beamSide: Optional[BeamSide] = Field(None, description="单梁左右位置，仅单梁入库时使用")
 
     model_config = {
         "extra": "allow",
@@ -178,7 +211,7 @@ class ScheduleTaskRequest(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "taskId": "OUTBOUND-R1-001",
+                "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
                 "taskType": "OUTBOUND",
                 "planId": "PLAN-LINE1",
                 "planIndex": 1,
@@ -190,6 +223,25 @@ class ScheduleTaskRequest(BaseModel):
         }
     }
 
+    def _check_single_beam_requirements(self):
+        if self.taskType == TaskType.INBOUND and len(self.skus) == 1 and self.skus[0].quantity > 0:
+            if self.skus[0].beamSide is None:
+                raise ValueError("single inbound SKU requires beamSide")
+        return self
+
+    if model_validator is not None:
+        @model_validator(mode="after")
+        def _validate_single_beam_requirements(self):
+            return self._check_single_beam_requirements()
+    else:
+        @root_validator(skip_on_failure=True)
+        def _validate_single_beam_requirements(cls, values):
+            task_type = values.get("taskType")
+            skus = values.get("skus") or []
+            if task_type == TaskType.INBOUND and len(skus) == 1 and getattr(skus[0], "quantity", 0) > 0:
+                if getattr(skus[0], "beamSide", None) is None:
+                    raise ValueError("single inbound SKU requires beamSide")
+            return values
 
 class AisleStatusRequest(BaseModel):
     """巷道状态信息"""
@@ -246,13 +298,55 @@ class MixedScheduleRequest(BaseModel):
     tasks: List[ScheduleTaskRequest] = Field(..., description="任务列表")
     aisleStatus: List[AisleStatusRequest] = Field(..., description="巷道状态列表")
     inventory: List[InventoryPositionRequest] = Field(..., description="库存信息")
-
+    productionPlan: Optional["ProductionPlanRequest"] = Field(
+        None,
+        description="本次调度使用的内联生产计划；结构沿用原 ProductionPlanRequest",
+    )
+    productionLineCurrentGroup: Optional[Dict[str, int]] = Field(
+        None,
+        description="各产线 core 0-based 当前可执行组索引，例如 {'LINE-1': 0} 表示第1组可执行/已完成0组",
+    )
+    currentGroups: Optional[Any] = Field(
+        None,
+        description="各产线 public 1-based 当前可执行组号；支持 {'LINE-1': 1} 或 [{'lineId': 'LINE-1', 'currentGroup': 1}]，优先于 productionLineCurrentGroup",
+    )
+    operationType: Optional[OperationType] = Field(
+        None,
+        description="内联生产计划操作类型；当 plans 直接放在 mixed 根节点时使用",
+    )
+    planDate: Optional[str] = Field(
+        None,
+        description="内联生产计划日期；当 plans 直接放在 mixed 根节点时使用",
+    )
+    plans: Optional[List["ProductionPlanInfo"]] = Field(
+        None,
+        description="内联生产计划列表；当直接放在 mixed 根节点时沿用原 plans 结构",
+    )
     model_config = {
         "json_schema_extra": {
             "example": {
+                "productionPlan": {
+                    "operationType": "UPDATE",
+                    "planDate": "2026-01-21 09:00:00",
+                    "plans": [
+                        {
+                            "planId": "PLAN-LINE1-20260121",
+                            "lineId": "1",
+                            "planIndex": [
+                                {
+                                    "requiredSkus": [
+                                        [{"skuId": "2801021-H19H0", "quantity": 1}, {"skuId": "2801037-H19H0", "quantity": 1}]
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "currentGroups": {"LINE-1": 1},
+                "productionLineCurrentGroup": {"LINE-1": 0},
                 "tasks": [
                     {
-                        "taskId": "OUTBOUND-R1-001",
+                        "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
                         "taskType": "OUTBOUND",
                         "planId": "PLAN-LINE1",
                         "planIndex": 1,
@@ -323,7 +417,7 @@ class AssignedTaskResponse(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "taskId": "OUTBOUND-R1-001",
+                "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
                 "taskType": "OUTBOUND",
                 "planId": "PLAN-LINE1",
                 "planIndex": 1,
@@ -346,13 +440,17 @@ class AisleAssignmentResponse(BaseModel):
     """巷道分配结果"""
     aisleId: str = Field(..., description="巷道ID")
     assignedTask: Optional[AssignedTaskResponse] = Field(None, description="分配的任务")
+    matchedTasks: Optional[List[AssignedTaskResponse]] = Field(
+        None,
+        description="本次请求中匹配到该巷道的任务列表（用于预匹配/排队展示，不代表立即下发执行）",
+    )
 
     model_config = {
         "json_schema_extra": {
             "example": {
                 "aisleId": "1",
                 "assignedTask": {
-                    "taskId": "OUTBOUND-R1-001",
+                    "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
                     "taskType": "OUTBOUND",
                     "planId": "PLAN-LINE1",
                     "planIndex": 1,
@@ -387,7 +485,7 @@ class MixedScheduleResponse(BaseModel):
                     {
                         "aisleId": "1",
                         "assignedTask": {
-                            "taskId": "OUTBOUND-R1-001",
+                            "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
                             "taskType": "OUTBOUND",
                             "planId": "PLAN-LINE1",
                             "planIndex": 1,
@@ -424,7 +522,7 @@ class TaskFeedbackRequest(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "taskId": "OUTBOUND-R1-001",
+                "taskId": "OUTBOUND_PL1_GP1_2801021-H19H0_2801037-H19H0_20260121101500_001",
                 "taskType": "OUTBOUND",
                 "status": "COMPLETED",
                 "startTime": "2026-01-15T10:00:00Z",
@@ -432,6 +530,22 @@ class TaskFeedbackRequest(BaseModel):
             }
         }
     }
+
+    def _check_failure_reason(self):
+        if self.status == TaskStatus.FAILED and not (self.failureReason or "").strip():
+            raise ValueError("failureReason is required when status is FAILED")
+        return self
+
+    if model_validator is not None:
+        @model_validator(mode="after")
+        def _validate_failure_reason(self):
+            return self._check_failure_reason()
+    else:
+        @root_validator(skip_on_failure=True)
+        def _validate_failure_reason(cls, values):
+            if values.get("status") == TaskStatus.FAILED and not (values.get("failureReason") or "").strip():
+                raise ValueError("failureReason is required when status is FAILED")
+            return values
 
 
 class TaskFeedbackResponse(BaseModel):
@@ -471,6 +585,24 @@ class InboundTaskRequest(BaseModel):
         }
     }
 
+    def _check_single_beam_requirements(self):
+        if len(self.skus) == 1 and self.skus[0].quantity > 0:
+            if self.skus[0].beamSide is None:
+                raise ValueError("single inbound SKU requires beamSide")
+        return self
+
+    if model_validator is not None:
+        @model_validator(mode="after")
+        def _validate_single_beam_requirements(self):
+            return self._check_single_beam_requirements()
+    else:
+        @root_validator(skip_on_failure=True)
+        def _validate_single_beam_requirements(cls, values):
+            skus = values.get("skus") or []
+            if len(skus) == 1 and getattr(skus[0], "quantity", 0) > 0:
+                if getattr(skus[0], "beamSide", None) is None:
+                    raise ValueError("single inbound SKU requires beamSide")
+            return values
 
 class InboundAllocateRequest(BaseModel):
     """入库分配请求"""
@@ -648,6 +780,15 @@ class ProductionPlanResponse(BaseModel):
             }
         }
     }
+
+
+try:
+    MixedScheduleRequest.model_rebuild()
+except AttributeError:
+    MixedScheduleRequest.update_forward_refs(
+        ProductionPlanRequest=ProductionPlanRequest,
+        ProductionPlanInfo=ProductionPlanInfo,
+    )
 
 
 # ============================================================

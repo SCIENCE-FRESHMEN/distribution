@@ -22,6 +22,8 @@ import argparse
 from typing import Dict, Any, Optional
 from pathlib import Path
 
+from config_loader import load_jsonc
+
 import sys; sys.stdout = open("log.md", "a", encoding="utf-8")
 
 
@@ -34,8 +36,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "warehouse.json"
 
 def load_match_fields() -> list:
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        cfg = load_jsonc(CONFIG_PATH)
         return list(cfg.get("match_fields", []) or [])
     except Exception:
         return []
@@ -71,11 +72,13 @@ SCENARIOS = [
     {
         "name": "场景0: 设置生产计划",
         "method": "POST",
-        "endpoint": "/plan/production",
+        "endpoint": "/schedule/mixed",
         "data": {
-            "operationType": "ADD",
-            "planDate": "2026-01-21 09:00:00",
-            "plans": [
+            "currentTime": "2026-01-21 09:00:00",
+            "productionPlan": {
+                "operationType": "ADD",
+                "planDate": "2026-01-21 09:00:00",
+                "plans": [
                 {
                     "planId": "PLAN-LINE1-20260121",
                     "lineId": "LINE-1",
@@ -144,14 +147,25 @@ SCENARIOS = [
                         }
                     ]
                 }
-            ]
+                ]
+            },
+            "currentGroups": {"LINE-1": 1, "LINE-2": 1, "LINE-3": 1},
+            "inventory": [],
+            "aisleStatus": [],
+            "tasks": []
         },
         "wait_after": 1
     },
     {
-        "name": "场景0.1: 获取生产计划",
-        "method": "GET",
-        "endpoint": "/plan/production",
+        "name": "场景0.1: 空调度确认计划状态保持",
+        "method": "POST",
+        "endpoint": "/schedule/mixed",
+        "data": {
+            "currentTime": "2026-01-21 09:01:00",
+            "inventory": [],
+            "aisleStatus": [],
+            "tasks": []
+        },
         "wait_after": 1
     },
     {
