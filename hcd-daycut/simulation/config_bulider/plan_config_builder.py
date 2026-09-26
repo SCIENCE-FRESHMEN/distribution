@@ -1,3 +1,5 @@
+"""将生产计划表规范化为按产线、组和任务组织的内部计划结构。"""
+
 import pandas as pd
 import json
 import os
@@ -6,10 +8,13 @@ import datetime
 import pytz
 
 class ProductionPlanBuilder:
+    """读取计划行并保留每组 SKU、属性与创建时间，供出库任务生成使用。"""
     def __init__(self, plan_df, sku_config):
-        """
-        :param plan_df: 生产计划 DataFrame
+        """:param plan_df: 生产计划 DataFrame
         :param sku_config: SKU 配置（来自 SKUConfigBuilder.load_json）
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
         """
         self.plan_df = plan_df
         self.sku_config = sku_config
@@ -21,6 +26,9 @@ class ProductionPlanBuilder:
 
     @staticmethod
     def _to_seconds(val):
+        """将 Excel 或字符串时间统一为 UTC 秒时间戳，失败时使用 0。
+
+        """
         """将 Excel/字符串时间转换为秒，失败返回 0"""
         try:
             if isinstance(val, pd.Timestamp):
@@ -33,8 +41,10 @@ class ProductionPlanBuilder:
                     return val.timestamp()
             if isinstance(val, (int, float)):
                 # 假设数值型时间戳是秒单位的时间戳
-                return float(val)
-            
+                # pandas 的 Timestamp 等对象不保证实现 float 协议；
+                # 转成文本后只接受可解析的数值型回退值。
+                return float(str(val).strip())
+
             # 将输入解析为datetime对象
             dt = pd.to_datetime(val)
             if dt.tz is None:
@@ -46,15 +56,15 @@ class ProductionPlanBuilder:
                 return dt.timestamp()
         except Exception:
             try:
-                return float(val)
+                return float(str(val).strip())
             except Exception:
                 return 0.0
 
     # ========= 从文件导入SKU 配置 =========
     @classmethod
     def from_files(cls, plan_path, sku_config_path):
-        """
-        从 Excel/CSV 文件和 SKU 配置文件构建对象
+        """从 Excel/CSV 文件和 SKU 配置文件构建对象
+
         """
         if not os.path.exists(plan_path):
             raise FileNotFoundError(f"计划文件不存在: {plan_path}")
@@ -75,7 +85,9 @@ class ProductionPlanBuilder:
 
     # ========= 判定函数 =========
     def _is_single_layer_sku(self, sku):
-        """判断是否为可合并的单层梁 SKU"""
+        """判断是否为可合并的单层梁 SKU
+
+        """
         sku_pairs = self.sku_config.get("sku_pairs", {})
         sku_solo = set(self.sku_config.get("sku_solo", []))
         if not sku or sku in ("", "9", "nan", "NaN", "None"):
@@ -84,6 +96,9 @@ class ProductionPlanBuilder:
 
     # ========= 构建逻辑 =========
     def build(self, filter_solo_sku=False):
+        """执行 `build` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        """
         df = self.plan_df.copy()
         sku_pairs = self.sku_config.get("sku_pairs", {})
         sku_solo = set(self.sku_config.get("sku_solo", []))
@@ -91,7 +106,7 @@ class ProductionPlanBuilder:
         line_map = {"装配一线": 1, "装配二线": 2, "装配三线": 3}
         df["计划类型"] = df["计划类型"].astype(str).str.strip()
         df["车架号"] = df["车架号"].astype(str).str.strip()
-        
+
         # 识别创建时间列（生产计划中的创建时间）
         creation_col = None
         for cand in ["完成时间", "creation_time"]:
@@ -112,9 +127,36 @@ class ProductionPlanBuilder:
 
             entries = []
             for _, row in group.iterrows():
-                def norm(x): return str(x).strip()
-                def is_empty_or_9(x): return x in ("", "9", "nan", "NaN", "None")
+                def norm(x):
+                    """将单元格值转为去除首尾空白的字符串，供本计划行字段统一读取。
+
+                    Args:
+                        x (Any): 供当前处理流程使用的 `x` 值。
+
+                    Returns:
+                        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+                    """
+                    return str(x).strip()
+
+                def is_empty_or_9(x):
+                    """判断计划单元格是否为空或以约定值 9 表示无有效 SKU。
+
+                    Args:
+                        x (Any): 供当前处理流程使用的 `x` 值。
+
+                    Returns:
+                        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+                    """
+                    return x in ("", "9", "nan", "NaN", "None")
                 def norm_or_none(x):
+                    """执行 `norm_or_none` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+                    Args:
+                        x (Any): 供当前处理流程使用的 `x` 值。
+
+                    Returns:
+                        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+                    """
                     v = norm(x)
                     return None if is_empty_or_9(v) else v
 
@@ -179,7 +221,7 @@ class ProductionPlanBuilder:
                         self.production_plan_attrs["version"][line].append(combined_versions)
                         combined_prod_attrs = [[left_prod_attrs[0], nxt_left_prod_attrs[0]], [right_prod_attrs[0], nxt_right_prod_attrs[0]]]
                         self.production_plan_attrs.setdefault("生产属性", {1: [], 2: [], 3: []})
-                        self.production_plan_attrs["生产属性"][line].append(combined_prod_attrs)                        
+                        self.production_plan_attrs["生产属性"][line].append(combined_prod_attrs)
                         self.creation_times[line].append(ctime if ctime is not None else nxt_ctime)
                         i += 2
                         continue
@@ -196,6 +238,9 @@ class ProductionPlanBuilder:
 
     # ========= 导出为 JSON =========
     def to_json(self, filepath=None, indent=4):
+        """执行 `to_json` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        """
         data = {
             "production_plan": self.production_plan,
             "production_plan_attrs": self.production_plan_attrs,
@@ -210,6 +255,16 @@ class ProductionPlanBuilder:
 
     # ========= 可视化输出 =========
     def show(self):
+        """执行 `show` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：无显式业务输入；依赖实例字段或模块配置。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         for line, plans in self.production_plan.items():
             print(f"\n=== 产线 {line} ===")
             for i, p in enumerate(plans, 1):
@@ -218,15 +273,15 @@ class ProductionPlanBuilder:
     # =========  导入方法 =========
     @classmethod
     def load_json(cls, filepath):
-        """
-        从 JSON 文件加载已生成的生产计划
+        """从 JSON 文件加载已生成的生产计划
         :param filepath: JSON 文件路径
         :return: ProductionPlanBuilder 实例
+
         """
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"生产计划文件不存在: {filepath}")
 
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, "r", encoding="utf-8-sig") as f:
             production_plan = json.load(f)
 
         # 兼容老格式（仅生产计划）和新格式（包含 creation_times/attrs）
@@ -248,7 +303,7 @@ class ProductionPlanBuilder:
             if production_plan_versions is not None:
                 production_plan_attrs["version"] = production_plan_versions
         production_plan_attrs = {k: {int(kk): vv for kk, vv in v.items()} for k, v in (production_plan_attrs or {}).items()}
-        
+
         instance = cls(plan_df=None, sku_config=None)
         instance.production_plan = production_plan
         instance.creation_times = creation_times

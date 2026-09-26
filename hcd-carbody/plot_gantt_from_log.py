@@ -1,3 +1,5 @@
+"""从仿真运行日志解析任务时间线并绘制甘特图。"""
+
 import re
 import os
 import sys
@@ -26,15 +28,27 @@ END_DATE = ""
 TASK_RE = re.compile(r"第\s*\d+个(出库任务|入库任务|移库操作)\s+([A-Z0-9_\-]+|IN_\d+|OUTBOUND[\w_\-]+).*?\(巷道\s*(\d+)\)，起止\s*([0-9.]+)s~([0-9.]+)s", re.UNICODE)
 
 
+# ==========================================================================
+# 辅助函数：日志解析、日期筛选与甘特图绘制
+# ==========================================================================
 def parse_days(log_text, days=None):
+    """执行 parse days 对应的业务处理。
+
+    Args:
+        log_text: 用于本函数处理的 `log_text` 参数。
+        days: 用于本函数处理的 `days` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     results = {}
-    
+
     #  "=== 第n天 ===" 段
     reloc_day_positions = {}
     for m in re.finditer(r"=== 第(\d+)天 ===", log_text):
         day = int(m.group(1))
         reloc_day_positions[day] = m.start()
-    
+
     #  "第 n 天汇总" 段
     stock_day_positions = {}
     summary_pos = log_text.find('全部天汇总')
@@ -51,9 +65,9 @@ def parse_days(log_text, days=None):
 
     for d in days:
         tasks = []
-        stock_tasks = []  
-        reloc_tasks = []  
-        
+        stock_tasks = []
+        reloc_tasks = []
+
         # 移库
         if d in reloc_day_positions:
             start_pos = reloc_day_positions[d]
@@ -64,7 +78,7 @@ def parse_days(log_text, days=None):
                     break
             if end_pos is None:
                 end_pos = len(log_text)
-            
+
             segment = log_text[start_pos:end_pos]
             for m in TASK_RE.finditer(segment):
                 task_type = m.group(1)
@@ -75,7 +89,7 @@ def parse_days(log_text, days=None):
                     start = float(m.group(4))
                     end = float(m.group(5))
                     reloc_tasks.append({'type': ttype, 'id': tid, 'aisle': aisle, 'start': start, 'end': end})
-        
+
         # 入库出库
         if d in stock_day_positions:
             start_pos = stock_day_positions[d]
@@ -86,7 +100,7 @@ def parse_days(log_text, days=None):
                     break
             if end_pos is None:
                 end_pos = len(log_text)
-            
+
             segment = log_text[start_pos:end_pos]
             for m in TASK_RE.finditer(segment):
                 task_type = m.group(1)
@@ -106,22 +120,22 @@ def parse_days(log_text, days=None):
                     end = float(m.group(5))
                     tasks.append({'type': ttype, 'id': tid, 'aisle': aisle, 'start': start, 'end': end})
                 else:
-                    continue  
-        
+                    continue
+
         # 校验移库任务
         corrected_reloc_tasks = []
         for reloc_task in reloc_tasks:
             task_id = reloc_task['id']
             reloc_aisle = reloc_task['aisle']
-            
+
             # 查找同一任务ID的出库任务
             matching_stock_tasks = [t for t in stock_tasks if t['id'] == task_id]
-            
+
             if matching_stock_tasks:
                 # 找到对应的出库任务，以出库任务的巷道为准
                 stock_task = matching_stock_tasks[0]
                 stock_aisle = stock_task['aisle']
-                
+
                 if reloc_aisle != stock_aisle:
                     print(f"第{d}天警告: 任务 {task_id} 的巷道不一致 - 移库记录为巷道{reloc_aisle}，出库记录为巷道{stock_aisle}，已修正为巷道{stock_aisle}")
                     # 修正巷道为出库任务的巷道，但保留其他信息
@@ -132,11 +146,11 @@ def parse_days(log_text, days=None):
                     corrected_reloc_tasks.append(reloc_task)
             else:
                 corrected_reloc_tasks.append(reloc_task)
-        
+
         # 添加修正后的移库任务
         tasks.extend(corrected_reloc_tasks)
         results[d] = tasks
-    
+
     #如果出库和移库是同一ID，改为移库
     for d in days:
         task_dict = {}
@@ -146,7 +160,7 @@ def parse_days(log_text, days=None):
                 # 如果已经存在相同ID的任务，检查类型优先级：移库 > 出库 > 入库
                 existing_task = task_dict[task_id]
                 priority = {'移库': 2, '出库': 1, '入库': 0}
-                
+
                 if priority.get(task['type'], -1) > priority.get(existing_task['type'], -1):
                     # 新任务优先级更高，替换
                     task_dict[task_id] = task
@@ -156,17 +170,30 @@ def parse_days(log_text, days=None):
                         task_dict[task_id] = task
             else:
                 task_dict[task_id] = task
-        
+
         results[d] = list(task_dict.values())
-    
+
     return results
 
 
 def plot_day(tasks, day, out_dir=OUT_DIR, show_labels=False, title_label=None, file_tag=None):
-    # tasks: list of dicts with aisle, start, end, type
+    # tasks：包含 aisle、start、end、type 字段的字典列表。
+    """执行 plot day 对应的业务处理。
+
+    Args:
+        tasks: 待处理的任务集合。
+        day: 用于本函数处理的 `day` 参数。
+        out_dir: 用于本函数处理的 `out_dir` 参数。
+        show_labels: 用于本函数处理的 `show_labels` 参数。
+        title_label: 用于本函数处理的 `title_label` 参数。
+        file_tag: 用于本函数处理的 `file_tag` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     aisles = [1,2,3,4,5]
     y_pos = {a: i for i,a in enumerate(aisles)}
-    fig, ax = plt.subplots(figsize=(10, 4)) 
+    fig, ax = plt.subplots(figsize=(10, 4))
     colors = {'出库':'#1f77b4', '入库':'#ff7f0e', '移库':'#2ca02c'}
     title_label = title_label or f"第{day}天"
     file_tag = file_tag or f"day{day}"
@@ -197,41 +224,41 @@ def plot_day(tasks, day, out_dir=OUT_DIR, show_labels=False, title_label=None, f
 
     # 检测每个巷道内的重叠：对每个巷道按开始时间排序
     overlap_info = []  # 存储重叠任务信息
-    
+
     for t in tasks:
         t['overlap'] = False
-    
+
     # 按巷道分组检测重叠
     for a in aisles:
         # 获取当前巷道的所有任务
         aisle_tasks = [t for t in tasks if t['aisle'] == a]
         if not aisle_tasks:
             continue
-            
+
         # 按开始时间排序
         aisle_tasks.sort(key=lambda x: x['start'])
-        
+
         # 检测同一巷道内的任务重叠
         for i in range(len(aisle_tasks)):
             for j in range(i+1, len(aisle_tasks)):
                 task_i = aisle_tasks[i]
                 task_j = aisle_tasks[j]
-                
+
                 # 确保是同一巷道
                 if task_i['aisle'] != task_j['aisle']:
                     continue
-                    
+
                 # 如果任务i结束时间 > 任务j开始时间，则存在重叠
                 if task_i['end'] > task_j['start']:
                     # 计算重叠时间
                     overlap_start = max(task_i['start'], task_j['start'])
                     overlap_end = min(task_i['end'], task_j['end'])
                     overlap_duration = overlap_end - overlap_start
-                    
+
                     if overlap_duration > 0:
                         # 检查重叠中是否包含移库操作
                         has_reloc = (task_i['type'] == '移库' or task_j['type'] == '移库')
-                        
+
                         overlap_info.append({
                             'aisle': a,
                             'task1_id': task_i['id'],
@@ -243,7 +270,7 @@ def plot_day(tasks, day, out_dir=OUT_DIR, show_labels=False, title_label=None, f
                             'duration': overlap_duration,
                             'has_reloc': has_reloc
                         })
-                        
+
                         if not has_reloc:
                             task_i['overlap'] = True
                             task_j['overlap'] = True
@@ -257,13 +284,13 @@ def plot_day(tasks, day, out_dir=OUT_DIR, show_labels=False, title_label=None, f
         y = y_pos[t['aisle']]
         left = t['start'] - day_base
         width = t['end'] - t['start']
-        
+
         # 确定条形颜色：如果标记为重叠则用红色，否则按任务类型配色
         if t.get('overlap'):
             bar_color = '#d62728'  # 红色表示需要关注的冲突
         else:
             bar_color = colors.get(t['type'], 'gray')
-            
+
         ax.barh(y, width, left=left, height=0.6, color=bar_color)
         if show_labels:
             ax.text(left + 0.5, y, t['id'], va='center', ha='left', fontsize=6)
@@ -292,6 +319,14 @@ def plot_day(tasks, day, out_dir=OUT_DIR, show_labels=False, title_label=None, f
 
 
 def _format_lambda_suffix(value):
+    """执行 format lambda suffix 对应的业务处理。
+
+    Args:
+        value: 待处理的单个值。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     if value is None:
         return ""
     text = f"{value}".replace(".", "p")
@@ -299,21 +334,51 @@ def _format_lambda_suffix(value):
 
 
 def _filter_logs_by_lambda(files, lambda_value):
+    """执行 filter logs by lambda 对应的业务处理。
+
+    Args:
+        files: 用于本函数处理的 `files` 参数。
+        lambda_value: 用于本函数处理的 `lambda_value` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     if lambda_value is None:
         return files
     suffix = _format_lambda_suffix(lambda_value)
     return [f for f in files if suffix in os.path.basename(f)]
 
 def _has_date_filter():
+    """判断是否存在date filter相关逻辑。
+
+    Returns:
+        bool: 判断结果。
+    """
     return bool(SELECT_DATES or START_DATE or END_DATE)
 
 
 def _extract_date_dir(dir_name):
+    """执行 extract date dir 对应的业务处理。
+
+    Args:
+        dir_name: 用于本函数处理的 `dir_name` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     match = DATE_RE.search(dir_name)
     return match.group(1) if match else None
 
 
 def _filter_date_dirs(date_dirs):
+    """执行 filter date dirs 对应的业务处理。
+
+    Args:
+        date_dirs: 用于本函数处理的 `date_dirs` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     if not _has_date_filter():
         return date_dirs
     if SELECT_DATES:
@@ -333,13 +398,21 @@ def _filter_date_dirs(date_dirs):
 
 
 def _collect_log_files(items):
+    """执行 collect 日志 files 对应的业务处理。
+
+    Args:
+        items: 用于本函数处理的 `items` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     logs = []
     for item in items:
         if os.path.isdir(item):
             files = [
                 os.path.join(item, f) for f in os.listdir(item) if f.endswith('.txt')
             ]
-            # Only filter by lambda for daily date folders.
+            # 只有按日日期目录时才按 lambda 后缀过滤。
             if os.path.normpath(item).startswith(os.path.normpath(DAILY_LOG_PATH)):
                 files = _filter_logs_by_lambda(files, POISSON_X)
             logs.extend(files)
@@ -358,6 +431,14 @@ def _collect_log_files(items):
 
 
 def _extract_date_from_path(log_path):
+    """执行 extract date from path 对应的业务处理。
+
+    Args:
+        log_path: 用于本函数处理的 `log_path` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     parts = os.path.normpath(log_path).split(os.sep)
     for part in parts:
         if DATE_RE.fullmatch(part):
@@ -368,6 +449,14 @@ def _extract_date_from_path(log_path):
 
 
 def _extract_date_from_text(log_text):
+    """执行 extract date from text 对应的业务处理。
+
+    Args:
+        log_text: 用于本函数处理的 `log_text` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     m = re.search(r"运行日期\s*(\d{8})", log_text)
     if m:
         return m.group(1)
@@ -398,24 +487,35 @@ def find_log_file():
             if daily_files:
                 return daily_files
         return None
-    
+
     # 2. 检查当前目录下的默认日志文件
     for default_log in DEFAULT_LOGS:
         full_path = os.path.join(os.getcwd(), default_log)
         if os.path.exists(full_path):
             return [full_path]
-    
+
     # 3. 检查logs目录下的默认日志文件
     for default_log in DEFAULT_LOGS:
         full_path = os.path.join(LOG_PATH, default_log)
         if os.path.exists(full_path):
             return [full_path]
-    
+
     # 4. 如果都没找到，返回None，让main函数处理
     return None
 
 
+# ==========================================================================
+# 主函数：日志甘特图生成入口
+# ==========================================================================
 def main(log_files=None):
+    """执行模块的主入口流程。
+
+    Args:
+        log_files: 用于本函数处理的 `log_files` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     if log_files is None:
         if _has_date_filter():
             print("日期筛选已启用，使用日仿真日志结果。")

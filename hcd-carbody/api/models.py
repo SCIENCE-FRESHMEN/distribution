@@ -1,10 +1,10 @@
-﻿"""
+"""
 Pydantic 数据模型定义
 基于 API接口字段说明文档 定义所有请求/响应模型
 """
 
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Union, Union
+from typing import Any, Dict, List, Optional, Union
 import json
 from pathlib import Path
 from enum import Enum
@@ -18,7 +18,15 @@ except Exception:
 _MATCH_FIELDS: Optional[List[str]] = None
 
 
+# ==========================================================================
+# 辅助函数：匹配字段配置读取
+# ==========================================================================
 def _load_match_fields() -> List[str]:
+    """从仓库配置读取 SKU 必须携带的匹配属性字段，并缓存读取结果。
+
+    Returns:
+        List[str]: 例如 ``["color", "rfid"]``；配置不存在或格式错误时返回空列表。
+    """
     global _MATCH_FIELDS
     if _MATCH_FIELDS is not None:
         return _MATCH_FIELDS
@@ -29,16 +37,19 @@ def _load_match_fields() -> List[str]:
             cfg = json5.loads(text)
         else:
             cfg = json.loads(text)
-        _MATCH_FIELDS = list(cfg.get("match_fields", []) or [])
+        _MATCH_FIELDS = list(cfg.get("match_fields", []) or []) if isinstance(cfg, dict) else []
     except Exception:
         try:
             cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            _MATCH_FIELDS = list(cfg.get("match_fields", []) or [])
+            _MATCH_FIELDS = list(cfg.get("match_fields", []) or []) if isinstance(cfg, dict) else []
         except Exception:
             _MATCH_FIELDS = []
     return _MATCH_FIELDS
 
 
+# ==========================================================================
+# 数据定义：API 请求、响应和字段校验模型
+# ==========================================================================
 class SkuAttrsMixin(BaseModel):
     """SKU附加属性校验混入"""
 
@@ -48,6 +59,11 @@ class SkuAttrsMixin(BaseModel):
 
     @model_validator(mode="after")
     def _validate_match_fields(self):
+        """校验有效 SKU 是否携带 warehouse.json 要求的特征字段。
+
+        Returns:
+            SkuAttrsMixin: 校验通过后的当前模型；缺少必填匹配字段时抛出 ValueError。
+        """
         match_fields = _load_match_fields()
         if not match_fields:
             return self
@@ -120,6 +136,14 @@ class SkuInfo(SkuAttrsMixin):
     """SKU信息"""
     skuId: str = Field(..., description="货物ID")
     quantity: int = Field(..., ge=0, description="货物数量（0表示空货位，1表示有货）")
+    inboundTime: Optional[Union[float, str]] = Field(
+        None,
+        description="库存同步时该 SKU 的实际入库时间：Unix 秒时间戳或 ISO 8601 字符串；用于 FIFO 排序",
+    )
+    arrivalTime: Optional[Union[float, str]] = Field(
+        None,
+        description="inboundTime 的兼容别名；同时传入时以 inboundTime 为准",
+    )
 
     model_config = {
         "extra": "allow",
@@ -240,7 +264,7 @@ class AisleStatusRequest(BaseModel):
     unavailableReason: Optional[str] = Field(None, description="不可用原因")
     exitCongestion: List[ExitCongestion] = Field(..., description="各产线拥堵状态")
     dockAvailability: Optional[List[DockAvailabilityRequest]] = Field(
-        None, description="巷道+口位可用性（可选）"
+        None, description="巷道+口位可用性（可选；省略或传空数组时沿用服务内存中的上次状态）"
     )
     bank: BankType = Field(..., description="所属库区")
 
@@ -586,7 +610,7 @@ class InboundTaskRequest(BaseModel):
     """入库任务请求"""
     taskId: str = Field(..., description="任务ID")
     inLine: Union[int, str] = Field(..., description="入库口/入口线，支持数字或LxCy")
-    outLine: Union[int, str] = Field(..., description="出库口/出口线，支持数字或LxCy")
+    outLine: Optional[Union[int, str]] = Field(None, description="出库口/出口线（可选，支持数字或LxCy）")
     skus: List[SkuInfo] = Field(..., description="货物列表")
 
     model_config = {
@@ -944,4 +968,3 @@ class BomUpdateResponse(BaseModel):
 
 
 MixedScheduleRequest.model_rebuild()
-

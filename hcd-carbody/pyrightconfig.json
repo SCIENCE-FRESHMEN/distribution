@@ -1,0 +1,26 @@
+{
+  "include": [
+    "allocation",
+    "api",
+    "estimate",
+    "schedule",
+    "scripts",
+    "simulation",
+    "tools",
+    "run.py",
+    "run_api.py",
+    "run_compare.py",
+    "run_compare_scaled_warehouse.py",
+    "plot_gantt_from_log.py",
+    "test_api_flow.py",
+    "visualize_results.py"
+  ],
+  "exclude": [
+    ".codex-ppt-build",
+    "__pycache__",
+    "logs"
+  ],
+  "pythonVersion": "3.13",
+  "pythonPlatform": "Windows",
+  "typeCheckingMode": "basic"
+}

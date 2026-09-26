@@ -20,6 +20,7 @@ Thumbs.db
 # 忽略打包生成的文件夹
 build/
 dist/
+release/
 *.egg-info/
 
 *.png

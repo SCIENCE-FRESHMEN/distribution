@@ -1,3 +1,5 @@
+"""Excel 测试用例提取工具。负责从测试工作簿中识别表头并导出可用于接口测试的记录。"""
+
 import json
 import sys
 from dataclasses import dataclass
@@ -7,12 +9,34 @@ import openpyxl
 
 
 def _norm_header(v: Any) -> str:
+    """执行 `_norm_header` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    输入：v（Any）
+    输出：str
+
+    Args:
+        v (Any): 供当前处理流程使用的 `v` 值。
+
+    Returns:
+        str: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     if v is None:
         return ""
     return str(v).strip()
 
 
 def _is_blank(v: Any) -> bool:
+    """根据输入状态和业务规则返回布尔判断结果。
+
+    输入：v（Any）
+    输出：bool
+
+    Args:
+        v (Any): 供当前处理流程使用的 `v` 值。
+
+    Returns:
+        bool: 条件满足、处理成功或校验通过时为 ``True``，否则为 ``False``。
+    """
     if v is None:
         return True
     if isinstance(v, str) and v.strip() == "":
@@ -35,10 +59,33 @@ class Case:
 
 
 def _get(ws, r: int, c: int) -> Any:
+    """读取并返回指定条件下的状态、对象或计算结果，不主动改变业务状态。
+    输出：Any
+
+    Args:
+        ws (Any): 供当前处理流程使用的 `ws` 值。
+        r (int): 供当前处理流程使用的 `r` 值。
+        c (int): 供当前处理流程使用的 `c` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     return ws.cell(r, c).value
 
 
 def _find_col(headers: dict[str, int], *names: str) -> int:
+    """在候选集合中按既定约束查找匹配对象或可用位置。
+
+    输入：headers（dict[str, int]）、*names（可变位置参数）
+    输出：int
+
+    Args:
+        headers (dict[str, int]): 供当前处理流程使用的 `headers` 值。
+        *names (tuple): 可变位置参数。
+
+    Returns:
+        int: 当前计算得到的数量、索引或编号。
+    """
     for n in names:
         if n in headers:
             return headers[n]
@@ -46,6 +93,17 @@ def _find_col(headers: dict[str, int], *names: str) -> int:
 
 
 def extract(path: str) -> list[Case]:
+    """执行 `extract` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    输入：path（str）
+    输出：list[Case]
+
+    Args:
+        path (str): 需要读取、写入或检查的文件路径。
+
+    Returns:
+        list[Case]: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     cases: list[Case] = []
 
@@ -54,7 +112,7 @@ def extract(path: str) -> list[Case]:
         if ws.max_row is None or ws.max_row < 2:
             continue
 
-        # Header on row 1
+    # 第一行作为表头。
         headers: dict[str, int] = {}
         for c in range(1, (ws.max_column or 1) + 1):
             hv = _norm_header(_get(ws, 1, c))
@@ -77,7 +135,7 @@ def extract(path: str) -> list[Case]:
             seq = _get(ws, r, col_seq) if col_seq else None
             api = _get(ws, r, col_api) if col_api else None
             if _is_blank(seq) and _is_blank(api):
-                # Many sheets have trailing empty rows.
+    # 多个工作表末尾带有空行，需要剔除。
                 continue
 
             case = Case(
@@ -108,6 +166,17 @@ def extract(path: str) -> list[Case]:
 
 
 def main(argv: list[str]) -> int:
+    """作为脚本入口，解析运行参数并按既定顺序调用本文件的主要处理流程。
+
+    输入：argv（list[str]）
+    输出：int
+
+    Args:
+        argv (list[str]): 供当前处理流程使用的 `argv` 值。
+
+    Returns:
+        int: 当前计算得到的数量、索引或编号。
+    """
     default_path = "库管系统算法升级接口测试记录_20260419.xlsx"
     path = default_path
     for arg in argv[1:]:
@@ -142,7 +211,7 @@ def main(argv: list[str]) -> int:
                 print("  problem:", c.problem.replace("\n", " ")[:240])
         print("ALL_NG_END")
 
-    # Also emit JSON to stdout if requested
+    # 如命令行要求，同时向标准输出写出 JSON。
     if "--json" in argv:
         payload = [c.__dict__ for c in cases]
         print("\nJSON_BEGIN")

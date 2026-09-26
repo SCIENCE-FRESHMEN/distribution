@@ -12,12 +12,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .response import fail, ok
 from .routes import feedback_router, inbound_router, plan_router, schedule_router
+from .logging_setup import create_uvicorn_log_config
 from .services.warehouse_service import _get_or_create_warehouse_service, get_warehouse_service, init_warehouse_service
 from .state import _get_or_create_task_state_manager, reset_task_state_manager
 
 API_VERSION = "1.0.0"
 
 
+# ==========================================================================
+# 主函数：FastAPI 生命周期、异常处理和状态查询入口
+# ==========================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -27,9 +31,9 @@ async def lifespan(app: FastAPI):
     reset_task_state_manager()
     app.state.task_state_manager = _get_or_create_task_state_manager()
     print("[API] 服务初始化完成")
-    
+
     yield
-    
+
     # 关闭时清理
     print("[API] 关闭仓库调度服务...")
 
@@ -56,16 +60,10 @@ app = FastAPI(
 ### 4. 生产计划 (/api/v1/plan/production)
 - 设置或更新当日生产计划
 
-### 常用测试数据 (Examples)
-为了方便测试，可以使用以下真实的 SKU ID（基于库存）：
-- **产线1 配对 SKU**: `2801021-H19H0` (左), `2801037-H19H0` (右)
-- **产线2 配对 SKU**: `2801022-H17F4` (左), `2801038-H17F4` (右)
-- **巷道 ID**: `1`, `2`, `3`, `4`, `5`
-- **产线 ID**: `1`, `2`, `3`
-
 ### 注意事项
-- 每次发出调度指令后，必须等待外部系统返回 **EXECUTING** 状态的反馈
-- 只有收到确认后才能处理下一个调度请求（否则返回 409 冲突）
+- 服务启动后仅建立空货位结构；调用方应先同步库存、生产计划和巷道状态。
+- 已下发但未确认的任务会冻结其巷道和位置；后续 mixed 请求会返回该任务及未确认任务标识，不会用新任务覆盖。
+- 接收到 **EXECUTING**、**COMPLETED** 或 **FAILED** 反馈后，服务按任务状态更新运行时队列和资源占用。
 """,
     version=API_VERSION,
     lifespan=lifespan,
@@ -94,12 +92,29 @@ app.include_router(plan_router, prefix="/api/v1")
 # ============================================================
 
 
+# ==========================================================================
+# 辅助函数：时间戳和异常响应序列化
+# ==========================================================================
 def _now_ts() -> str:
+    """执行 now ts 对应的业务处理。
+
+    Returns:
+        str: 处理后的结果。
+    """
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
+    """执行 http exception handler 对应的业务处理。
+
+    Args:
+        request: 接口请求对象。
+        exc: 用于本函数处理的 `exc` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     return fail(
         message=str(exc.detail),
         http_status=exc.status_code,
@@ -110,6 +125,15 @@ async def http_exception_handler(request, exc):
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request, exc: RequestValidationError):
+    """执行 请求 validation exception handler 对应的业务处理。
+
+    Args:
+        request: 接口请求对象。
+        exc: 用于本函数处理的 `exc` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     errors = exc.errors() or []
     first_error = errors[0] if errors else {}
     error_type = str(first_error.get("type", "validation_error"))
@@ -147,6 +171,15 @@ async def request_validation_exception_handler(request, exc: RequestValidationEr
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
+    """执行 general exception handler 对应的业务处理。
+
+    Args:
+        request: 接口请求对象。
+        exc: 用于本函数处理的 `exc` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     return fail(
         message="内部服务器错误。",
         http_status=500,
@@ -160,6 +193,11 @@ async def general_exception_handler(request, exc):
 
 @app.get("/", tags=["基础"])
 async def root():
+    """执行 root 对应的业务处理。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     return ok(
         status_code="SUCCESS",
         message="ok",
@@ -174,6 +212,11 @@ async def root():
 
 @app.get("/api/v1/status", tags=["基础"])
 async def system_status():
+    """执行 system status 对应的业务处理。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     try:
         service = _get_or_create_warehouse_service()
         return ok(
@@ -207,4 +250,5 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
         log_level="info",
+        log_config=create_uvicorn_log_config(),
     )

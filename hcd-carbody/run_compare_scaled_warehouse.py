@@ -1,3 +1,5 @@
+"""在不同仓库规模下运行策略对比实验。"""
+
 import argparse
 import copy
 import json
@@ -22,12 +24,31 @@ DEFAULT_LOGS_SUBDIR = "compare_2x_8_aisles"
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 
 
+# ==========================================================================
+# 辅助函数：配置扩展、SKU 复制和单轮执行
+# ==========================================================================
 def sanitize_filename(name: str) -> str:
+    """执行 sanitize filename 对应的业务处理。
+
+    Args:
+        name: 用于本函数处理的 `name` 参数。
+
+    Returns:
+        str: 处理后的结果。
+    """
     name = _INVALID_FILENAME_CHARS.sub("_", name).strip(" .")
     return name or "log"
 
 
 def _decode_bytes(raw: bytes) -> str:
+    """执行 decode bytes 对应的业务处理。
+
+    Args:
+        raw: 用于本函数处理的 `raw` 参数。
+
+    Returns:
+        str: 处理后的结果。
+    """
     for enc in ("utf-8", "gbk"):
         try:
             return raw.decode(enc)
@@ -37,16 +58,38 @@ def _decode_bytes(raw: bytes) -> str:
 
 
 def load_json(path: Path) -> dict[str, Any]:
+    """加载json相关逻辑。
+
+    Args:
+        path: 输入或输出文件路径。
+
+    Returns:
+        dict[str, Any]: 处理后的结果。
+    """
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def dump_json(path: Path, data: dict[str, Any]) -> None:
+    """执行 dump json 对应的业务处理。
+
+    Args:
+        path: 输入或输出文件路径。
+        data: 待转换或处理的数据。
+
+    Returns:
+        None: 处理后的结果。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def build_aisle_dimensions() -> dict[str, dict[str, int]]:
+    """构建巷道 dimensions相关逻辑。
+
+    Returns:
+        dict[str, dict[str, int]]: 处理后的结果。
+    """
     dims: dict[str, dict[str, int]] = {}
     for aisle in range(1, TARGET_NUM_AISLES + 1):
         if aisle <= STANDARD_AISLE_COUNT:
@@ -61,6 +104,16 @@ def build_disabled_positions(
     template_rows: tuple[int, ...] = (1,),
     edge_columns_only: bool = True,
 ) -> list[str]:
+    """构建disabled positions相关逻辑。
+
+    Args:
+        aisle_dimensions: 用于本函数处理的 `aisle_dimensions` 参数。
+        template_rows: 用于本函数处理的 `template_rows` 参数。
+        edge_columns_only: 用于本函数处理的 `edge_columns_only` 参数。
+
+    Returns:
+        list[str]: 处理后的结果。
+    """
     positions: list[str] = []
     for aisle_str, dims in aisle_dimensions.items():
         aisle = int(aisle_str)
@@ -77,6 +130,15 @@ def build_disabled_positions(
 
 
 def expand_warehouse_config(base_config: dict[str, Any], task_multiplier: int) -> dict[str, Any]:
+    """执行 expand warehouse 配置 对应的业务处理。
+
+    Args:
+        base_config: 用于本函数处理的 `base_config` 参数。
+        task_multiplier: 用于本函数处理的 `task_multiplier` 参数。
+
+    Returns:
+        dict[str, Any]: 处理后的结果。
+    """
     expanded = copy.deepcopy(base_config)
     aisle_dimensions = build_aisle_dimensions()
 
@@ -108,6 +170,15 @@ def expand_warehouse_config(base_config: dict[str, Any], task_multiplier: int) -
 
 
 def duplicate_sku_ids(value: Any, suffix: str) -> Any:
+    """执行 duplicate sku ids 对应的业务处理。
+
+    Args:
+        value: 待处理的单个值。
+        suffix: 用于本函数处理的 `suffix` 参数。
+
+    Returns:
+        Any: 处理后的结果。
+    """
     if isinstance(value, dict):
         duplicated: dict[str, Any] = {}
         for key, item in value.items():
@@ -122,6 +193,15 @@ def duplicate_sku_ids(value: Any, suffix: str) -> Any:
 
 
 def expand_inbound_config(base_config: dict[str, Any], task_multiplier: int) -> dict[str, Any]:
+    """执行 expand 入库 配置 对应的业务处理。
+
+    Args:
+        base_config: 用于本函数处理的 `base_config` 参数。
+        task_multiplier: 用于本函数处理的 `task_multiplier` 参数。
+
+    Returns:
+        dict[str, Any]: 处理后的结果。
+    """
     inbound_records = base_config.get("inbound_records", []) or []
     expanded_records: list[Any] = []
     for record in inbound_records:
@@ -131,6 +211,15 @@ def expand_inbound_config(base_config: dict[str, Any], task_multiplier: int) -> 
 
 
 def expand_outbound_config(base_config: dict[str, Any], task_multiplier: int) -> dict[str, Any]:
+    """执行 expand 出库 配置 对应的业务处理。
+
+    Args:
+        base_config: 用于本函数处理的 `base_config` 参数。
+        task_multiplier: 用于本函数处理的 `task_multiplier` 参数。
+
+    Returns:
+        dict[str, Any]: 处理后的结果。
+    """
     production_plan = base_config.get("production_plan", {}) or {}
     creation_times = base_config.get("creation_times", {}) or {}
 
@@ -167,6 +256,18 @@ def write_expanded_configs(
     output_dir: Path,
     task_multiplier: int,
 ) -> tuple[Path, Path, Path]:
+    """执行 write expanded configs 对应的业务处理。
+
+    Args:
+        warehouse_src: 用于本函数处理的 `warehouse_src` 参数。
+        inbound_src: 用于本函数处理的 `inbound_src` 参数。
+        outbound_src: 用于本函数处理的 `outbound_src` 参数。
+        output_dir: 用于本函数处理的 `output_dir` 参数。
+        task_multiplier: 用于本函数处理的 `task_multiplier` 参数。
+
+    Returns:
+        tuple[Path, Path, Path]: 处理后的结果。
+    """
     warehouse_cfg = expand_warehouse_config(load_warehouse_config(str(warehouse_src)), task_multiplier)
     inbound_cfg = expand_inbound_config(load_json(inbound_src), task_multiplier)
     outbound_cfg = expand_outbound_config(load_json(outbound_src), task_multiplier)
@@ -190,6 +291,20 @@ def run_one(
     outbound_config: Path,
     abbreviations: dict[str, str],
 ) -> tuple[int, tuple[str, str, str], Path, int, str | None]:
+    """执行 run one 对应的业务处理。
+
+    Args:
+        idx: 用于本函数处理的 `idx` 参数。
+        total: 用于本函数处理的 `total` 参数。
+        cfg: 用于本函数处理的 `cfg` 参数。
+        logs_dir: 用于本函数处理的 `logs_dir` 参数。
+        inbound_config: 用于本函数处理的 `inbound_config` 参数。
+        outbound_config: 用于本函数处理的 `outbound_config` 参数。
+        abbreviations: 用于本函数处理的 `abbreviations` 参数。
+
+    Returns:
+        tuple[int, tuple[str, str, str], Path, int, str | None]: 处理后的结果。
+    """
     allocation, position, scheduler = cfg
     allocation_abbr = abbreviations.get(allocation, allocation)
     position_abbr = abbreviations.get(position, position)
@@ -226,7 +341,15 @@ def run_one(
         return idx, cfg, log_file, -1, str(exc)
 
 
+# ==========================================================================
+# 主函数：扩展仓库规模对比入口
+# ==========================================================================
 def main() -> None:
+    """执行模块的主入口流程。
+
+    Returns:
+        None: 处理后的结果。
+    """
     parser = argparse.ArgumentParser(description="扩展仓库巷道并按指定倍数复制出入库任务后，批量运行四种策略对比")
     parser.add_argument("--jobs", type=int, default=0, help="并行任务数，0表示自动")
     parser.add_argument("--keep-internal-logs", action="store_true", help="保留 run.py 生成的内部日志")

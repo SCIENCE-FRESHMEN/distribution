@@ -7,11 +7,11 @@ import random
 import heapq
 import pytz
 import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Tuple
 from simulation.warehouse_core import WarehouseCore
 from simulation.warehouse_core import load_warehouse_config
 from simulation.task_data import TaskData
-from simulation.event import Event, EVENT_INBOUND_UNASSIGNED, EVENT_INBOUND_ARRIVAL_AT_AISLE
+from simulation.event import Event, EVENT_INBOUND_UNASSIGNED, EVENT_INBOUND_ARRIVAL_AT_AISLE, EVENT_TASK_COMPLETE
 from simulation.task_data import TASK_TYPE_INBOUND_UNASSIGNED, TASK_TYPE_INBOUND, TASK_TYPE_OUTBOUND
 
 from simulation.config_bulider.plan_config_builder import ProductionPlanBuilder
@@ -20,40 +20,34 @@ from simulation.config_bulider.inbound_task_config_builder import InboundConfigB
 
 class WarehouseSimulation:
     """仓库仿真器 - 事件驱动版本"""
-    
+
     def __init__(self, num_aisles: int = 5, num_production_lines: int = 3,
                  initial_inventory_ratio: float = 0.3, random_seed: Optional[int] = None,
-                 use_magnetic_crane: bool = True, outbound_congestion_time: float = 10.0,
                  aisle_production_line_mapping: Optional[Dict[int, List[int]]] = None,
-                 lr_balance_weight: float = 0.3,
                  inbound_aisle_strategy: Optional[str] = None,
                  inbound_allocation_strategy: Optional[str] = None,
                  inbound_aisle_allocator = None,
                  inbound_position_allocator = None,
-                 inbound_rate_lambda: float = 1/100.0,  # 泊松到达率(1/秒)
+                 # 泊松到达率(1/秒)
+                 inbound_rate_lambda: float = 1/100.0,
                  transport_delay_s: Optional[float] = None,
                  scheduler_type: str = 'heuristic',
                  initial_inventory_count: int = 250,
                  track_skus: Optional[List[str]] = ["2801022-TG360"],
                  config_path: Optional[str] = "config/warehouse.json"):
-        """
-        Args:
+        """Args:
             num_aisles: 巷道数量
             num_production_lines: 产线数量
             initial_inventory_ratio: 初始库存占比
             random_seed: 随机种子
-            use_magnetic_crane: 是否使用磁力吊（默认True）
-            outbound_congestion_time: 出库口拥堵时间（秒）
             aisle_production_line_mapping: 巷道-产线映射配置
-            lr_balance_weight: 左右均衡度权重（0-1），默认0.3
             inbound_aisle_allocator: 入库任务的巷道分配策略（可选）
             inbound_position_allocator: 入库任务的货位分配策略（可选）
             scheduler_type: 调度器类型 ('heuristic' 或 'optimization')
-            num_iterations: 随机优化调度器的迭代次数（仅当scheduler_type='optimization'时有效）
-            makespan_weight: makespan权重（仅当scheduler_type='optimization'时有效）
-            balance_weight: 均衡度变化权重（仅当scheduler_type='optimization'时有效）
-            production_line_avg_time_weight: 产线平均完成时间权重（仅当scheduler_type='optimization'时有效）
             initial_inventory_count: 初始库存任务记录数量（仅当initial_inventory为None时有效）
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
         """
         # 仓库核心
         self.warehouse_core = WarehouseCore(
@@ -61,10 +55,7 @@ class WarehouseSimulation:
             num_production_lines=num_production_lines,
             initial_inventory_ratio=initial_inventory_ratio,
             random_seed=random_seed,
-            use_magnetic_crane=use_magnetic_crane,
-            outbound_congestion_time=outbound_congestion_time,
             aisle_production_line_mapping=aisle_production_line_mapping,
-            lr_balance_weight=lr_balance_weight,
             scheduler_type=scheduler_type,
             inbound_aisle_strategy=inbound_aisle_strategy,
             inbound_allocation_strategy=inbound_allocation_strategy,
@@ -77,24 +68,29 @@ class WarehouseSimulation:
                 print(f"[INFO] 开启 SKU 跟踪: {track_skus}")
             except Exception:
                 pass
-        
+
         # 参数：入库泊松到达率与运输延迟（可覆盖Core默认）
         self.inbound_rate_lambda = inbound_rate_lambda
         if transport_delay_s is not None:
             self.warehouse_core.transport_delay_s = transport_delay_s
 
         # 事件驱动仿真相关（Simulation 仅做派发与推进）
-        self.event_queue = []  # 优先队列（最小堆）
-        self.current_time = 0.0  # 当前仿真时间
-    
-    def run_simulation(self, production_plan: Dict[int, List[List[str]]] = None,
+        # 优先队列（最小堆）
+        self.event_queue = []
+        # 当前仿真时间
+        self.current_time = 0.0
+
+    # ========================================================================
+    # 主流程：按日事件驱动仿真
+    # ========================================================================
+    def run_simulation(self, production_plan: Optional[Dict[Any, Any]] = None,
                       max_simulation_time: float = 3600.0, initial_inventory: Optional[dict] = None,
                       initial_inventory_count: int = 250,
                       real_time_days: Optional[int] = None,
                       cutoff_hour: Optional[int] = None,
                       creation_times: Optional[Dict[int, List[float]]] = None):
         """事件驱动仿真
-        
+
         Args:
             production_plan: 生产计划 {production_line: [['A1', 'A2', 'A3', 'A4'], ...]}
             max_simulation_time: 最大仿真时间（秒）
@@ -104,13 +100,14 @@ class WarehouseSimulation:
             real_time_days: 使用真实时间数据时，模拟几天（从最早记录的cutoff_hour切日开始）
             cutoff_hour: 切日小时，默认 6 点，6 点前归上一天
             creation_times: 与生产计划 group 对齐的创建时间列表
+
         """
         print("=" * 80)
         print("仓库仿真系统 - 事件驱动版本")
         print("=" * 80)
 
         # 兼容直接传入包含 production_plan/creation_times 的整体配置
-        plan_attrs = {}
+        plan_attrs: Dict[str, Dict[int, Any]] = {}
         if isinstance(production_plan, dict) and "production_plan" in production_plan:
             if creation_times is None:
                 creation_times = production_plan.get("creation_times", {})
@@ -119,21 +116,58 @@ class WarehouseSimulation:
             if not plan_attrs and production_plan.get("production_plan_versions"):
                 plan_attrs = {"version": production_plan.get("production_plan_versions", {})}
             production_plan = production_plan.get("production_plan", {})
-            
+
         # 使用明确的时区处理：时间戳视为 UTC 秒，统一转为东八区，避免本机时区影响
         china_tz = pytz.timezone('Asia/Shanghai')
 
         def to_local(ts: float) -> datetime.datetime:
+            """执行 `to_local` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+            输入：ts（float）
+            输出：datetime.datetime
+
+            Args:
+                ts (float): 供当前处理流程使用的 `ts` 值。
+
+            Returns:
+                datetime.datetime: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             return datetime.datetime.fromtimestamp(ts, tz=pytz.utc).astimezone(china_tz)
 
+        # 仅在启用按天分桶时使用；给闭包一个确定的整数值以消除 Optional 传播。
+        effective_cutoff_hour = cutoff_hour if cutoff_hour is not None else 0
+
         def calc_anchor(ts: float) -> datetime.datetime:
+            """根据输入状态执行计算并返回指标或中间结果。
+
+            输入：ts（float）
+            输出：datetime.datetime
+
+            Args:
+                ts (float): 供当前处理流程使用的 `ts` 值。
+
+            Returns:
+                datetime.datetime: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             dt = to_local(ts)
-            anchor = dt.replace(hour=cutoff_hour, minute=0, second=0, microsecond=0)
-            if dt.hour < cutoff_hour:
+            anchor = dt.replace(hour=effective_cutoff_hour, minute=0, second=0, microsecond=0)
+            if dt.hour < effective_cutoff_hour:
                 anchor -= datetime.timedelta(days=1)
             return anchor
 
         def day_idx(ts: float, anchor_dt: datetime.datetime) -> int:
+            """执行 `day_idx` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+            输入：ts（float）、anchor_dt（datetime.datetime）
+            输出：int
+
+            Args:
+                ts (float): 供当前处理流程使用的 `ts` 值。
+                anchor_dt (datetime.datetime): 供当前处理流程使用的 `anchor_dt` 值。
+
+            Returns:
+                int: 当前计算得到的数量、索引或编号。
+            """
             dt = to_local(ts)
             return int((dt - anchor_dt).total_seconds() // (24*3600))
 
@@ -154,6 +188,9 @@ class WarehouseSimulation:
                 ts_candidates.append(rec["arrival_time"])
         for _, cts in creation_times.items():
             ts_candidates += [ct for ct in cts if ct is not None]
+        # 先给跨分支使用的运行边界设置默认值；下面会按是否切日覆盖。
+        days_to_run = 1
+        per_day_time_limit = max_simulation_time
         if cutoff_hour is None:
             inbound_by_day = {0: list(inbound_records_all)}
             merged_outbound: Dict[int, List[List[List[str]]]] = {
@@ -241,12 +278,13 @@ class WarehouseSimulation:
         #     initial_inventory=initial_inventory,
         #     initial_inventory_count=initial_inventory_count
         # )
-        
+
         # 初始化移库计数器和移库日志游标
         self._last_relocation_count = 0
         self._last_relocation_log_idx = 0
 
-        report_interval = 15 * 60.0  # 15min
+        # 15min
+        report_interval = 15 * 60.0
         total_plan_groups = {
             pl: sum(len(outbound_by_day.get(d, {}).get(pl, [])) for d in outbound_by_day)
             for pl in range(1, self.warehouse_core.num_production_lines + 1)
@@ -314,7 +352,7 @@ class WarehouseSimulation:
 
             # 初始化pairing_logs
             pairing_logs = []
-            
+
             # 在每天开始时输出配对率统计
             try:
                 pairing = self.warehouse_core.inventory_manager.get_pairing_stats()
@@ -332,7 +370,7 @@ class WarehouseSimulation:
                 beam_rate_with_solo = (
                     paired_beams_including_solo / total_goods if total_goods else 0.0
                 )
-                
+
                 msg = (
                     f"[DAY {day+1} 开始] "
                     f"配对率(旧，不含solo): {slot_rate:.2%} "
@@ -343,11 +381,13 @@ class WarehouseSimulation:
                     f"({paired_beams_including_solo}/{total_goods})"
                 )
                 print(msg)
-                if day == 0:  # 第一天开始也要记录日志
+                # 第一天开始也要记录日志
+                if day == 0:
                     pairing_logs.append(f"0.00,{slot_rate:.4f},{beam_rate:.4f},{beam_rate_with_solo:.4f}")
             except Exception as e:
                 print(f"[WARN] 配对率统计失败: {e}")
-                break  # 发生异常时跳出循环，避免程序卡住
+                # 发生异常时跳出循环，避免程序卡住
+                break
 
             # 当天入库：用泊松分布生成到达事件（horizon=24h）
             self._seed_inbound_for_records(day_inbound_records, horizon_s=24*3600)
@@ -360,12 +400,45 @@ class WarehouseSimulation:
             # 事件循环
             print("\n开始事件驱动仿真...")
             next_report_time = self.current_time + report_interval
-            outbound_completed = False  # 出库完成后不再往调度器加新任务，但要跑完队列中已有任务
+            # 出库完成后不再往调度器加新任务，但要跑完队列中已有任务
+            outbound_completed = False
+            invalid_idle_cursor = self.current_time
+            invalid_idle_by_aisle = {aisle: 0.0 for aisle in self.warehouse_core.aisles}
+
+            def accumulate_invalid_idle(until_time: float):
+                """执行 `accumulate_invalid_idle` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+                输入：until_time（float）
+
+                Args:
+                    until_time (float): 当前计算使用的时间值。
+
+                Returns:
+                    None: 通过实例状态、队列或外部副作用完成处理。
+                """
+                nonlocal invalid_idle_cursor
+                if until_time <= invalid_idle_cursor:
+                    return
+                try:
+                    ready_counts = self.warehouse_core.get_ready_task_counts_by_aisle(invalid_idle_cursor)
+                    busy_aisles = self.warehouse_core.get_busy_aisles(invalid_idle_cursor)
+                except Exception:
+                    invalid_idle_cursor = until_time
+                    return
+                delta = until_time - invalid_idle_cursor
+                for aisle in self.warehouse_core.aisles:
+                    if aisle in busy_aisles:
+                        continue
+                    if ready_counts.get(aisle, 0) > 0:
+                        invalid_idle_by_aisle[aisle] += delta
+                invalid_idle_cursor = until_time
+
             while self.current_time < day_max_time:
                 next_reloc_time = getattr(self.warehouse_core, "_get_next_relocation_op_time", lambda: None)()
                 if next_reloc_time is not None:
                     next_event_time = self.event_queue[0].time if self.event_queue else None
                     if next_event_time is None or next_reloc_time < next_event_time:
+                        accumulate_invalid_idle(next_reloc_time)
                         self.current_time = max(self.current_time, next_reloc_time)
                         self.warehouse_core._apply_relocation_ops(self.current_time)
                         continue
@@ -382,7 +455,9 @@ class WarehouseSimulation:
                                 current_group = self.warehouse_core.production_line_current_group.get(pl, 0)
                                 print(f"[DEBUG] 产线{pl}: 当前组 {current_group}/{len(groups)}")
                             wait = max(self.warehouse_core.relocation_delay_s, 0.0)
-                            refill_events = self.warehouse_core.on_event(None, self.current_time + 2 * wait)
+                            future_time = self.current_time + 2 * wait
+                            accumulate_invalid_idle(future_time)
+                            refill_events = self.warehouse_core.on_event(None, future_time)
                             print(f"[DEBUG] 调度生成了 {len(refill_events)} 个新事件")
                             for ev in refill_events:
                                 heapq.heappush(self.event_queue, ev.copy())
@@ -412,6 +487,7 @@ class WarehouseSimulation:
 
                 # 取出下一个事件
                 event = heapq.heappop(self.event_queue)
+                accumulate_invalid_idle(event.time)
                 self.current_time = event.time
 
                 print(f"\n[时间 {self.current_time:.2f}s] 处理事件: {event}")
@@ -434,7 +510,7 @@ class WarehouseSimulation:
                     print("[run]未来即将到来的事件(前10，按时间升序):")
                     for ev in event_queue_sorted:
                         print(f"  {ev}")
-                
+
                 # 将事件通知Core，让Core更新并返回新事件
                 core_events = self.warehouse_core.on_event(event, self.current_time)
                 if outbound_completed:
@@ -477,7 +553,8 @@ class WarehouseSimulation:
                     except Exception as e:
                         print(f"[配对率 {self.current_time/60:.1f}min] 获取配对率统计失败: {e}")
                         next_report_time += report_interval
-                        continue  # 发生异常时继续执行，避免程序卡住
+                        # 发生异常时继续执行，避免程序卡住
+                        continue
 
                 day_out_done = True
                 for pl, groups in day_plan_full.items():
@@ -570,7 +647,7 @@ class WarehouseSimulation:
                 beam_rate_with_solo = (
                     paired_beams_including_solo / total_goods if total_goods else 0.0
                 )
-                
+
                 msg = (
                     f"[DAY {day+1} 结束] "
                     f"货位配对率: {matched_pairs}/{total_pairs} = {slot_rate:.2%}; "
@@ -581,7 +658,8 @@ class WarehouseSimulation:
                 pairing_logs.append(msg)
             except Exception as e:
                 print(f"[DAY {day+1} 结束] 获取配对率统计失败: {e}")
-                break  # 发生异常时跳出循环，避免程序卡住
+                # 发生异常时跳出循环，避免程序卡住
+                break
 
             # 当日汇总
             lines = self._print_daily_summary(
@@ -590,12 +668,13 @@ class WarehouseSimulation:
                 cumulative_completed=cumulative_completed,
                 total_plan_groups=total_plan_groups,
                 day_time=self.current_time,
+                invalid_idle_by_aisle=invalid_idle_by_aisle,
                 pairing_logs=pairing_logs,
                 return_lines=True,
             )
-            for ln in lines:
+            for ln in lines or []:
                 print(ln)
-            daily_summaries.append(lines)
+            daily_summaries.append(lines or [])
 
         # 当天循环结束
 
@@ -608,11 +687,25 @@ class WarehouseSimulation:
                 for ln in lines:
                     print(ln)
                 print("-" * 60)
-    
+
+    # ========================================================================
+    # 阶段处理：日报、入库事件构造与阻塞诊断
+    # ========================================================================
     def _print_daily_summary(self, day_idx: int, day_completed=None, cumulative_completed=None, total_plan_groups=None,
-                             day_time=None, pairing_logs=None, return_lines: bool = False):
-        """输出当日完成情况（参考总结果格式）"""
+                             day_time=None, invalid_idle_by_aisle=None, pairing_logs=None, return_lines: bool = False):
+        """输出当日完成情况（参考总结果格式）
+
+        """
         def format_task_skus(task) -> str:
+            """将内部数据格式化为日志、展示或接口输出所需的形式。
+            输出：str
+
+            Args:
+                task (Any): 当前处理的任务记录。
+
+            Returns:
+                str: 当前处理得到的文本标识、格式化结果或诊断信息。
+            """
             match_fields = getattr(self.warehouse_core, "match_fields", []) or []
             entries = []
             for entry in (getattr(task, "skus", None) or []):
@@ -684,10 +777,28 @@ class WarehouseSimulation:
         # 显示每日新增的移库数量而不是累计值
         daily_relocations = self.warehouse_core._relocation_count - getattr(self, '_last_relocation_count', 0)
         lines.append(f"移库数量: {daily_relocations} (新增)")
+
+        if invalid_idle_by_aisle:
+            numeric_aisles = sorted(
+                aisle for aisle in invalid_idle_by_aisle.keys() if isinstance(aisle, (int, float))
+            )
+            invalid_idle_line = {}
+            for aisle in numeric_aisles:
+                wait_time = float(invalid_idle_by_aisle.get(aisle, 0.0) or 0.0)
+                wait_ratio = wait_time / t * 100 if t else 0.0
+                invalid_idle_line[aisle] = f"{wait_time:.1f}s ({wait_ratio:.1f}%)"
+                lines.append(
+                    f"[DAY {day_idx} INVALID_IDLE] aisle={aisle} time={wait_time:.1f} ratio={wait_ratio:.2f}"
+                )
+            if numeric_aisles:
+                avg_wait = sum(float(invalid_idle_by_aisle.get(aisle, 0.0) or 0.0) for aisle in numeric_aisles) / len(numeric_aisles)
+                avg_ratio = avg_wait / t * 100 if t else 0.0
+                invalid_idle_line["avg"] = f"{avg_wait:.1f}s ({avg_ratio:.1f}%)"
+            lines.append(f"巷道无效等待: {invalid_idle_line}")
         # 移库占用明细（当日新增）
         new_logs = []
-        if hasattr(self.warehouse_core, "relocation_log_messages"):
-            msgs = self.warehouse_core.relocation_log_messages
+        msgs = getattr(self.warehouse_core, "relocation_log_messages", [])
+        if isinstance(msgs, list):
             if self._last_relocation_log_idx < len(msgs):
                 new_logs = msgs[self._last_relocation_log_idx:]
                 self._last_relocation_log_idx = len(msgs)
@@ -695,7 +806,7 @@ class WarehouseSimulation:
             lines.append("移库占用记录:")
             lines.extend(new_logs)
         self._last_relocation_count = self.warehouse_core._relocation_count
-        
+
         if pairing_logs:
             lines.append("配对率记录(15min间隔):")
             lines.extend(pairing_logs)
@@ -706,7 +817,9 @@ class WarehouseSimulation:
             print(ln)
 
     def _build_sku_entries_from_record(self, sku_raw, record: Optional[dict] = None):
-        """构造SKU条目，携带额外属性（如version）。"""
+        """构造SKU条目，携带额外属性（如version）。
+
+        """
         match_fields = getattr(self.warehouse_core, "match_fields", []) or []
         skus = []
         for idx_slot, sku in enumerate(sku_raw or []):
@@ -720,17 +833,22 @@ class WarehouseSimulation:
             skus.append(entry)
         return skus
     def _seed_inbound_poisson(self, lambda_rate: float, horizon_s: float):
-        """使用真实入库配置 + 泊松触发生成入库事件"""
+        """使用真实入库配置 + 泊松触发生成入库事件
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         t = 0.0
         idx_inbound_unassigned = 0
 
         # 跳过前initial_inventory_count条用于初始化库存的数据
         start_index = self.warehouse_core.initial_inventory_count
-        if start_index >= len(self.warehouse_core.inbound_records):
-            print(f"警告: initial_inventory_count ({start_index}) 大于或等于总入库记录数 ({len(self.warehouse_core.inbound_records)})，将不生成额外的入库任务")
+        inbound_records = self.warehouse_core.inbound_records or []
+        if start_index >= len(inbound_records):
+            print(f"警告: initial_inventory_count ({start_index}) 大于或等于总入库记录数 ({len(inbound_records)})，将不生成额外的入库任务")
             return
 
-        for record in self.warehouse_core.inbound_records[start_index:]:
+        for record in inbound_records[start_index:]:
             dt = random.expovariate(lambda_rate) if lambda_rate > 0 else horizon_s
             t += dt
             if t >= horizon_s:
@@ -770,6 +888,14 @@ class WarehouseSimulation:
 
         def parse_record(rec):
             # 支持 dict {'arrival_time': t, 'skus': [...], 'in_line': x } 或 (t, [...])
+            """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+            Args:
+                rec (Any): 供当前处理流程使用的 `rec` 值。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             if isinstance(rec, dict) and "arrival_time" in rec:
                 return rec["arrival_time"], rec.get("skus", []), rec.get("in_line", 1), rec
             if isinstance(rec, (list, tuple)) and len(rec) == 2 and isinstance(rec[0], (int, float)):
@@ -794,13 +920,25 @@ class WarehouseSimulation:
         china_tz = pytz.timezone('Asia/Shanghai')
         first_ts = min(a for _, a, _ in arrival_list)
         # 使用带时区的时间处理，避免UTC和本地时间混淆
+        effective_cutoff_hour = cutoff_hour if cutoff_hour is not None else 0
         first_dt = datetime.datetime.fromtimestamp(first_ts, tz=china_tz)
-        anchor = first_dt.replace(hour=cutoff_hour, minute=0, second=0, microsecond=0)
-        if first_dt.hour < cutoff_hour:
+        anchor = first_dt.replace(hour=effective_cutoff_hour, minute=0, second=0, microsecond=0)
+        if first_dt.hour < effective_cutoff_hour:
             anchor -= datetime.timedelta(days=1)
         anchor_ts = anchor.timestamp()
 
         def day_idx(ts: float) -> int:
+            """执行 `day_idx` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+            输入：ts（float）
+            输出：int
+
+            Args:
+                ts (float): 供当前处理流程使用的 `ts` 值。
+
+            Returns:
+                int: 当前计算得到的数量、索引或编号。
+            """
             return int((ts - anchor_ts) // (24 * 3600))
 
         if real_time_days is not None:
@@ -808,7 +946,8 @@ class WarehouseSimulation:
 
         max_used_ts = None
         for idx, arrive_abs, skus_raw, in_line, raw_rec in arrival_list:
-            arrive = arrive_abs - anchor_ts  # 以 day0 起点为0
+            # 以 day0 起点为0
+            arrive = arrive_abs - anchor_ts
             if horizon_s is not None and arrive >= horizon_s:
                 continue
             max_used_ts = arrive_abs if (max_used_ts is None or arrive_abs > max_used_ts) else max_used_ts
@@ -831,7 +970,11 @@ class WarehouseSimulation:
         return True, anchor_ts, max_used_ts
 
     def _seed_inbound_for_records(self, records: List, horizon_s: float = 24*3600):
-        """基于给定的入库记录列表，按泊松间隔生成到达事件（当天起点为0）。"""
+        """基于给定的入库记录列表，按泊松间隔生成到达事件（当天起点为0）。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         t = 0.0
         idx_inbound_unassigned = 0
         for rec in records:
@@ -861,7 +1004,11 @@ class WarehouseSimulation:
             idx_inbound_unassigned += 1
 
     def _flush_remaining_inbound(self, current_time: float):
-        """将队列中尚未到达的入库事件立即处理完（用于当日出库完成后加速结束当天）。"""
+        """将队列中尚未到达的入库事件立即处理完（用于当日出库完成后加速结束当天）。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         # 将剩余事件统一拉平到 current_time 并处理到底（主要是入库到达→入库完成）
         while self.event_queue:
             ev = heapq.heappop(self.event_queue)
@@ -871,17 +1018,21 @@ class WarehouseSimulation:
                 heapq.heappush(self.event_queue, ne.copy())
 
     def _debug_outbound_blockers(self, production_line: int, day_groups: List, day_attrs: Optional[dict] = None):
-        """当出库无法继续时，输出剩余任务的缺货情况与属性匹配信息"""
+        """当出库无法继续时，输出剩余任务的缺货情况与属性匹配信息
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         current_idx = self.warehouse_core.production_line_current_group.get(production_line, 0)
         if current_idx >= len(day_groups):
             print(f"[DEBUG] 产线{production_line} 当前组索引({current_idx})已超过计划组数({len(day_groups)})")
             return
-            
+
         print(f"[DEBUG] 产线{production_line} 当前组索引: {current_idx}，计划总组数: {len(day_groups)}")
         remaining = day_groups[current_idx:]
         remaining_attrs = {}
         if day_attrs:
-            # day_attrs: {field: {line: [groups]}}
+    # day_attrs：{属性字段: {产线: [生产组]}}。
             for field, by_line in day_attrs.items():
                 line_groups = by_line.get(production_line, [])
                 remaining_attrs[field] = line_groups[current_idx:]
@@ -939,10 +1090,21 @@ class WarehouseSimulation:
                     print(
                         f"      匹配位置: sku1={len(sku1_pos)}, sku2={len(sku2_pos)}, 可配对货位={len(pair_pos)}"
                     )
-    
+
     def _print_final_analysis(self, cumulative_completed=None, total_plan_groups=None):
-        """输出最终分析"""
+        """输出最终分析
+
+        """
         def format_task_skus(task) -> str:
+            """将内部数据格式化为日志、展示或接口输出所需的形式。
+            输出：str
+
+            Args:
+                task (Any): 当前处理的任务记录。
+
+            Returns:
+                str: 当前处理得到的文本标识、格式化结果或诊断信息。
+            """
             match_fields = getattr(self.warehouse_core, "match_fields", []) or []
             entries = []
             for entry in (getattr(task, "skus", None) or []):
@@ -963,9 +1125,9 @@ class WarehouseSimulation:
         print("\n" + "=" * 80)
         print("仿真结束 - 最终统计")
         print("=" * 80)
-        
+
         print(f"\n仿真时长: {self.current_time/60:.2f}分钟")
-        
+
         # 入库任务完成情况
         print(f"\n任务完成情况:")
         in_count, out_count = 0, 0
@@ -1022,68 +1184,49 @@ class WarehouseSimulation:
         print(f"\n最终库存均衡度: {final_balance:.3f}")
 
 
-def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0, 
-         use_magnetic_crane: Optional[bool] = None,
-         outbound_congestion_time: Optional[float] = None, lr_balance_weight: Optional[float] = None,
-         inbound_allocation_strategy: str = "baseline_random",
-         inbound_position_strategy: str = 'first_available',
+# ============================================================================
+# 脚本入口：配置加载与仿真器启动
+# ============================================================================
+def main(random_seed: Optional[int] = 42,
+         max_simulation_time: float = 3600.0,
+         inbound_allocation_strategy: str = "baseline",
+         inbound_position_strategy: str = 'baseline',
          scheduler_type: str = 'heuristic',
-         makespan_weight: Optional[float] = None,
-         balance_weight: Optional[float] = None,
-         production_line_avg_time_weight: Optional[float] = None,
-         production_line_balance_weight: Optional[float] = None,
-         aisle_dispersion_weight: Optional[float] = None,
-         inbound_wait_weight: Optional[float] = None,
-         outbound_choice_bonus_weight: Optional[float] = None,
          initial_inventory_count: Optional[int] = None,
          inbound_rate_lambda: float = 1/100.0,
          real_time_days: Optional[int] = None,
-         cutoff_hour: int = 6,
+         cutoff_hour: Optional[int] = 6,
          date_str: Optional[str] = None,
          inbound_config_path: Optional[str] = None,
          plan_config_path: Optional[str] = None,
          warehouse_config_path: str = "config/warehouse.json"):
     """仓库仿真主函数（事件驱动版本）
-    
+
     Args:
         random_seed: 随机种子，None表示不设置
         max_simulation_time: 最大仿真时间（秒）
-        use_magnetic_crane: 是否使用磁力吊（None 时使用 config/warehouse.json）
-        outbound_congestion_time: 出库口拥堵时间（秒，None 时使用 config/warehouse.json）
-        lr_balance_weight: 左右均衡度权重（0-1，None 时使用 config/warehouse.json）
-        inbound_allocation_strategy: 入库巷道分配策略 ('proposed', 'baseline_random', 'baseline_round_robin', 'baseline_most_empty', None)
-        inbound_position_strategy: 入库货位分配策略 ('proposed', 'first_available', 'lowest_level', 'nearest')
-        scheduler_type: 调度器类型 ('heuristic' 或 'optimization')
+        inbound_allocation_strategy: 入库巷道分配策略 ('proposed', 'baseline')
+        inbound_position_strategy: 入库货位分配策略 ('proposed', 'baseline')
+        scheduler_type: 调度器类型 ('heuristic', 'optimization')
         initial_inventory_count: 用于初始化库存的入库任务记录数（None 时使用 config/warehouse.json）
+        inbound_rate_lambda: 入库任务生成速度（1/秒，None 时使用 config/warehouse.json）
+        real_time_days: 实时仿真天数（None 时使用 config/warehouse.json）
         cutoff_hour: 切日小时
         date_str: 日期字符串（如20251012），用于指定运行特定日期的仿真
         inbound_config_path: 入库配置文件路径，用于指定特定日期的配置
         plan_config_path: 生产计划配置文件路径，用于指定特定日期的配置
         warehouse_config_path: 仓库配置文件路径
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
     """
     # 入库策略交由 Core 内部配置
-    
-    cfg = load_warehouse_config(warehouse_config_path)
-    def _resolve_param(value, key, fallback):
-        if value is not None:
-            return value
-        if key in cfg:
-            return cfg[key]
-        return fallback
 
-    use_magnetic_crane = _resolve_param(use_magnetic_crane, "use_magnetic_crane", True)
-    outbound_congestion_time = _resolve_param(outbound_congestion_time, "outbound_congestion_time", 0.0)
-    lr_balance_weight = _resolve_param(lr_balance_weight, "lr_balance_weight", 0.3)
-    makespan_weight = _resolve_param(makespan_weight, "makespan_weight", 0.3)
-    balance_weight = _resolve_param(balance_weight, "balance_weight", 0.001)
-    production_line_avg_time_weight = _resolve_param(production_line_avg_time_weight, "production_line_avg_time_weight", 0.5)
-    production_line_balance_weight = _resolve_param(production_line_balance_weight, "production_line_balance_weight", 0.3)
-    aisle_dispersion_weight = _resolve_param(aisle_dispersion_weight, "aisle_dispersion_weight", 0.3)
-    inbound_wait_weight = _resolve_param(inbound_wait_weight, "inbound_wait_weight", 0.01)
-    outbound_choice_bonus_weight = _resolve_param(
-        outbound_choice_bonus_weight, "outbound_choice_bonus_weight", 0.2
-    )
-    initial_inventory_count = _resolve_param(initial_inventory_count, "initial_inventory_count", None)
+    cfg = load_warehouse_config(warehouse_config_path)
+    # 设备时间、FIFO 与全部评分权重由 WarehouseCore 从 warehouse.json 统一读取；
+    # 此入口仅保留初始库存数量等单次仿真的输入数据。
+    if initial_inventory_count is None:
+        initial_inventory_count = int(cfg.get("initial_inventory_count", 250) or 250)
 
     # 创建仿真器
     simulator = WarehouseSimulation(
@@ -1091,9 +1234,6 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
         num_production_lines=int(cfg.get("num_production_lines", 3)),
         initial_inventory_ratio=0,
         random_seed=random_seed,
-        use_magnetic_crane=use_magnetic_crane,
-        outbound_congestion_time=outbound_congestion_time,
-        lr_balance_weight=lr_balance_weight,
         scheduler_type=scheduler_type,
         inbound_aisle_strategy=inbound_allocation_strategy,
         inbound_allocation_strategy=inbound_position_strategy,
@@ -1105,26 +1245,21 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
         initial_inventory_count = simulator.warehouse_core.initial_inventory_count
     else:
         simulator.warehouse_core.initial_inventory_count = initial_inventory_count
-    simulator.warehouse_core.makespan_weight = makespan_weight
-    simulator.warehouse_core.balance_weight = balance_weight
-    simulator.warehouse_core.production_line_avg_time_weight = production_line_avg_time_weight
-    simulator.warehouse_core.production_line_balance_weight = production_line_balance_weight
-    simulator.warehouse_core.aisle_dispersion_weight = aisle_dispersion_weight
-    simulator.warehouse_core.inbound_wait_weight = inbound_wait_weight
-    simulator.warehouse_core.outbound_choice_bonus_weight = outbound_choice_bonus_weight
 
     # 根据是否指定了特定日期配置来设置生产计划
-    if date_str and inbound_config_path and plan_config_path:
-        print(f"正在运行日期 {date_str} 的仿真...")
-        print(f"使用入库配置: {inbound_config_path}")
+    # 只要传了 plan_config_path 就使用它（可以不传 date_str）
+    inbound_config = None
+    if plan_config_path:
+        if date_str:
+            print(f"正在运行日期 {date_str} 的仿真...")
+        if inbound_config_path:
+            print(f"使用入库配置: {inbound_config_path}")
+            inbound_config = InboundConfigBuilder.load_json(inbound_config_path)
+            simulator.warehouse_core.inbound_records = inbound_config.inbound_records
         print(f"使用生产计划配置: {plan_config_path}")
-        
-        # 加载指定日期的配置文件
-        inbound_config = InboundConfigBuilder.load_json(inbound_config_path)
+
+        # 加载生产计划配置
         plan_config = ProductionPlanBuilder.load_json(plan_config_path)
-        
-        # 设置入库记录
-        simulator.warehouse_core.inbound_records = inbound_config.inbound_records
         # 设置生产计划
         if hasattr(plan_config, "production_plan_attrs") or hasattr(plan_config, "production_plan_versions"):
             simulator.warehouse_core.set_production_plan({
@@ -1134,7 +1269,7 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
             })
         else:
             simulator.warehouse_core.set_production_plan(plan_config.production_plan)
-        
+
         # 获取创建时间
         creation_times = getattr(plan_config, "creation_times", {})
 
@@ -1149,7 +1284,7 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
         except Exception:
             first_outbound_time = None
 
-        if first_outbound_time is not None:
+        if first_outbound_time is not None and inbound_config is not None:
             auto_initial_count = 0
             for rec in inbound_config.inbound_records or []:
                 if isinstance(rec, dict):
@@ -1179,7 +1314,7 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
         creation_times = getattr(production_plan_builder, "creation_times", {})
 
     # 运行仿真（优先把版本/创建时间随计划一起传入，避免丢失）
-    plan_payload = {"production_plan": plan_config.production_plan}
+    plan_payload: Dict[str, Any] = {"production_plan": plan_config.production_plan}
     if hasattr(plan_config, "production_plan_attrs"):
         plan_payload["production_plan_attrs"] = getattr(plan_config, "production_plan_attrs", {})
     elif hasattr(plan_config, "production_plan_versions"):
@@ -1198,20 +1333,12 @@ def main(random_seed: Optional[int] = 42, max_simulation_time: float = 3600.0,
 
 
 if __name__ == "__main__":
-    # 使用说明：
-    # 运行前请先激活conda环境: conda activate scip_env
-    
-    # 参数说明：
-    # - use_magnetic_crane: 是否使用磁力吊（True/False）
-    # - outbound_congestion_time: 出库口拥堵时间（秒）
-    # - lr_balance_weight: 左右均衡度权重（0-1），不使用磁力吊时建议设为0
+
+    # 参数说明：设备时间、FIFO 和优化评分权重统一在 warehouse.json 中维护，
+    # 不在命令行重复暴露，避免仿真和 API 使用不同参数来源。
     # - scheduler_type: 调度器类型
     #   * 'heuristic': 启发式调度器（快速，适合大规模）
     #   * 'optimization': 随机优化调度器（较慢，质量更好，支持综合评分）
-    # - num_iterations: 随机优化调度器的迭代次数（仅当scheduler_type='optimization'时有效）
-    # - makespan_weight: makespan权重（仅当scheduler_type='optimization'时有效）
-    # - balance_weight: 均衡度变化权重（仅当scheduler_type='optimization'时有效）
-    # - production_line_avg_time_weight: 产线平均完成时间权重（仅当scheduler_type='optimization'时有效）
     # - inbound_allocation_strategy: 入库巷道分配策略
     #   * 'proposed': 使用提出策略
     #   * 'baseline': 使用基线策略
@@ -1224,61 +1351,59 @@ if __name__ == "__main__":
     # - date_str: 日期字符串（如20251012），用于指定运行特定日期的仿真
     # - inbound_config_path: 入库配置文件路径，用于指定特定日期的配置
     # - plan_config_path: 生产计划配置文件路径，用于指定特定日期的配置
-    
+
 
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='仓库仿真系统')
+    # 固定伪随机序列，用于复现任务生成、候选采样和策略比较结果。
     parser.add_argument('--random-seed', type=int, default=42, help='随机种子')
+    # 限制单轮离散事件仿真的最大推进秒数，防止异常事件链无限运行。
     parser.add_argument('--max-simulation-time', type=float, default=86400.0, help='最大仿真时间（秒）')
-    parser.add_argument('--use-magnetic-crane', action='store_true', help='是否使用磁力吊')
-    parser.add_argument('--no-magnetic-crane', dest='use_magnetic_crane', action='store_false', help='不使用磁力吊')
-    parser.set_defaults(use_magnetic_crane=None)
-    parser.add_argument('--outbound-congestion-time', type=float, default=None, help='出库口拥堵时间（秒，默认用 config/warehouse.json）')
-    parser.add_argument('--lr-balance-weight', type=float, default=None, help='左右均衡度权重（默认用 config/warehouse.json）')
+    # 选择入库任务的巷道分配实现，例如 proposed 或 baseline。
     parser.add_argument('--inbound-allocation-strategy', type=str, default='proposed', help='入库巷道分配策略')
+    # 选择进入目标巷道后具体货位的分配实现。
     parser.add_argument('--inbound-position-strategy', type=str, default='proposed', help='入库货位分配策略')
+    # 选择任务调度器实现，例如 heuristic 或 optimization。
     parser.add_argument('--scheduler-type', type=str, default='heuristic', help='调度器类型')
-    parser.add_argument('--makespan-weight', type=float, default=None, help='makespan weight (optimization)')
-    parser.add_argument('--balance-weight', type=float, default=None, help='inventory balance change weight (optimization)')
-    parser.add_argument('--production-line-avg-time-weight', type=float, default=None, help='production line avg time weight (optimization)')
-    parser.add_argument('--production-line-balance-weight', type=float, default=None, help='production line balance weight (optimization)')
-    parser.add_argument('--aisle-dispersion-weight', type=float, default=None, help='aisle dispersion weight (optimization)')
-    parser.add_argument('--inbound-wait-weight', type=float, default=None, help='inbound wait time weight (optimization)')
-    parser.add_argument('--outbound-choice-bonus-weight', type=float, default=None, help='outbound choice bonus weight (optimization)')
+    # 指定用于构造初始库存的历史入库记录条数；None 时读取仓库配置。
     parser.add_argument('--initial-inventory-count', type=int, default=None, help='用于初始化库存的入库任务记录数（默认使用 config/warehouse.json）')
+    # 泊松入库生成间隔参数 lambda，仅在自动生成入库任务时使用。
     parser.add_argument('--inbound-rate-lambda', type=float, default=1/80.0, help='(入库计划生成时)入库任务生成间隔的λ参数')
+    # 使用真实时间数据时的仿真天数。
     parser.add_argument('--real-time-days', type=int, default=6, help='使用真实时间数据时，模拟几天')
+    # 按自然日拆分真实记录时采用的业务切日小时，也就是说0点到cutoff hour之前的记录会被列为上一天的。
     parser.add_argument('--cutoff-hour', type=int, default=4, help='切日小时')
+    # 关闭业务切日逻辑，将全部输入记录视为一个连续仿真区间。
     parser.add_argument('--no-cutoff', action='store_true', help='不分日，整段时间作为单日运行')
+    # 仅运行指定 YYYYMMDD 日期对应的真实数据和配置。
     parser.add_argument('--date-str', type=str, help='日期字符串（如20251012），用于指定运行特定日期的仿真')
+    # 显式指定入库任务配置，通常由批处理脚本按日期传入。
     parser.add_argument('--inbound-config', type=str, help='入库配置文件路径')
+    # 显式指定生产计划配置，通常与入库配置使用相同日期。
     parser.add_argument('--plan-config', type=str, help='生产计划配置文件路径')
+    # 指定仓库几何、货位禁用、配对规则和策略默认权重的配置来源。
     parser.add_argument('--warehouse-config', type=str, default='config/warehouse.json', help='仓库配置文件路径')
-    
+
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
         print(f"[WARN] 忽略未知命令行参数: {unknown_args}")
-    
+
     main(
-        random_seed=args.random_seed, 
+        random_seed=args.random_seed,
         max_simulation_time=args.max_simulation_time,
-        use_magnetic_crane=args.use_magnetic_crane,  # 是否使用磁力吊
-        outbound_congestion_time=args.outbound_congestion_time,  # 出库口拥堵时间（秒）
-        lr_balance_weight=args.lr_balance_weight,  # 左右均衡度权重
-        inbound_allocation_strategy=args.inbound_allocation_strategy,  # 入库巷道分配策略
-        inbound_position_strategy=args.inbound_position_strategy,  # 入库货位分配策略
-        scheduler_type=args.scheduler_type,  # 调度器类型
-        makespan_weight=args.makespan_weight,
-        balance_weight=args.balance_weight,
-        production_line_avg_time_weight=args.production_line_avg_time_weight,
-        production_line_balance_weight=args.production_line_balance_weight,
-        aisle_dispersion_weight=args.aisle_dispersion_weight,
-        inbound_wait_weight=args.inbound_wait_weight,
-        outbound_choice_bonus_weight=args.outbound_choice_bonus_weight,
-        initial_inventory_count=args.initial_inventory_count,  # 用于初始化库存的入库任务记录数
-        inbound_rate_lambda=args.inbound_rate_lambda,  # (入库计划生成时)入库任务生成间隔的λ参数
-        real_time_days=args.real_time_days, #设置为None时可以使用max_simulation_time
+        # 入库巷道分配策略
+        inbound_allocation_strategy=args.inbound_allocation_strategy,
+        # 入库货位分配策略
+        inbound_position_strategy=args.inbound_position_strategy,
+        # 调度器类型
+        scheduler_type=args.scheduler_type,
+        # 用于初始化库存的入库任务记录数
+        initial_inventory_count=args.initial_inventory_count,
+        # (入库计划生成时)入库任务生成间隔的λ参数
+        inbound_rate_lambda=args.inbound_rate_lambda,
+        #设置为None时可以使用max_simulation_time
+        real_time_days=args.real_time_days,
         cutoff_hour=None if args.no_cutoff else args.cutoff_hour,
         date_str=args.date_str,
         inbound_config_path=args.inbound_config,

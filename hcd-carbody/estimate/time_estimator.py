@@ -1,49 +1,52 @@
+"""根据货位坐标、设备规则和配置估算任务作业时间。"""
+
 from typing import List, Optional, Dict, Any, Tuple, Union
-from pathlib import Path
-import json
 import re
 import numpy as np
 import pandas as pd
 import joblib
-try:
-    import json5  # type: ignore
-except Exception:
-    json5 = None
 from datetime import time, timedelta
 from math import sqrt
 
+from config_loader import load_jsonc, resolve_runtime_path
 from simulation.position import InventoryPosition
 
-import warnings
-from sklearn.base import InconsistentVersionWarning
 
-warnings.filterwarnings('ignore', category=InconsistentVersionWarning)
+# ==========================================================================
+# 辅助函数：时间估算配置和巷道尺寸读取
+# ==========================================================================
+def load_time_estimator_config(path: Optional[str]) -> Dict[str, Any]:
+    """读取时间估算器 JSON/JSONC 配置。
 
+    Args:
+        path: 配置文件的相对或绝对路径。
 
-def load_time_estimator_config(path: Optional[str]) -> dict:
-    """
-    Load estimator config from a JSON/JSON5 file if provided.
+    Returns:
+        Dict[str, Any]: 顶层配置对象；文件不存在或内容无效时返回空字典。
     """
     if not path:
         return {}
-    cfg_path = Path(path)
+    cfg_path = resolve_runtime_path(path)
     if not cfg_path.exists():
         return {}
-    text = cfg_path.read_text(encoding="utf-8")
     try:
-        if json5 is not None:
-            return json5.loads(text)
-        return json.loads(text)
+        parsed = load_jsonc(cfg_path)
+        return parsed if isinstance(parsed, dict) else {}
     except Exception:
-        try:
-            return json.loads(text)
-        except Exception:
-            return {}
+        return {}
 
 
 def load_aisle_max_columns(path: str = "config/warehouse.json") -> Dict[int, int]:
+    """从仓库配置读取每条巷道的实际最大列号。
+
+    Args:
+        path: 仓库 JSON/JSONC 配置路径。
+
+    Returns:
+        Dict[int, int]: 巷道号到最大列号的映射；配置无效时返回空字典。
+    """
     try:
-        cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+        cfg = load_jsonc(resolve_runtime_path(path))
     except Exception:
         return {}
     dims = cfg.get("aisle_dimensions", {}) or {}
@@ -66,6 +69,9 @@ def load_aisle_max_columns(path: str = "config/warehouse.json") -> Dict[int, int
     return result
 
 
+# ==========================================================================
+# 主类：出入库路径和作业时长估算
+# ==========================================================================
 class TimeEstimator:
     """
     TimeEstimator
@@ -99,7 +105,7 @@ class TimeEstimator:
         """
         cfg = load_time_estimator_config(config_path)
 
-        # load model path from config (if any)
+        # 从配置中读取模型路径；如果配置未提供，则沿用调用方传入的值。
         self.model_path = cfg.get("model_path", model_path)
 
         self.pickup_time_default = float(cfg.get("pickup_time_default", pickup_time_default))
@@ -129,9 +135,33 @@ class TimeEstimator:
             "a_col": float(physics_cfg.get("a_col", a_col)),
             "a_layer": float(physics_cfg.get("a_layer", a_layer)),
         }
+        # 按巷道覆盖的物理参数。未提供的字段保留全局 physics 值，从而可只为
+        # 异构巷道填写不同的横向列距或运动参数，而不影响其余巷道。
+        self.physics_by_aisle: Dict[int, Dict[str, float]] = {}
+        raw_physics_by_aisle = cfg.get("physics_by_aisle", {}) or {}
+        if isinstance(raw_physics_by_aisle, dict):
+            for raw_aisle, raw_override in raw_physics_by_aisle.items():
+                if not isinstance(raw_override, dict):
+                    continue
+                try:
+                    aisle = int(raw_aisle)
+                except (TypeError, ValueError):
+                    continue
+                override: Dict[str, float] = {}
+                for key in self.physics_params:
+                    if key not in raw_override:
+                        continue
+                    try:
+                        value = float(raw_override[key])
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        override[key] = value
+                if override:
+                    self.physics_by_aisle[aisle] = override
         self.aisle_max_columns = load_aisle_max_columns("config/warehouse.json")
-        
-        # load trained residual models if available
+
+        # 配置允许时加载已经训练好的残差模型。
         self.inbound_model = None
         self.outbound_model = None
         if self.load_model:
@@ -143,6 +173,9 @@ class TimeEstimator:
         ]
 
     @staticmethod
+    # ==========================================================================
+    # 辅助函数：出入库口归一化、路径序列和物理时间计算
+    # ==========================================================================
     def _normalize_dock_map(raw_map: Dict[Any, Any], default_col: int) -> Dict[str, Dict[str, int]]:
         """
         Normalize dock map entries.
@@ -177,6 +210,14 @@ class TimeEstimator:
 
     @staticmethod
     def _dock_key(value: Any) -> Optional[str]:
+        """执行 dock key 对应的业务处理。
+
+        Args:
+            value: 待处理的单个值。
+
+        Returns:
+            Optional[str]: 处理后的结果。
+        """
         if value is None:
             return None
         text = str(value).strip()
@@ -184,6 +225,14 @@ class TimeEstimator:
 
     @staticmethod
     def _extract_level(value: Any) -> Optional[int]:
+        """执行 extract level 对应的业务处理。
+
+        Args:
+            value: 待处理的单个值。
+
+        Returns:
+            Optional[int]: 处理后的结果。
+        """
         if value is None:
             return None
         if isinstance(value, (int, float)):
@@ -203,6 +252,16 @@ class TimeEstimator:
             return None
 
     def _clamp_dock_col(self, col: int, aisle: Optional[int]) -> int:
+        """执行 clamp dock col 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            col: 用于本函数处理的 `col` 参数。
+            aisle: 目标巷道编号。
+
+        Returns:
+            int: 处理后的结果。
+        """
         if aisle is None:
             return int(col)
         try:
@@ -214,6 +273,17 @@ class TimeEstimator:
         return max(1, min(int(col), max_col))
 
     def resolve_inbound_dock(self, line: Optional[Any], default_layer: int = 1, aisle: Optional[int] = None) -> Tuple[int, int]:
+        """执行 resolve 入库 dock 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            line: 用于本函数处理的 `line` 参数。
+            default_layer: 用于本函数处理的 `default_layer` 参数。
+            aisle: 目标巷道编号。
+
+        Returns:
+            Tuple[int, int]: 处理后的结果。
+        """
         if line is None:
             return self._clamp_dock_col(self.dock_in_col, aisle), int(default_layer)
         line_key = self._dock_key(line)
@@ -224,6 +294,17 @@ class TimeEstimator:
         return self._clamp_dock_col(col, aisle), int(info.get("level", default_layer))
 
     def resolve_outbound_dock(self, line: Optional[Any], default_layer: int = 1, aisle: Optional[int] = None) -> Tuple[int, int]:
+        """执行 resolve 出库 dock 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            line: 用于本函数处理的 `line` 参数。
+            default_layer: 用于本函数处理的 `default_layer` 参数。
+            aisle: 目标巷道编号。
+
+        Returns:
+            Tuple[int, int]: 处理后的结果。
+        """
         if line is None:
             return self._clamp_dock_col(self.dock_out_col, aisle), int(default_layer)
         line_key = self._dock_key(line)
@@ -232,6 +313,24 @@ class TimeEstimator:
             return self._clamp_dock_col(self.dock_out_col, aisle), int(default_layer)
         col = int(info.get("col", self.dock_out_col))
         return self._clamp_dock_col(col, aisle), int(info.get("level", default_layer))
+
+    def get_physics_params(self, aisle: Optional[int] = None) -> Dict[str, float]:
+        """返回指定巷道实际使用的列/层运动物理参数。
+
+        Args:
+            aisle: 目标巷道编号；为空或未配置覆盖时使用全局 physics。
+
+        Returns:
+            Dict[str, float]: 可直接传给 ``_augment_sequence_physics2d`` 或
+            ``_physics_time_2d`` 的完整参数字典。
+        """
+        params = dict(self.physics_params)
+        try:
+            override = self.physics_by_aisle.get(int(aisle), {}) if aisle is not None else {}
+        except (TypeError, ValueError):
+            override = {}
+        params.update(override)
+        return params
 
     def _load_model(self):
         """加载时间预测模型"""
@@ -246,8 +345,11 @@ class TimeEstimator:
             # 如果加载失败，保留None，后续逻辑会处理
 
     # -----------------------------
-    # Public estimate APIs
+    # 对外提供的时间估算接口。
     # -----------------------------
+    # ==========================================================================
+    # 主函数：入库与出库时间估算
+    # ==========================================================================
     def estimate_inbound_time(self,
                               target_position: List[InventoryPosition],
                               skus: List[Dict[str, Any]],
@@ -344,21 +446,23 @@ class TimeEstimator:
             start_pos_dict=current_position,
             default_dock_layer=1
         )
-        seq = self._augment_sequence_physics2d(seq, **self.physics_params)
-        
+        # 单个任务仅属于一个巷道，因此可在这里一次性使用其专属物理参数。
+        seq = self._augment_sequence_physics2d(seq, **self.get_physics_params(roadway))
+
         if dual:
             # 双梁入库只计算第二个任务的时间
             i = 1
         else:
             # 单梁入库计算第一个（也是唯一一个）任务的时间
             i = 0
-            
+
         physics_time = float(seq.iloc[i].get("physics_time_total", 0.0))
         pickdrop = float(seq.iloc[i].get("取放时间_sec", self.pickup_time_default + self.drop_time_default))
-        
-        # residual features
-        X = pd.DataFrame([seq.iloc[i][self.feature_names].values], columns=self.feature_names)
-        
+
+        # 组装残差模型需要的特征。
+        feature_row = {name: seq.iloc[i][name] for name in self.feature_names}
+        X = pd.DataFrame([feature_row])
+
         residual = 0.0
         if self.inbound_model is not None:
             pred = getattr(self.inbound_model, 'predict')(X)
@@ -366,7 +470,7 @@ class TimeEstimator:
         else:
             # 若没有模型，则使用默认值
             residual = 3.0
-        
+
         total_time = residual + physics_time + pickdrop
 
         return float(total_time)
@@ -374,14 +478,16 @@ class TimeEstimator:
     def estimate_outbound_time(self,
                                source_position,
                                skus: List[Dict[str, Any]],
-                               production_line: int = 1,
+                               production_line: Any = 1,
                                current_position: Optional[InventoryPosition] = None,
                                ) -> float:
         """
         出库单任务时间估计
         Args:
             source_position: (GL_Row, GL_Column, GL_Layer)
-            skus, raw_layer, current_position: same as inbound
+            skus: 出库 SKU 列表。
+            production_line: 出库口标识，可为产线号或 ``L1C17`` 等真实出库口键。
+            current_position: 当前堆垛机位置。
         Returns:
             total_time,
         """
@@ -412,7 +518,8 @@ class TimeEstimator:
             start_pos_dict=current_position,
             default_dock_layer=1
         )
-        seq = self._augment_sequence_physics2d(seq, **self.physics_params)
+        # 单个任务仅属于一个巷道，因此可在这里一次性使用其专属物理参数。
+        seq = self._augment_sequence_physics2d(seq, **self.get_physics_params(roadway))
         physics_time = float(seq.iloc[0].get("physics_time_total", 0.0))
         pickdrop = float(seq.iloc[0].get("取放时间_sec", self.pickup_time_default + self.drop_time_default))
 
@@ -426,7 +533,7 @@ class TimeEstimator:
             residual = 3.0
 
         total_time = residual + physics_time + pickdrop
-        
+
         return float(total_time)
 
     def _build_sequence(
@@ -455,11 +562,27 @@ class TimeEstimator:
             dock_out_col = self.dock_out_col
 
         def _parse_task(x):
+            """执行 parse 任务 对应的业务处理。
+
+            Args:
+                x: 用于本函数处理的 `x` 参数。
+
+            Returns:
+                处理结果；具体类型由调用上下文决定。
+            """
             if x in [0, 1, 3, 4]:
                 return int(x)
             return np.nan
 
         def _to_seconds(val):
+            """执行 to seconds 对应的业务处理。
+
+            Args:
+                val: 用于本函数处理的 `val` 参数。
+
+            Returns:
+                处理结果；具体类型由调用上下文决定。
+            """
             if pd.isna(val):
                 return np.nan
             if isinstance(val, timedelta):
@@ -648,7 +771,7 @@ class TimeEstimator:
                 last_seg2 = (seg2_col, seg2_layer)
 
         return pd.DataFrame(recs)
-    
+
     def _travel_time_1d(self, d: float, v_max: float, a: float) -> float:
         """
         单方向加速-匀速-减速时间计算
@@ -667,7 +790,7 @@ class TimeEstimator:
         else:
             # 达到 vmax，梯形速度曲线
             return 2 * t_acc + (d - 2 * d_acc) / v_max
-    
+
     def _physics_time_2d(self, delta_col: float, delta_layer: float,
                     col_scale=15.0, layer_scale=0.5,
                     v_col_max=1.6, v_layer_max=0.6,  # 分别定义水平和垂直最大速度

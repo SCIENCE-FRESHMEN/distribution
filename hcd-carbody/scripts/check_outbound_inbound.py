@@ -14,13 +14,16 @@
 
 import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import pytz
 
 import pandas as pd
 
 
-def to_ts(val) -> pd.Timestamp:
+# ==========================================================================
+# 辅助函数：表格读取与出入库一致性校验
+# ==========================================================================
+def to_ts(val: Any) -> Any:
     """将时间值转为带时区的 Timestamp（北京时间），失败返回 NaT"""
     try:
         china_tz = pytz.timezone('Asia/Shanghai')
@@ -49,6 +52,16 @@ def _base_sku(code_raw) -> str:
 
 
 def load_inbound_table(path: Path, arrival_col: str, beam_cols: List[str]) -> Dict[str, List[pd.Timestamp]]:
+    """加载入库 table相关逻辑。
+
+    Args:
+        path: 输入或输出文件路径。
+        arrival_col: 用于本函数处理的 `arrival_col` 参数。
+        beam_cols: 用于本函数处理的 `beam_cols` 参数。
+
+    Returns:
+        Dict[str, List[pd.Timestamp]]: 处理后的结果。
+    """
     df = pd.read_excel(path) if path.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(path)
     arrivals: Dict[str, List[pd.Timestamp]] = {}
     for _, row in df.iterrows():
@@ -71,7 +84,7 @@ def load_outbound_table(path: Path, creation_col: str, sku_cols: List[str]) -> L
     df = pd.read_excel(path) if path.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(path)
     df[creation_col] = df[creation_col].ffill()
     tasks: List[Tuple[pd.Timestamp, List[str], int]] = []
-    for idx, row in df.iterrows():
+    for row_number, (_, row) in enumerate(df.iterrows(), start=1):
         ct = to_ts(row.get(creation_col))
         if pd.isna(ct):
             continue
@@ -80,7 +93,7 @@ def load_outbound_table(path: Path, creation_col: str, sku_cols: List[str]) -> L
             base = _base_sku(row.get(col))
             if base:
                 skus.append(base)
-        tasks.append((ct, skus, idx + 1))
+        tasks.append((ct, skus, row_number))
     tasks.sort(key=lambda x: x[0])
     return tasks
 
@@ -94,6 +107,14 @@ def check_consistency(inbound: Dict[str, List[pd.Timestamp]], outbound_tasks: Li
     avail: Dict[str, List[pd.Timestamp]] = {k: sorted(v) for k, v in inbound.items()}
 
     def fmt_ts(ts: pd.Timestamp) -> str:
+        """执行 fmt ts 对应的业务处理。
+
+        Args:
+            ts: 用于本函数处理的 `ts` 参数。
+
+        Returns:
+            str: 处理后的结果。
+        """
         try:
             if pd.isna(ts):
                 return ""
@@ -133,8 +154,16 @@ def check_consistency(inbound: Dict[str, List[pd.Timestamp]], outbound_tasks: Li
     return issues
 
 
+# ==========================================================================
+# 主函数：出入库一致性检查入口
+# ==========================================================================
 def main():
-    # ===== 配置：如需调整路径/列名，修改下方常量 =====
+        # ===== 配置：如需调整路径/列名，修改下方常量 =====
+    """执行模块的主入口流程。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     inbound_table = Path("simulation/data/daily/inbound_20251026.xlsx")
     outbound_table = Path("simulation/data/daily/production_plan_20251026.xlsx")
     arrival_col = "到达时间"

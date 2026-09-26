@@ -20,6 +20,7 @@ Thumbs.db
 # 忽略打包生成的文件夹
 build/
 dist/
+release/
 *.egg-info/
 
 *.png
@@ -27,4 +28,6 @@ dist/
 simulation/data/
 *.txt
 *.json
+# API 的空 BOM 是部署包初始状态，需随源码和发布包交付。
+!config/sku_config.json
 *.pdf

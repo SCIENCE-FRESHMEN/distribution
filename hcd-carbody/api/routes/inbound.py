@@ -1,5 +1,6 @@
 """Inbound allocation API routes."""
 
+import logging
 import uuid
 from typing import Any, Dict, List
 
@@ -11,16 +12,30 @@ from ..services.warehouse_service import WarehouseService, get_warehouse_service
 from ..state import TaskStateManager, get_task_state_manager
 
 router = APIRouter(prefix="/inbound", tags=["inbound"])
+logger = logging.getLogger("api.business")
 
 
+# ==========================================================================
+# 辅助函数：SKU 属性归一化与禁配校验
+# ==========================================================================
 def _normalize_sku_features(core: Any, skus: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """合并嵌套和顶层特征，并转换为核心统一的特征键和值。
+
+    Args:
+        core: WarehouseCore，用于执行特征别名归一化。
+        skus: API 入库任务的 SKU 条目，允许 ``features`` 和顶层扩展字段并存。
+
+    Returns:
+        List[Dict[str, str]]: 每个有效 SKU 对应一组非空标准化特征。
+    """
     rows: List[Dict[str, str]] = []
     for s in skus or []:
         if not isinstance(s, dict):
             continue
-        feats = s.get("features") if isinstance(s.get("features"), dict) else {}
+        raw_features = s.get("features")
+        feats: Dict[str, Any] = raw_features if isinstance(raw_features, dict) else {}
         merged = dict(feats)
-        # top-level fallback fields also allowed
+        # 允许使用 SKU 字典顶层字段作为特征回退值。
         for k, v in s.items():
             if k in ("skuId", "quantity", "features"):
                 continue
@@ -44,6 +59,17 @@ def _normalize_sku_features(core: Any, skus: List[Dict[str, Any]]) -> List[Dict[
 
 
 def _evaluate_forbidden(core: Any, aisle_id: int, skus: List[Dict[str, Any]], task_id: str) -> Dict[str, Any]:
+    """核验本次入库 SKU 是否命中目标巷道的特征禁配规则。
+
+    Args:
+        core: 仓库核心，提供 ``aisle_forbidden`` 和特征键归一化方法。
+        aisle_id: 本次分配得到的内部巷道号。
+        skus: 当前入库任务的 SKU 与属性。
+        task_id: 用于返回诊断结果的任务标识。
+
+    Returns:
+        Dict[str, Any]: 包含已检查规则数、通过标志和违反项的诊断对象。
+    """
     rules = (getattr(core, "aisle_forbidden", {}) or {}).get(int(aisle_id), {})
     if not rules:
         return {
@@ -76,6 +102,9 @@ def _evaluate_forbidden(core: Any, aisle_id: int, skus: List[Dict[str, Any]], ta
     }
 
 
+# ==========================================================================
+# 主函数：入库巷道和货位推荐 API 路由
+# ==========================================================================
 @router.post("/allocate")
 async def allocate_inbound(
     request: InboundAllocateRequest,
@@ -113,6 +142,12 @@ async def allocate_inbound(
 
         violations = [x for x in checks if not x.get("passed", True)]
         if violations:
+            logger.warning(
+                "event=inbound_allocate_rejected allocation_id=%s task_ids=%s reason=aisle_forbidden violations=%s",
+                allocation_id,
+                [str(task.taskId) for task in request.tasks],
+                violations,
+            )
             return fail(
                 message="命中禁配规则，入库分配失败。",
                 http_status=400,
@@ -130,6 +165,11 @@ async def allocate_inbound(
                 },
             )
 
+        logger.info(
+            "event=inbound_allocate_success allocation_id=%s assignments=%s",
+            allocation_id,
+            assignments,
+        )
         return ok(
             status_code="SUCCESS",
             message="分配成功",
@@ -148,4 +188,5 @@ async def allocate_inbound(
         )
 
     except Exception as e:
+        logger.exception("event=inbound_allocate_error task_ids=%s", [str(task.taskId) for task in request.tasks])
         return fail(message="入库分配失败", http_status=500, data={"detail": str(e)})

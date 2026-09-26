@@ -1,6 +1,7 @@
-"""
-全局状态管理模块
-管理待反馈任务队列和系统状态
+"""API 服务进程内的任务反馈状态管理。
+
+该状态机记录已下发但未完成的外部反馈生命周期，用于接口幂等和超时检查；库存
+和调度资源仍由 ``WarehouseService`` 与 ``WarehouseCore`` 维护。
 """
 
 import asyncio
@@ -22,7 +23,7 @@ class PendingTaskStatus(str, Enum):
 
 @dataclass
 class PendingTask:
-    """待反馈任务信息"""
+    """外部系统反馈生命周期中的任务快照。"""
     task_id: str
     task_type: str
     aisle_id: Optional[str]
@@ -31,32 +32,42 @@ class PendingTask:
     confirmed_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     timeout_seconds: float = 60.0  # 默认60秒超时
-    
+
     def is_timeout(self) -> bool:
-        """检查是否超时"""
+        """判断待确认任务是否超过确认时限。
+
+        只有 ``PENDING`` 状态参与判断；未带时区的历史时间按 UTC 解释。
+        """
         if self.status != PendingTaskStatus.PENDING:
             return False
         created_at = self.created_at
         if created_at.tzinfo is None:
-            # Backward compatibility: treat naive timestamps as UTC.
+        # 为兼容历史调用，将未携带时区的时间戳按 UTC 处理。
             created_at = created_at.replace(tzinfo=timezone.utc)
         elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
         return elapsed > self.timeout_seconds
 
 
 class TaskStateManager:
-    """任务状态管理器"""
-    
+    """线程安全地维护 API 已下发任务的确认、完成、失败和超时状态。"""
+
     def __init__(self, default_timeout: float = 60.0):
+        """初始化任务缓存、确认集合和线程锁。
+
+        Args:
+            default_timeout: 未单独指定时等待 EXECUTING 反馈的秒数。
+        """
         self.default_timeout = default_timeout
         self._pending_tasks: Dict[str, PendingTask] = {}
         self._lock = threading.RLock()
         self._confirmed_tasks: Set[str] = set()
-        
-    def add_pending_task(self, task_id: str, task_type: str, 
+
+    def add_pending_task(self, task_id: str, task_type: str,
                          aisle_id: Optional[str] = None,
                          timeout_seconds: Optional[float] = None) -> PendingTask:
-        """添加待反馈任务"""
+        """添加待反馈任务
+
+        """
         with self._lock:
             existing = self._pending_tasks.get(task_id)
             if existing is not None:
@@ -75,9 +86,11 @@ class TaskStateManager:
             )
             self._pending_tasks[task_id] = task
             return task
-    
+
     def confirm_task(self, task_id: str) -> bool:
-        """确认任务已开始执行（收到EXECUTING反馈）"""
+        """确认任务已开始执行（收到EXECUTING反馈）
+
+        """
         with self._lock:
             if task_id in self._pending_tasks:
                 task = self._pending_tasks[task_id]
@@ -86,9 +99,11 @@ class TaskStateManager:
                 self._confirmed_tasks.add(task_id)
                 return True
             return False
-    
+
     def complete_task(self, task_id: str) -> bool:
-        """标记任务完成"""
+        """标记任务完成
+
+        """
         with self._lock:
             if task_id in self._pending_tasks:
                 task = self._pending_tasks[task_id]
@@ -99,9 +114,11 @@ class TaskStateManager:
                 del self._pending_tasks[task_id]
                 return True
             return False
-    
+
     def fail_task(self, task_id: str) -> bool:
-        """标记任务失败"""
+        """标记任务失败
+
+        """
         with self._lock:
             if task_id in self._pending_tasks:
                 task = self._pending_tasks[task_id]
@@ -111,36 +128,38 @@ class TaskStateManager:
                 del self._pending_tasks[task_id]
                 return True
             return False
-    
+
     def get_task(self, task_id: str) -> Optional[PendingTask]:
-        """获取任务信息"""
+        """获取任务信息
+
+        """
         with self._lock:
             return self._pending_tasks.get(task_id)
-    
+
     def has_unconfirmed_tasks(self) -> bool:
-        """检查是否有未确认的任务"""
+        """返回是否仍存在等待 EXECUTING 反馈的 ``PENDING`` 任务。"""
         with self._lock:
             return any(
                 task.status == PendingTaskStatus.PENDING
                 for task in self._pending_tasks.values()
             )
-    
+
     def get_unconfirmed_tasks(self) -> Dict[str, PendingTask]:
-        """获取所有未确认的任务"""
+        """返回任务 ID 到 ``PENDING`` 任务快照的映射。"""
         with self._lock:
             return {
-                task_id: task 
+                task_id: task
                 for task_id, task in self._pending_tasks.items()
                 if task.status == PendingTaskStatus.PENDING
             }
-    
+
     def get_all_pending_tasks(self) -> Dict[str, PendingTask]:
-        """获取所有待处理任务（包括已确认但未完成的）"""
+        """返回仍处于反馈生命周期的任务副本，含已确认未完成任务。"""
         with self._lock:
             return self._pending_tasks.copy()
-    
+
     def check_and_timeout_tasks(self) -> list:
-        """检查并标记超时的任务，返回超时的任务ID列表"""
+        """将超过时限的 ``PENDING`` 任务标为 ``TIMEOUT`` 并返回其 ID。"""
         with self._lock:
             timeout_tasks = []
             for task_id, task in list(self._pending_tasks.items()):
@@ -148,12 +167,12 @@ class TaskStateManager:
                     task.status = PendingTaskStatus.TIMEOUT
                     timeout_tasks.append(task_id)
             return timeout_tasks
-    
+
     def can_accept_new_task(self, aisle_id: Optional[str] = None) -> bool:
-        """
-        检查是否可以接受新任务
+        """检查是否可以接受新任务
         如果指定了巷道，检查该巷道是否有未确认的任务
         如果未指定巷道，检查是否有任何未确认的任务
+
         """
         with self._lock:
             if aisle_id:
@@ -165,14 +184,19 @@ class TaskStateManager:
             else:
                 # 全局检查
                 return not self.has_unconfirmed_tasks()
-    
+
     def is_task_confirmed(self, task_id: str) -> bool:
-        """检查任务是否已确认"""
+        """检查任务是否已确认
+
+        """
         with self._lock:
             return task_id in self._confirmed_tasks
-    
+
     def clear_all(self):
-        """清除所有状态"""
+        """清空服务进程内的待反馈和已确认记录。
+
+        仅重置本状态机；库存和 Core 任务队列由 ``WarehouseService`` 单独处理。
+        """
         with self._lock:
             self._pending_tasks.clear()
             self._confirmed_tasks.clear()
@@ -183,7 +207,7 @@ _task_state_manager: Optional[TaskStateManager] = None
 
 
 def get_task_state_manager() -> TaskStateManager:
-    """获取全局任务状态管理器实例"""
+    """返回 FastAPI 依赖注入使用的进程内状态机单例。"""
     global _task_state_manager
     if _task_state_manager is None:
         _task_state_manager = TaskStateManager()
@@ -191,7 +215,7 @@ def get_task_state_manager() -> TaskStateManager:
 
 
 def reset_task_state_manager():
-    """重置全局任务状态管理器（用于测试）"""
+    """清空旧状态机并创建新实例，供测试或显式服务重置调用。"""
     global _task_state_manager
     if _task_state_manager is not None:
         _task_state_manager.clear_all()

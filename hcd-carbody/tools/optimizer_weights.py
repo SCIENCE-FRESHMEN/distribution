@@ -1,4 +1,4 @@
-﻿"""
+"""
 Grid search for optimizer score weights.
 
 Supports:
@@ -8,14 +8,8 @@ Supports:
     ("proposed", "proposed", "optimization")
     ("baseline", "baseline", "optimization")
 
-Weights are injected via environment variables (no warehouse.json rewrite):
-  OPT_LR_BALANCE_WEIGHT
-  OPT_MAKESPAN_WEIGHT
-  OPT_BALANCE_WEIGHT
-  OPT_PRODUCTION_LINE_AVG_TIME_WEIGHT
-  OPT_PRODUCTION_LINE_BALANCE_WEIGHT
-  OPT_AISLE_DISPERSION_WEIGHT
-  OPT_INBOUND_WAIT_WEIGHT
+权重通过 ``run.py`` 的命令行参数传入；run.py 在创建仓库核心后将这些值写入
+评分器实例。搜索过程不会修改 ``config/warehouse.json``。
 """
 
 from __future__ import annotations
@@ -27,7 +21,6 @@ import json
 import re
 import subprocess
 import sys
-import os
 from pathlib import Path
 from typing import Dict, Any, Iterable, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,17 +35,6 @@ WEIGHT_KEYS = [
     "aisle_dispersion_weight",
     "inbound_wait_weight",
 ]
-
-
-WEIGHT_ENV_MAP = {
-    "lr_balance_weight": "OPT_LR_BALANCE_WEIGHT",
-    "makespan_weight": "OPT_MAKESPAN_WEIGHT",
-    "balance_weight": "OPT_BALANCE_WEIGHT",
-    "production_line_avg_time_weight": "OPT_PRODUCTION_LINE_AVG_TIME_WEIGHT",
-    "production_line_balance_weight": "OPT_PRODUCTION_LINE_BALANCE_WEIGHT",
-    "aisle_dispersion_weight": "OPT_AISLE_DISPERSION_WEIGHT",
-    "inbound_wait_weight": "OPT_INBOUND_WAIT_WEIGHT",
-}
 
 
 DEFAULT_GRID: Dict[str, List[Any]] = {
@@ -72,7 +54,18 @@ CONFIGS: List[Tuple[str, str, str]] = [
 ]
 
 
+# ==========================================================================
+# 辅助函数：参数网格、试验执行和结果汇总
+# ==========================================================================
 def load_grid(path: str | None) -> Dict[str, List[Any]]:
+    """加载grid相关逻辑。
+
+    Args:
+        path: 输入或输出文件路径。
+
+    Returns:
+        Dict[str, List[Any]]: 处理后的结果。
+    """
     if not path:
         return dict(DEFAULT_GRID)
     p = Path(path)
@@ -88,12 +81,28 @@ def load_grid(path: str | None) -> Dict[str, List[Any]]:
 
 
 def iter_param_combinations(grid: Dict[str, List[Any]]) -> Iterable[Dict[str, Any]]:
+    """执行 iter param combinations 对应的业务处理。
+
+    Args:
+        grid: 用于本函数处理的 `grid` 参数。
+
+    Returns:
+        Iterable[Dict[str, Any]]: 处理后的结果。
+    """
     value_lists = [grid[k] for k in WEIGHT_KEYS]
     for values in itertools.product(*value_lists):
         yield {k: v for k, v in zip(WEIGHT_KEYS, values)}
 
 
 def decode_bytes(raw: bytes) -> str:
+    """执行 decode bytes 对应的业务处理。
+
+    Args:
+        raw: 用于本函数处理的 `raw` 参数。
+
+    Returns:
+        str: 处理后的结果。
+    """
     for enc in ("utf-8", "gbk"):
         try:
             return raw.decode(enc)
@@ -140,13 +149,27 @@ def run_one(
     trial_id: int,
     logs_dir: Path,
     python_exe: str,
+    real_time_days: int,
 ) -> Tuple[float | None, Path]:
+    """执行 run one 对应的业务处理。
+
+    Args:
+        weights: 用于本函数处理的 `weights` 参数。
+        config: 配置数据。
+        trial_id: 用于本函数处理的 `trial_id` 参数。
+        logs_dir: 用于本函数处理的 `logs_dir` 参数。
+        python_exe: 用于本函数处理的 `python_exe` 参数。
+
+    Returns:
+        Tuple[float | None, Path]: 处理后的结果。
+    """
     allocation, position, scheduler = config
     log_file = logs_dir / f"trial{trial_id:04d}-{allocation[:4]}-{position[:4]}-{scheduler[:3]}.log"
 
-    env = os.environ.copy()
-    for k, env_name in WEIGHT_ENV_MAP.items():
-        env[env_name] = str(weights[k])
+    # 试验编号会在新的网格搜索中重新从 1 开始；清除旧日志，避免 run.py 的追加写入
+    # 使不同轮次的每日完成记录混在一起，进而污染平均完成时间统计。
+    if log_file.exists():
+        log_file.unlink()
 
     cmd = [
         python_exe,
@@ -173,8 +196,10 @@ def run_one(
         str(weights["inbound_wait_weight"]),
         "--log-file",
         str(log_file),
+        "--real-time-days",
+        str(real_time_days),
     ]
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=False)
+    proc = subprocess.run(cmd, capture_output=True, text=False)
     if proc.returncode != 0:
         print(f"[ERROR] trial {trial_id} {allocation}-{position}-{scheduler} failed: {proc.returncode}")
         print(decode_bytes(proc.stdout)[-1200:])
@@ -189,13 +214,26 @@ def run_trial(
     logs_dir: Path,
     python_exe: str,
     parallel_configs: bool = False,
+    real_time_days: int = 5,
 ) -> Dict[str, Any]:
+    """执行 run trial 对应的业务处理。
+
+    Args:
+        trial_id: 用于本函数处理的 `trial_id` 参数。
+        weights: 用于本函数处理的 `weights` 参数。
+        logs_dir: 用于本函数处理的 `logs_dir` 参数。
+        python_exe: 用于本函数处理的 `python_exe` 参数。
+        parallel_configs: 用于本函数处理的 `parallel_configs` 参数。
+
+    Returns:
+        Dict[str, Any]: 处理后的结果。
+    """
     row: Dict[str, Any] = {"trial_id": trial_id, **weights}
     vals: List[float] = []
 
     if parallel_configs and len(CONFIGS) > 1:
         with ThreadPoolExecutor(max_workers=len(CONFIGS)) as ex:
-            fut_map = {ex.submit(run_one, weights, cfg, trial_id, logs_dir, python_exe): cfg for cfg in CONFIGS}
+            fut_map = {ex.submit(run_one, weights, cfg, trial_id, logs_dir, python_exe, real_time_days): cfg for cfg in CONFIGS}
             for fut in as_completed(fut_map):
                 cfg = fut_map[fut]
                 avg_h, log_path = fut.result()
@@ -206,7 +244,7 @@ def run_trial(
                     vals.append(avg_h)
     else:
         for cfg in CONFIGS:
-            avg_h, log_path = run_one(weights, cfg, trial_id, logs_dir, python_exe)
+            avg_h, log_path = run_one(weights, cfg, trial_id, logs_dir, python_exe, real_time_days)
             key = f"{cfg[0]}_{cfg[1]}_{cfg[2]}"
             row[f"avg_completion_{key}_hours"] = avg_h
             row[f"log_{key}"] = str(log_path)
@@ -218,6 +256,15 @@ def run_trial(
 
 
 def flush_rows_csv(rows: List[Dict[str, Any]], out_csv: Path) -> None:
+    """执行 flush rows csv 对应的业务处理。
+
+    Args:
+        rows: 用于本函数处理的 `rows` 参数。
+        out_csv: 用于本函数处理的 `out_csv` 参数。
+
+    Returns:
+        None: 处理后的结果。
+    """
     if not rows:
         return
     with out_csv.open("w", newline="", encoding="utf-8-sig") as f:
@@ -227,6 +274,14 @@ def flush_rows_csv(rows: List[Dict[str, Any]], out_csv: Path) -> None:
 
 
 def load_existing_rows(out_csv: Path) -> List[Dict[str, Any]]:
+    """加载existing rows相关逻辑。
+
+    Args:
+        out_csv: 用于本函数处理的 `out_csv` 参数。
+
+    Returns:
+        List[Dict[str, Any]]: 处理后的结果。
+    """
     if not out_csv.exists():
         return []
     rows: List[Dict[str, Any]] = []
@@ -242,7 +297,15 @@ def load_existing_rows(out_csv: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+# ==========================================================================
+# 主函数：优化器权重搜索入口
+# ==========================================================================
 def main() -> None:
+    """执行模块的主入口流程。
+
+    Returns:
+        None: 处理后的结果。
+    """
     parser = argparse.ArgumentParser(description="Grid search for optimizer weight params")
     parser.add_argument("--grid-json", type=str, default=None, help="JSON file: {param: [values,...]}")
     parser.add_argument("--max-trials", type=int, default=0, help="0 means run all combinations")
@@ -251,6 +314,7 @@ def main() -> None:
     parser.add_argument("--python", type=str, default=sys.executable)
     parser.add_argument("--jobs", type=int, default=8, help="parallel trials to run")
     parser.add_argument("--parallel-configs", action="store_true", help="run both configs in parallel inside each trial")
+    parser.add_argument("--real-time-days", type=int, default=5, help="每次试验使用的真实数据天数")
     parser.add_argument("--resume", action="store_true", help="resume from existing output-csv by trial_id")
     args = parser.parse_args()
 
@@ -283,7 +347,7 @@ def main() -> None:
     if jobs == 1:
         for i, weights in pending:
             print(f"[INFO] trial {i}/{len(all_params)} params={weights}")
-            row = run_trial(i, weights, logs_dir, args.python, args.parallel_configs)
+            row = run_trial(i, weights, logs_dir, args.python, args.parallel_configs, args.real_time_days)
             rows.append(row)
             rows.sort(key=lambda r: int(r.get("trial_id", 0)))
             flush_rows_csv(rows, out_csv)
@@ -292,7 +356,7 @@ def main() -> None:
             fut_map = {}
             for i, weights in pending:
                 print(f"[INFO] submit trial {i}/{len(all_params)} params={weights}")
-                fut = ex.submit(run_trial, i, weights, logs_dir, args.python, args.parallel_configs)
+                fut = ex.submit(run_trial, i, weights, logs_dir, args.python, args.parallel_configs, args.real_time_days)
                 fut_map[fut] = i
             done_cnt = 0
             for fut in as_completed(fut_map):
@@ -311,6 +375,14 @@ def main() -> None:
     valid_rows = [r for r in rows if r.get("avg_completion_mean_hours") not in (None, "")]
     if valid_rows:
         def _to_float(v):
+            """执行 to float 对应的业务处理。
+
+            Args:
+                v: 用于本函数处理的 `v` 参数。
+
+            Returns:
+                处理结果；具体类型由调用上下文决定。
+            """
             try:
                 return float(v)
             except Exception:

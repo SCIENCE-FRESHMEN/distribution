@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 API flow test script for current warehouse service.
 
@@ -104,19 +104,53 @@ APPEND_PRODUCTION_PLAN_2: Dict[str, Any] = {
 
 class Tee:
     def __init__(self, *streams):
+        """初始化对象依赖、配置和运行时状态。
+
+        Args:
+            self: 当前对象实例。
+            *streams: 可变位置参数。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         self.streams = streams
 
     def write(self, data: str) -> None:
+        """执行 write 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            data: 待转换或处理的数据。
+
+        Returns:
+            None: 处理后的结果。
+        """
         for s in self.streams:
             s.write(data)
             s.flush()
 
     def flush(self) -> None:
+        """执行 flush 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+
+        Returns:
+            None: 处理后的结果。
+        """
         for s in self.streams:
             s.flush()
 
 
+# ==========================================================================
+# 辅助函数：配置读取、请求载荷归一化与场景构造
+# ==========================================================================
 def load_config() -> Dict[str, Any]:
+    """加载配置相关逻辑。
+
+    Returns:
+        Dict[str, Any]: 处理后的结果。
+    """
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -125,10 +159,26 @@ def load_config() -> Dict[str, Any]:
 
 
 def load_match_fields(cfg: Dict[str, Any]) -> List[str]:
+    """加载匹配 fields相关逻辑。
+
+    Args:
+        cfg: 用于本函数处理的 `cfg` 参数。
+
+    Returns:
+        List[str]: 处理后的结果。
+    """
     return list(cfg.get("match_fields", []) or [])
 
 
 def load_outbound_feature_fields_by_line(cfg: Dict[str, Any]) -> Dict[int, List[str]]:
+    """加载出库 特征 fields by line相关逻辑。
+
+    Args:
+        cfg: 用于本函数处理的 `cfg` 参数。
+
+    Returns:
+        Dict[int, List[str]]: 处理后的结果。
+    """
     raw = cfg.get("outbound_match_features", {}) or {}
     if isinstance(raw, dict):
         result: Dict[int, List[str]] = {}
@@ -147,6 +197,14 @@ def load_outbound_feature_fields_by_line(cfg: Dict[str, Any]) -> Dict[int, List[
 
 
 def default_attr_value(field: str) -> Any:
+    """执行 default attr value 对应的业务处理。
+
+    Args:
+        field: 用于本函数处理的 `field` 参数。
+
+    Returns:
+        Any: 处理后的结果。
+    """
     if field == "version":
         return "00"
     if field == "color":
@@ -155,6 +213,15 @@ def default_attr_value(field: str) -> Any:
 
 
 def apply_sku_attrs_to_payload(obj: Any, required_fields: List[str]) -> None:
+    """应用sku attrs to payload相关逻辑。
+
+    Args:
+        obj: 用于本函数处理的 `obj` 参数。
+        required_fields: 用于本函数处理的 `required_fields` 参数。
+
+    Returns:
+        None: 处理后的结果。
+    """
     if not required_fields:
         return
 
@@ -185,6 +252,14 @@ def apply_sku_attrs_to_payload(obj: Any, required_fields: List[str]) -> None:
 
 
 def remove_shelf_fields(obj: Any) -> None:
+    """移除shelf fields相关逻辑。
+
+    Args:
+        obj: 用于本函数处理的 `obj` 参数。
+
+    Returns:
+        None: 处理后的结果。
+    """
     if isinstance(obj, list):
         for item in obj:
             remove_shelf_fields(item)
@@ -197,6 +272,15 @@ def remove_shelf_fields(obj: Any) -> None:
 
 
 def apply_plan_line_feature_fields(plan_payload: Dict[str, Any], feature_fields_by_line: Dict[int, List[str]]) -> None:
+    """应用计划 line 特征 fields相关逻辑。
+
+    Args:
+        plan_payload: 用于本函数处理的 `plan_payload` 参数。
+        feature_fields_by_line: 用于本函数处理的 `feature_fields_by_line` 参数。
+
+    Returns:
+        None: 处理后的结果。
+    """
     plans = plan_payload.get("plans", [])
     for plan in plans:
         line_raw = str(plan.get("lineId", ""))
@@ -224,6 +308,15 @@ def apply_plan_line_feature_fields(plan_payload: Dict[str, Any], feature_fields_
 
 
 def apply_default_features_to_payload(obj: Any, defaults: Dict[str, Any]) -> None:
+    """应用default features to payload相关逻辑。
+
+    Args:
+        obj: 用于本函数处理的 `obj` 参数。
+        defaults: 用于本函数处理的 `defaults` 参数。
+
+    Returns:
+        None: 处理后的结果。
+    """
     if isinstance(obj, list):
         for item in obj:
             apply_default_features_to_payload(item, defaults)
@@ -250,6 +343,16 @@ def apply_default_features_to_payload(obj: Any, defaults: Dict[str, Any]) -> Non
 
 
 def extract_plan_group_sku(plan_payload: Dict[str, Any], line_id: str, group_index: int) -> str:
+    """执行 extract 计划 任务组 sku 对应的业务处理。
+
+    Args:
+        plan_payload: 用于本函数处理的 `plan_payload` 参数。
+        line_id: 生产线编号。
+        group_index: 用于本函数处理的 `group_index` 参数。
+
+    Returns:
+        str: 处理后的结果。
+    """
     payload = plan_payload.get("data", plan_payload) if isinstance(plan_payload, dict) else {}
     production_plan = payload.get("production_plan", {}) if isinstance(payload, dict) else {}
 
@@ -277,832 +380,853 @@ def extract_plan_group_sku(plan_payload: Dict[str, Any], line_id: str, group_ind
 
 
 SCENARIOS: List[Dict[str, Any]] = [
-    {
-        "name": "S0 init inventory full reset with inline production plan",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 09:00:00",
-            "productionPlan": BASE_PRODUCTION_PLAN,
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [
-                {"aisleId": "1", "row": 1, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000001", "quantity": 1}]},
-                {"aisleId": "1", "row": 1, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000002", "quantity": 1}]},
-                {"aisleId": "1", "row": 1, "column": 3, "level": 3, "positions": [{"skuId": "1RAT000003", "quantity": 1}]},
-                {"aisleId": "1", "row": 1, "column": 3, "level": 4, "positions": [{"skuId": "1RAT000004", "quantity": 1}]},
-                {"aisleId": "2", "row": 3, "column": 2, "level": 1, "positions": [{"skuId": "1RAK000005", "quantity": 1}]},
-                {"aisleId": "2", "row": 3, "column": 2, "level": 2, "positions": [{"skuId": "1RAK000006", "quantity": 1}]},
-                {"aisleId": "2", "row": 3, "column": 3, "level": 3, "positions": [{"skuId": "1RAK000007", "quantity": 1}]},
-                {"aisleId": "2", "row": 3, "column": 3, "level": 4, "positions": [{"skuId": "1RAK000008", "quantity": 1}]},
-                {"aisleId": "1", "row": 2, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000005", "quantity": 1}]},
-                {"aisleId": "1", "row": 2, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000006", "quantity": 1}]},
-                {"aisleId": "1", "row": 2, "column": 3, "level": 3, "positions": [{"skuId": "1RAT000007", "quantity": 1}]},
-                {"aisleId": "1", "row": 2, "column": 3, "level": 4, "positions": [{"skuId": "1RAT000008", "quantity": 1}]},
-                {"aisleId": "2", "row": 4, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000009", "quantity": 1}]},
-                {"aisleId": "2", "row": 4, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000010", "quantity": 1}]},
-                {"aisleId": "2", "row": 4, "column": 3, "level": 3, "positions": [{"skuId": "1RAK000009", "quantity": 1}]},
-                {"aisleId": "2", "row": 4, "column": 3, "level": 4, "positions": [{"skuId": "1RAK000010", "quantity": 1}]},
-                # 每个巷道增加一个空滑橇
-                {"aisleId": "1", "row": 1, "column": 4, "level": 1, "positions": [{"skuId": "0EMP000001", "quantity": 1, "features": {"skid_state": "0", "skid_type": "0", "color": "W1"}}]},
-                {"aisleId": "2", "row": 3, "column": 4, "level": 1, "positions": [{"skuId": "0EMP000002", "quantity": 1, "features": {"skid_state": "0", "skid_type": "0", "color": "W1"}}]},
-            ],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [],
-        },
-        "wait_after": 1,
+{
+    "name": "S0 init inventory full reset with inline production plan",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 09:00:00",
+        "productionPlan": BASE_PRODUCTION_PLAN,
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [
+            {"aisleId": "1", "row": 1, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000001", "quantity": 1}]},
+            {"aisleId": "1", "row": 1, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000002", "quantity": 1}]},
+            {"aisleId": "1", "row": 1, "column": 3, "level": 3, "positions": [{"skuId": "1RAT000003", "quantity": 1}]},
+            {"aisleId": "1", "row": 1, "column": 3, "level": 4, "positions": [{"skuId": "1RAT000004", "quantity": 1}]},
+            {"aisleId": "2", "row": 3, "column": 2, "level": 1, "positions": [{"skuId": "1RAK000005", "quantity": 1}]},
+            {"aisleId": "2", "row": 3, "column": 2, "level": 2, "positions": [{"skuId": "1RAK000006", "quantity": 1}]},
+            {"aisleId": "2", "row": 3, "column": 3, "level": 3, "positions": [{"skuId": "1RAK000007", "quantity": 1}]},
+            {"aisleId": "2", "row": 3, "column": 3, "level": 4, "positions": [{"skuId": "1RAK000008", "quantity": 1}]},
+            {"aisleId": "1", "row": 2, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000005", "quantity": 1}]},
+            {"aisleId": "1", "row": 2, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000006", "quantity": 1}]},
+            {"aisleId": "1", "row": 2, "column": 3, "level": 3, "positions": [{"skuId": "1RAT000007", "quantity": 1}]},
+            {"aisleId": "1", "row": 2, "column": 3, "level": 4, "positions": [{"skuId": "1RAT000008", "quantity": 1}]},
+            {"aisleId": "2", "row": 4, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000009", "quantity": 1}]},
+            {"aisleId": "2", "row": 4, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000010", "quantity": 1}]},
+            {"aisleId": "2", "row": 4, "column": 3, "level": 3, "positions": [{"skuId": "1RAK000009", "quantity": 1}]},
+            {"aisleId": "2", "row": 4, "column": 3, "level": 4, "positions": [{"skuId": "1RAK000010", "quantity": 1}]},
+            # 每个巷道增加一个空滑橇
+            {"aisleId": "1", "row": 1, "column": 4, "level": 1, "positions": [{"skuId": "0EMP000001", "quantity": 1, "features": {"skid_state": "0", "skid_type": "0", "color": "W1"}}]},
+            {"aisleId": "2", "row": 3, "column": 4, "level": 1, "positions": [{"skuId": "0EMP000002", "quantity": 1, "features": {"skid_state": "0", "skid_type": "0", "color": "W1"}}]},
+        ],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [],
     },
-    {
-        "name": "S0.1 get production plan",
-        "method": "GET",
-        "endpoint": "/plan/production",
-        "wait_after": 1,
+    "wait_after": 1,
+},
+{
+    "name": "S0.1 get production plan",
+    "method": "GET",
+    "endpoint": "/plan/production",
+    "wait_after": 1,
+},
+{
+    "name": "S2 inbound aisle recommendation",
+    "method": "POST",
+    "endpoint": "/inbound/allocate",
+    "data": {
+        "tasks": [
+            {
+                "taskId": "INBOUND_A_1RAT000012",
+                "inLine": "L4C1",
+                "outLine": "L1C17",
+
+                "skus": [
+                    {"skuId": "1RAT000012", "quantity": 1},
+                ],
+            },
+            {
+                "taskId": "INBOUND_A_1RAT000013",
+                "inLine": "L1C17",
+                "outLine": "L2C1",
+
+                "skus": [
+                    {"skuId": "1RAT000013", "quantity": 1},
+                ],
+            }
+        ]
     },
-    {
-        "name": "S2 inbound aisle recommendation",
-        "method": "POST",
-        "endpoint": "/inbound/allocate",
-        "data": {
-            "tasks": [
-                {
-                    "taskId": "INBOUND_A_1RAT000012",
-                    "inLine": "L4C1",
-                    "outLine": "L1C17",
-                    "skus": [
-                        {"skuId": "1RAT000012", "quantity": 1},
-                    ],
-                },
-                {
-                    "taskId": "INBOUND_A_1RAT000013",
-                    "inLine": "L1C17",
-                    "outLine": "L2C1",
-                    "skus": [
-                        {"skuId": "1RAT000013", "quantity": 1},
-                    ],
-                }
-            ]
-        },
-        "wait_after": 1,
+    "wait_after": 1,
+},
+{
+    "name": "S3 mixed scheduling",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 10:15:00",
+        "productionPlan": BASE_PRODUCTION_PLAN,
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [
+            {
+                "taskId": "OUTBOUND_PL1_GP1_1RAT000001",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE1-20260121",
+                "planIndex": 1,
+                "inLine": "L1C17",
+                "outLine": "L1C17",
+                "skus": [
+                    {"skuId": "1RAT000001", "quantity": 1},
+                ],
+            },
+            {
+                "taskId": "OUTBOUND_PL1_GP1_1RAT000002",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE1-20260121",
+                "planIndex": 1,
+                "inLine": "L1C17",
+                "outLine": "L1C1",
+                "skus": [
+                    {"skuId": "1RAT000002", "quantity": 1},
+                ],
+            },
+            {
+                "taskId": "OUTBOUND_PL2_GP1_1RAK000005",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE2-20260121",
+                "planIndex": 1,
+                "inLine": "L2C17",
+                "outLine": "L2C17",
+                "skus": [
+                    {"skuId": "1RAK000005", "quantity": 1},
+                ],
+            },
+            {
+                "taskId": "OUTBOUND_PL2_GP1_1RAK000006",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE2-20260121",
+                "planIndex": 1,
+                "inLine": "L2C17",
+                "outLine": "L2C1",
+                "skus": [
+                    {"skuId": "1RAK000006", "quantity": 1},
+                ],
+            },
+            {
+                "taskId": "INBOUND_1RAT000012",
+                "taskType": "INBOUND",
+                "targetAisle": "1",
+                "inLine": "L4C1",
+                "outLine": "L1C17",
+
+                "skus": [
+                    {"skuId": "1RAT000012", "quantity": 1},
+                ],
+            },
+            {
+                "taskId": "INBOUND_1RAT000013",
+                "taskType": "INBOUND",
+                "targetAisle": "2",
+                "inLine": "L1C17",
+                "outLine": "L2C1",
+
+                "skus": [
+                    {"skuId": "1RAT000013", "quantity": 1},
+                ],
+            },
+        ],
     },
-    {
-        "name": "S3 mixed scheduling",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 10:15:00",
-            "productionPlan": BASE_PRODUCTION_PLAN,
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [
-                {
-                    "taskId": "OUTBOUND_PL1_GP1_1RAT000001",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE1-20260121",
-                    "planIndex": 1,
-                    "inLine": "L1C17",
-                    "outLine": "L1C17",
-                    "skus": [
-                        {"skuId": "1RAT000001", "quantity": 1},
-                    ],
-                },
-                {
-                    "taskId": "OUTBOUND_PL1_GP1_1RAT000002",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE1-20260121",
-                    "planIndex": 1,
-                    "inLine": "L1C17",
-                    "outLine": "L1C1",
-                    "skus": [
-                        {"skuId": "1RAT000002", "quantity": 1},
-                    ],
-                },
-                {
-                    "taskId": "OUTBOUND_PL2_GP1_1RAK000005",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE2-20260121",
-                    "planIndex": 1,
-                    "inLine": "L2C17",
-                    "outLine": "L2C17",
-                    "skus": [
-                        {"skuId": "1RAK000005", "quantity": 1},
-                    ],
-                },
-                {
-                    "taskId": "OUTBOUND_PL2_GP1_1RAK000006",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE2-20260121",
-                    "planIndex": 1,
-                    "inLine": "L2C17",
-                    "outLine": "L2C1",
-                    "skus": [
-                        {"skuId": "1RAK000006", "quantity": 1},
-                    ],
-                },
-                {
-                    "taskId": "INBOUND_1RAT000012",
-                    "taskType": "INBOUND",
-                    "targetAisle": "1",
-                    "inLine": "L4C1",
-                    "outLine": "L1C17",
-                    "skus": [
-                        {"skuId": "1RAT000012", "quantity": 1},
-                    ],
-                },
-                {
-                    "taskId": "INBOUND_1RAT000013",
-                    "taskType": "INBOUND",
-                    "targetAisle": "2",
-                    "inLine": "L1C17",
-                    "outLine": "L2C1",
-                    "skus": [
-                        {"skuId": "1RAT000013", "quantity": 1},
-                    ],
-                },
-            ],
-        },
-        "save_response_key": "assigned_tasks",
-        "wait_after": 2,
+    "save_response_key": "assigned_tasks",
+    "wait_after": 2,
+},
+{
+    "name": "S3.1 schedule again before confirm should keep unconfirmed assignments frozen",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [],
     },
-    {
-        "name": "S3.1 schedule again before confirm should keep unconfirmed assignments frozen",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [],
-        },
-        "assert_assigned_task_count": 2,
-        "wait_after": 1,
+    "assert_assigned_task_count": 2,
+    "wait_after": 1,
+},
+{"name": "S3.2 get unconfirmed", "method": "GET", "endpoint": "/task/unconfirmed", "wait_after": 1},
+{
+    "name": "S4 feedback EXECUTING",
+    "method": "MULTI_POST",
+    "endpoint": "/task/feedback",
+    "data_template": {"status": "EXECUTING", "startTime": "2026-01-21T10:16:00Z"},
+    "use_assigned_tasks": True,
+    "wait_after": 2,
+},
+{
+    "name": "S5 feedback COMPLETED",
+    "method": "MULTI_POST",
+    "endpoint": "/task/feedback",
+    "data_template": {"status": "COMPLETED", "startTime": "2026-01-21T10:16:00Z"},
+    "use_assigned_tasks": True,
+    "wait_after": 2,
+},
+{
+    "name": "S6 incremental inventory sync",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "inventory": [
+            {"aisleId": "1", "row": 1, "column": 1, "level": 1, "positions": [{"skuId": "", "quantity": 0}]},
+            {"aisleId": "1", "row": 1, "column": 1, "level": 1, "positions": [{"skuId": "", "quantity": 0}]},
+            {"aisleId": "2", "row": 3, "column": 1, "level": 4, "positions": [{"skuId": "", "quantity": 0}]},
+            {"aisleId": "2", "row": 3, "column": 1, "level": 4, "positions": [{"skuId": "", "quantity": 0}]},
+        ],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [],
     },
-    {"name": "S3.2 get unconfirmed", "method": "GET", "endpoint": "/task/unconfirmed", "wait_after": 1},
-    {
-        "name": "S4 feedback EXECUTING",
-        "method": "MULTI_POST",
-        "endpoint": "/task/feedback",
-        "data_template": {"status": "EXECUTING", "startTime": "2026-01-21T10:16:00Z"},
-        "use_assigned_tasks": True,
-        "wait_after": 2,
+    "wait_after": 1,
+},
+{"name": "S6.1 get system status", "method": "GET", "endpoint": "/status", "wait_after": 1},
+{
+    "name": "S6.15 duplicate task ids in one mixed request should be rejected",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "inventory": [],
+        "aisleStatus": [
+            {"aisleId": "1", "isAvailable": True, "bank": "LEFT", "exitCongestion": []},
+            {"aisleId": "2", "isAvailable": True, "bank": "RIGHT", "exitCongestion": []},
+        ],
+        "tasks": [
+            {"taskId": "DUPLICATE_TASK_001", "taskType": "INBOUND", "targetAisle": "1", "inLine": "L4C1", "outLine": "L1C17", "skus": [{"skuId": "1RAT000012", "quantity": 1}]},
+            {"taskId": "DUPLICATE_TASK_001", "taskType": "INBOUND", "targetAisle": "2", "inLine": "L1C17", "outLine": "L2C1", "skus": [{"skuId": "1RAT000013", "quantity": 1}]},
+        ],
     },
-    {
-        "name": "S5 feedback COMPLETED",
-        "method": "MULTI_POST",
-        "endpoint": "/task/feedback",
-        "data_template": {"status": "COMPLETED", "startTime": "2026-01-21T10:16:00Z"},
-        "use_assigned_tasks": True,
-        "wait_after": 2,
+    "expected_status": 400,
+    "wait_after": 1,
+},
+{
+    "name": "S6.16 disabled inventory position should be rejected",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "inventory": [
+            {"aisleId": "1", "row": 1, "column": 1, "level": 1, "positions": [{"skuId": "1RAT000001", "quantity": 1}]},
+        ],
+        "aisleStatus": [
+            {"aisleId": "1", "isAvailable": True, "bank": "LEFT", "exitCongestion": []},
+            {"aisleId": "2", "isAvailable": True, "bank": "RIGHT", "exitCongestion": []},
+        ],
+        "tasks": [],
     },
-    {
-        "name": "S6 incremental inventory sync",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "inventory": [
-                {"aisleId": "1", "row": 1, "column": 1, "level": 1, "positions": [{"skuId": "", "quantity": 0}]},
-                {"aisleId": "1", "row": 1, "column": 1, "level": 1, "positions": [{"skuId": "", "quantity": 0}]},
-                {"aisleId": "2", "row": 3, "column": 1, "level": 4, "positions": [{"skuId": "", "quantity": 0}]},
-                {"aisleId": "2", "row": 3, "column": 1, "level": 4, "positions": [{"skuId": "", "quantity": 0}]},
-            ],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [],
-        },
-        "wait_after": 1,
+    "expected_status": 400,
+    "wait_after": 1,
+},
+{
+    "name": "S6.2 cleanup pending before empty-skid test",
+    "method": "CLEAN_PENDING",
+    "wait_after": 1,
+},
+{
+    "name": "S6.3 all outbound docks disabled should block outbound dispatch",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 10:15:00",
+        "productionPlan": BASE_PRODUCTION_PLAN,
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+                "dockAvailability": [
+                    {"direction": "OUTBOUND", "lineRef": "L2C17", "isAvailable": False, "reason": "TEST_DISABLE"},
+                    {"direction": "OUTBOUND", "lineRef": "L2C1", "isAvailable": False, "reason": "TEST_DISABLE"},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+                "dockAvailability": [
+                    {"direction": "OUTBOUND", "lineRef": "L2C17", "isAvailable": False, "reason": "TEST_DISABLE"},
+                    {"direction": "OUTBOUND", "lineRef": "L2C1", "isAvailable": False, "reason": "TEST_DISABLE"},
+                ],
+            },
+        ],
+        "tasks": [
+            {
+                "taskId": "OUTBOUND_DOCK_BLOCKED_001",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE2-20260121",
+                "planIndex": 1,
+                "inLine": "L2C17",
+                "outLine": "L2C17",
+                "skus": [
+                    {"skuId": "1RAK000005", "quantity": 1},
+                ],
+            },
+            {
+                "taskId": "OUTBOUND_DOCK_BLOCKED_002",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE2-20260121",
+                "planIndex": 1,
+                "inLine": "L2C17",
+                "outLine": "L2C1",
+                "skus": [
+                    {"skuId": "1RAK000006", "quantity": 1},
+                ],
+            },
+        ],
     },
-    {"name": "S6.1 get system status", "method": "GET", "endpoint": "/status", "wait_after": 1},
-    {
-        "name": "S6.15 duplicate task ids in one mixed request should be rejected",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "inventory": [],
-            "aisleStatus": [
-                {"aisleId": "1", "isAvailable": True, "bank": "LEFT", "exitCongestion": []},
-                {"aisleId": "2", "isAvailable": True, "bank": "RIGHT", "exitCongestion": []},
-            ],
-            "tasks": [
-                {"taskId": "DUPLICATE_TASK_001", "taskType": "INBOUND", "targetAisle": "1", "inLine": "L4C1", "outLine": "L1C17", "skus": [{"skuId": "1RAT000012", "quantity": 1}]},
-                {"taskId": "DUPLICATE_TASK_001", "taskType": "INBOUND", "targetAisle": "2", "inLine": "L1C17", "outLine": "L2C1", "skus": [{"skuId": "1RAT000013", "quantity": 1}]},
-            ],
-        },
-        "expected_status": 400,
-        "wait_after": 1,
+    "assert_no_assigned_task_prefix": "OUTBOUND_DOCK_",
+    "wait_after": 1,
+},
+{
+    "name": "S6.35 cleanup pending before empty-skid scheduling",
+    "method": "CLEAN_PENDING",
+    "wait_after": 1,
+},
+{
+    "name": "S7 empty-skid outbound request should be scheduled with high priority",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [
+            {
+                "taskId": "OUTBOUND_EMPTY_SKID_REQ_001",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE1-20260121",
+                "planIndex": 1,
+                "inLine": "L1C17",
+                "outLine": "L2C17",
+                "skus": [
+                    # empty-skid request: only skid_state=0 is required for detection
+                    {"skuId": "", "quantity": 1, "features": {"skid_state": "0", "skid_type": "0", "color": "W1"}},
+                ],
+            },
+            {
+                "taskId": "OUTBOUND_NORMAL_FOR_COMPARE_001",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE1-20260121",
+                "planIndex": 1,
+                "inLine": "L1C17",
+                "outLine": "L1C17",
+                "skus": [
+                    {"skuId": "1RAT000003", "quantity": 1},
+                ],
+            },
+        ],
     },
-    {
-        "name": "S6.16 disabled inventory position should be rejected",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "inventory": [
-                {"aisleId": "1", "row": 1, "column": 1, "level": 1, "positions": [{"skuId": "1RAT000001", "quantity": 1}]},
-            ],
-            "aisleStatus": [
-                {"aisleId": "1", "isAvailable": True, "bank": "LEFT", "exitCongestion": []},
-                {"aisleId": "2", "isAvailable": True, "bank": "RIGHT", "exitCongestion": []},
-            ],
-            "tasks": [],
-        },
-        "expected_status": 400,
-        "wait_after": 1,
+    "assert_assigned_task_id": "OUTBOUND_EMPTY_SKID_REQ_001",
+    "wait_after": 1,
+},
+{
+    "name": "S7.1 pending queue head should be empty-skid outbound",
+    "method": "GET",
+    "endpoint": "/task/pending",
+    "assert_first_pending_task_id": "OUTBOUND_EMPTY_SKID_REQ_001",
+    "wait_after": 1,
+},
+{
+    "name": "S8 cleanup pending before partial-task scheduling test",
+    "method": "CLEAN_PENDING",
+    "wait_after": 1,
+},
+{
+    "name": "S8.1 reset minimal inventory for partial-task scheduling",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 11:00:00",
+        "productionPlan": BASE_PRODUCTION_PLAN,
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [
+            {"aisleId": "1", "row": 1, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000001", "quantity": 1}]},
+            {"aisleId": "1", "row": 1, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000002", "quantity": 1}]},
+            {"aisleId": "2", "row": 3, "column": 2, "level": 1, "positions": [{"skuId": "1RAK000005", "quantity": 1}]},
+            {"aisleId": "2", "row": 3, "column": 2, "level": 2, "positions": [{"skuId": "1RAK000006", "quantity": 1}]},
+        ],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [],
     },
-    {
-        "name": "S6.2 cleanup pending before empty-skid test",
-        "method": "CLEAN_PENDING",
-        "wait_after": 1,
+    "assert_assigned_task_count": 0,
+    "wait_after": 1,
+},
+{
+    "name": "S8.2 schedule first partial batch",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 11:01:00",
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [
+            {
+                "taskId": "PARTIAL_BATCH1_LINE1",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE1-20260121",
+                "planIndex": 1,
+                "inLine": "L1C17",
+                "outLine": "L1C17",
+                "skus": [{"skuId": "1RAT000001", "quantity": 1}],
+            },
+            {
+                "taskId": "PARTIAL_BATCH1_LINE2",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE2-20260121",
+                "planIndex": 1,
+                "inLine": "L2C17",
+                "outLine": "L2C17",
+                "skus": [{"skuId": "1RAK000005", "quantity": 1}],
+            },
+        ],
     },
-    {
-        "name": "S6.3 all outbound docks disabled should block outbound dispatch",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 10:15:00",
-            "productionPlan": BASE_PRODUCTION_PLAN,
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                    "dockAvailability": [
-                        {"direction": "OUTBOUND", "lineRef": "L2C17", "isAvailable": False, "reason": "TEST_DISABLE"},
-                        {"direction": "OUTBOUND", "lineRef": "L2C1", "isAvailable": False, "reason": "TEST_DISABLE"},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                    "dockAvailability": [
-                        {"direction": "OUTBOUND", "lineRef": "L2C17", "isAvailable": False, "reason": "TEST_DISABLE"},
-                        {"direction": "OUTBOUND", "lineRef": "L2C1", "isAvailable": False, "reason": "TEST_DISABLE"},
-                    ],
-                },
-            ],
-            "tasks": [
-                {
-                    "taskId": "OUTBOUND_DOCK_BLOCKED_001",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE2-20260121",
-                    "planIndex": 1,
-                    "inLine": "L2C17",
-                    "outLine": "L2C17",
-                    "skus": [
-                        {"skuId": "1RAK000005", "quantity": 1},
-                    ],
-                },
-                {
-                    "taskId": "OUTBOUND_DOCK_BLOCKED_002",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE2-20260121",
-                    "planIndex": 1,
-                    "inLine": "L2C17",
-                    "outLine": "L2C1",
-                    "skus": [
-                        {"skuId": "1RAK000006", "quantity": 1},
-                    ],
-                },
-            ],
-        },
-        "assert_no_assigned_task_prefix": "OUTBOUND_DOCK_",
-        "wait_after": 1,
+    "save_response_key": "partial_batch_1",
+    "assert_assigned_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
+    "wait_after": 1,
+},
+{
+    "name": "S8.3 schedule second partial batch before confirm should keep first batch frozen",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 11:02:00",
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [
+            {
+                "taskId": "PARTIAL_BATCH2_LINE1",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE1-20260121",
+                "planIndex": 2,
+                "inLine": "L1C17",
+                "outLine": "L1C1",
+                "skus": [{"skuId": "1RAT000002", "quantity": 1}],
+            },
+            {
+                "taskId": "PARTIAL_BATCH2_LINE2",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE2-20260121",
+                "planIndex": 2,
+                "inLine": "L2C17",
+                "outLine": "L2C1",
+                "skus": [{"skuId": "1RAK000006", "quantity": 1}],
+            },
+        ],
     },
-    {
-        "name": "S6.35 cleanup pending before empty-skid scheduling",
-        "method": "CLEAN_PENDING",
-        "wait_after": 1,
+    "assert_assigned_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
+    "wait_after": 1,
+},
+{
+    "name": "S8.4 pending should contain first partial batch",
+    "method": "GET",
+    "endpoint": "/task/pending",
+    "assert_pending_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
+    "wait_after": 1,
+},
+{
+    "name": "S8.5 confirm first partial batch",
+    "method": "MULTI_POST",
+    "endpoint": "/task/feedback",
+    "data_template": {"status": "EXECUTING", "startTime": "2026-01-21T11:03:00Z"},
+    "assigned_source_key": "partial_batch_1",
+    "wait_after": 1,
+},
+{
+    "name": "S8.6 schedule second partial batch after confirm should succeed but keep first batch dispatched",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 11:04:00",
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [
+            {
+                "taskId": "PARTIAL_BATCH2_LINE1",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE1-20260121",
+                "planIndex": 2,
+                "inLine": "L1C17",
+                "outLine": "L1C1",
+                "skus": [{"skuId": "1RAT000002", "quantity": 1}],
+            },
+            {
+                "taskId": "PARTIAL_BATCH2_LINE2",
+                "taskType": "OUTBOUND",
+                "planId": "PLAN-LINE2-20260121",
+                "planIndex": 2,
+                "inLine": "L2C17",
+                "outLine": "L2C1",
+                "skus": [{"skuId": "1RAK000006", "quantity": 1}],
+            },
+        ],
     },
-    {
-        "name": "S7 empty-skid outbound request should be scheduled with high priority",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [
-                {
-                    "taskId": "OUTBOUND_EMPTY_SKID_REQ_001",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE1-20260121",
-                    "planIndex": 1,
-                    "inLine": "L1C17",
-                    "outLine": "L2C17",
-                    "skus": [
-                        # empty-skid request: only skid_state=0 is required for detection
-                        {"skuId": "", "quantity": 1, "features": {"skid_state": "0", "skid_type": "0", "color": "W1"}},
-                    ],
-                },
-                {
-                    "taskId": "OUTBOUND_NORMAL_FOR_COMPARE_001",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE1-20260121",
-                    "planIndex": 1,
-                    "inLine": "L1C17",
-                    "outLine": "L1C17",
-                    "skus": [
-                        {"skuId": "1RAT000003", "quantity": 1},
-                    ],
-                },
-            ],
-        },
-        "assert_assigned_task_id": "OUTBOUND_EMPTY_SKID_REQ_001",
-        "wait_after": 1,
+    "assert_assigned_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
+    "wait_after": 1,
+},
+{
+    "name": "S8.7 pending should still contain first partial batch only",
+    "method": "GET",
+    "endpoint": "/task/pending",
+    "assert_pending_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
+    "assert_pending_task_count": 2,
+    "wait_after": 1,
+},
+{
+    "name": "S8.8 complete first partial batch",
+    "method": "MULTI_POST",
+    "endpoint": "/task/feedback",
+    "data_template": {"status": "COMPLETED", "startTime": "2026-01-21T11:05:00Z"},
+    "assigned_source_key": "partial_batch_1",
+    "wait_after": 1,
+},
+{
+    "name": "S8.9 empty task schedule should dispatch queued second batch",
+    "method": "POST",
+    "endpoint": "/schedule/mixed",
+    "data": {
+        "currentTime": "2026-01-21 11:07:00",
+        "currentGroups": BASE_CURRENT_GROUPS,
+        "inventory": [],
+        "aisleStatus": [
+            {
+                "aisleId": "1",
+                "isAvailable": True,
+                "bank": "LEFT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+            {
+                "aisleId": "2",
+                "isAvailable": True,
+                "bank": "RIGHT",
+                "exitCongestion": [
+                    {"lineId": "LINE-1", "isCongested": False},
+                    {"lineId": "LINE-2", "isCongested": False},
+                    {"lineId": "LINE-3", "isCongested": False},
+                ],
+            },
+        ],
+        "tasks": [],
     },
-    {
-        "name": "S7.1 pending queue head should be empty-skid outbound",
-        "method": "GET",
-        "endpoint": "/task/pending",
-        "assert_first_pending_task_id": "OUTBOUND_EMPTY_SKID_REQ_001",
-        "wait_after": 1,
+    "save_response_key": "partial_batch_2",
+    "assert_assigned_task_ids": ["PARTIAL_BATCH2_LINE1", "PARTIAL_BATCH2_LINE2"],
+    "wait_after": 1,
+},
+{
+    "name": "S8.10 pending after empty task schedule should keep second batch only",
+    "method": "GET",
+    "endpoint": "/task/pending",
+    "assert_pending_task_ids": ["PARTIAL_BATCH2_LINE1", "PARTIAL_BATCH2_LINE2"],
+    "assert_pending_task_count": 2,
+    "wait_after": 1,
+},
+{
+    "name": "S8.11 confirm second partial batch",
+    "method": "MULTI_POST",
+    "endpoint": "/task/feedback",
+    "data_template": {"status": "EXECUTING", "startTime": "2026-01-21T11:08:00Z"},
+    "assigned_source_key": "partial_batch_2",
+    "wait_after": 1,
+},
+{
+    "name": "S8.12 complete second partial batch",
+    "method": "MULTI_POST",
+    "endpoint": "/task/feedback",
+    "data_template": {"status": "COMPLETED", "startTime": "2026-01-21T11:09:00Z"},
+    "assigned_source_key": "partial_batch_2",
+    "wait_after": 1,
+},
+{
+    "name": "S9 cleanup pending before appended-plan test",
+    "method": "CLEAN_PENDING",
+    "wait_after": 1,
+},
+{
+    "name": "S9.1 reset base plan before append checks",
+    "method": "POST",
+    "endpoint": "/plan/production",
+    "data": {
+        "operationType": "UPDATE",
+        "planDate": "2026-01-21 09:00:00",
+        "plans": BASE_PRODUCTION_PLAN["plans"],
     },
-    {
-        "name": "S8 cleanup pending before partial-task scheduling test",
-        "method": "CLEAN_PENDING",
-        "wait_after": 1,
+    "wait_after": 1,
+},
+{
+    "name": "S9.2 current plan should match base plan",
+    "method": "GET",
+    "endpoint": "/plan/production",
+    "assert_plan_group_counts": {"1": 6, "2": 2},
+    "assert_plan_boundary_skus": {
+        "1": {"first": "1RAT000001", "last": "1RAT000006"},
+        "2": {"first": "1RAK000005", "last": "1RAK000006"},
     },
-    {
-        "name": "S8.1 reset minimal inventory for partial-task scheduling",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 11:00:00",
-            "productionPlan": BASE_PRODUCTION_PLAN,
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [
-                {"aisleId": "1", "row": 1, "column": 2, "level": 1, "positions": [{"skuId": "1RAT000001", "quantity": 1}]},
-                {"aisleId": "1", "row": 1, "column": 2, "level": 2, "positions": [{"skuId": "1RAT000002", "quantity": 1}]},
-                {"aisleId": "2", "row": 3, "column": 2, "level": 1, "positions": [{"skuId": "1RAK000005", "quantity": 1}]},
-                {"aisleId": "2", "row": 3, "column": 2, "level": 2, "positions": [{"skuId": "1RAK000006", "quantity": 1}]},
-            ],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [],
-        },
-        "assert_assigned_task_count": 0,
-        "wait_after": 1,
+    "wait_after": 1,
+},
+{
+    "name": "S9.3 append extra production plan batch 1",
+    "method": "POST",
+    "endpoint": "/plan/production",
+    "data": APPEND_PRODUCTION_PLAN_1,
+    "wait_after": 1,
+},
+{
+    "name": "S9.4 current plan should keep old groups and append batch 1",
+    "method": "GET",
+    "endpoint": "/plan/production",
+    "assert_plan_group_counts": {"1": 8, "2": 3},
+    "assert_plan_boundary_skus": {
+        "1": {"first": "1RAT000001", "last": "1RAT000012"},
+        "2": {"first": "1RAK000005", "last": "1RAK000011"},
     },
-    {
-        "name": "S8.2 schedule first partial batch",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 11:01:00",
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [
-                {
-                    "taskId": "PARTIAL_BATCH1_LINE1",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE1-20260121",
-                    "planIndex": 1,
-                    "inLine": "L1C17",
-                    "outLine": "L1C17",
-                    "skus": [{"skuId": "1RAT000001", "quantity": 1}],
-                },
-                {
-                    "taskId": "PARTIAL_BATCH1_LINE2",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE2-20260121",
-                    "planIndex": 1,
-                    "inLine": "L2C17",
-                    "outLine": "L2C17",
-                    "skus": [{"skuId": "1RAK000005", "quantity": 1}],
-                },
-            ],
-        },
-        "save_response_key": "partial_batch_1",
-        "assert_assigned_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
-        "wait_after": 1,
+    "wait_after": 1,
+},
+{
+    "name": "S9.5 append extra production plan batch 2",
+    "method": "POST",
+    "endpoint": "/plan/production",
+    "data": APPEND_PRODUCTION_PLAN_2,
+    "wait_after": 1,
+},
+{
+    "name": "S9.6 current plan should keep previous groups and append batch 2",
+    "method": "GET",
+    "endpoint": "/plan/production",
+    "assert_plan_group_counts": {"1": 9, "2": 3},
+    "assert_plan_boundary_skus": {
+        "1": {"first": "1RAT000001", "last": "1RAT000013"},
+        "2": {"first": "1RAK000005", "last": "1RAK000011"},
     },
-    {
-        "name": "S8.3 schedule second partial batch before confirm should keep first batch frozen",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 11:02:00",
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [
-                {
-                    "taskId": "PARTIAL_BATCH2_LINE1",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE1-20260121",
-                    "planIndex": 2,
-                    "inLine": "L1C17",
-                    "outLine": "L1C1",
-                    "skus": [{"skuId": "1RAT000002", "quantity": 1}],
-                },
-                {
-                    "taskId": "PARTIAL_BATCH2_LINE2",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE2-20260121",
-                    "planIndex": 2,
-                    "inLine": "L2C17",
-                    "outLine": "L2C1",
-                    "skus": [{"skuId": "1RAK000006", "quantity": 1}],
-                },
-            ],
-        },
-        "assert_assigned_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.4 pending should contain first partial batch",
-        "method": "GET",
-        "endpoint": "/task/pending",
-        "assert_pending_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.5 confirm first partial batch",
-        "method": "MULTI_POST",
-        "endpoint": "/task/feedback",
-        "data_template": {"status": "EXECUTING", "startTime": "2026-01-21T11:03:00Z"},
-        "assigned_source_key": "partial_batch_1",
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.6 schedule second partial batch after confirm should succeed but keep first batch dispatched",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 11:04:00",
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [
-                {
-                    "taskId": "PARTIAL_BATCH2_LINE1",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE1-20260121",
-                    "planIndex": 2,
-                    "inLine": "L1C17",
-                    "outLine": "L1C1",
-                    "skus": [{"skuId": "1RAT000002", "quantity": 1}],
-                },
-                {
-                    "taskId": "PARTIAL_BATCH2_LINE2",
-                    "taskType": "OUTBOUND",
-                    "planId": "PLAN-LINE2-20260121",
-                    "planIndex": 2,
-                    "inLine": "L2C17",
-                    "outLine": "L2C1",
-                    "skus": [{"skuId": "1RAK000006", "quantity": 1}],
-                },
-            ],
-        },
-        "assert_assigned_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.7 pending should still contain first partial batch only",
-        "method": "GET",
-        "endpoint": "/task/pending",
-        "assert_pending_task_ids": ["PARTIAL_BATCH1_LINE1", "PARTIAL_BATCH1_LINE2"],
-        "assert_pending_task_count": 2,
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.8 complete first partial batch",
-        "method": "MULTI_POST",
-        "endpoint": "/task/feedback",
-        "data_template": {"status": "COMPLETED", "startTime": "2026-01-21T11:05:00Z"},
-        "assigned_source_key": "partial_batch_1",
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.9 empty task schedule should dispatch queued second batch",
-        "method": "POST",
-        "endpoint": "/schedule/mixed",
-        "data": {
-            "currentTime": "2026-01-21 11:07:00",
-            "currentGroups": BASE_CURRENT_GROUPS,
-            "inventory": [],
-            "aisleStatus": [
-                {
-                    "aisleId": "1",
-                    "isAvailable": True,
-                    "bank": "LEFT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-                {
-                    "aisleId": "2",
-                    "isAvailable": True,
-                    "bank": "RIGHT",
-                    "exitCongestion": [
-                        {"lineId": "LINE-1", "isCongested": False},
-                        {"lineId": "LINE-2", "isCongested": False},
-                        {"lineId": "LINE-3", "isCongested": False},
-                    ],
-                },
-            ],
-            "tasks": [],
-        },
-        "save_response_key": "partial_batch_2",
-        "assert_assigned_task_ids": ["PARTIAL_BATCH2_LINE1", "PARTIAL_BATCH2_LINE2"],
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.10 pending after empty task schedule should keep second batch only",
-        "method": "GET",
-        "endpoint": "/task/pending",
-        "assert_pending_task_ids": ["PARTIAL_BATCH2_LINE1", "PARTIAL_BATCH2_LINE2"],
-        "assert_pending_task_count": 2,
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.11 confirm second partial batch",
-        "method": "MULTI_POST",
-        "endpoint": "/task/feedback",
-        "data_template": {"status": "EXECUTING", "startTime": "2026-01-21T11:08:00Z"},
-        "assigned_source_key": "partial_batch_2",
-        "wait_after": 1,
-    },
-    {
-        "name": "S8.12 complete second partial batch",
-        "method": "MULTI_POST",
-        "endpoint": "/task/feedback",
-        "data_template": {"status": "COMPLETED", "startTime": "2026-01-21T11:09:00Z"},
-        "assigned_source_key": "partial_batch_2",
-        "wait_after": 1,
-    },
-    {
-        "name": "S9 cleanup pending before appended-plan test",
-        "method": "CLEAN_PENDING",
-        "wait_after": 1,
-    },
-    {
-        "name": "S9.1 reset base plan before append checks",
-        "method": "POST",
-        "endpoint": "/plan/production",
-        "data": {
-            "operationType": "UPDATE",
-            "planDate": "2026-01-21 09:00:00",
-            "plans": BASE_PRODUCTION_PLAN["plans"],
-        },
-        "wait_after": 1,
-    },
-    {
-        "name": "S9.2 current plan should match base plan",
-        "method": "GET",
-        "endpoint": "/plan/production",
-        "assert_plan_group_counts": {"1": 6, "2": 2},
-        "assert_plan_boundary_skus": {
-            "1": {"first": "1RAT000001", "last": "1RAT000006"},
-            "2": {"first": "1RAK000005", "last": "1RAK000006"},
-        },
-        "wait_after": 1,
-    },
-    {
-        "name": "S9.3 append extra production plan batch 1",
-        "method": "POST",
-        "endpoint": "/plan/production",
-        "data": APPEND_PRODUCTION_PLAN_1,
-        "wait_after": 1,
-    },
-    {
-        "name": "S9.4 current plan should keep old groups and append batch 1",
-        "method": "GET",
-        "endpoint": "/plan/production",
-        "assert_plan_group_counts": {"1": 8, "2": 3},
-        "assert_plan_boundary_skus": {
-            "1": {"first": "1RAT000001", "last": "1RAT000012"},
-            "2": {"first": "1RAK000005", "last": "1RAK000011"},
-        },
-        "wait_after": 1,
-    },
-    {
-        "name": "S9.5 append extra production plan batch 2",
-        "method": "POST",
-        "endpoint": "/plan/production",
-        "data": APPEND_PRODUCTION_PLAN_2,
-        "wait_after": 1,
-    },
-    {
-        "name": "S9.6 current plan should keep previous groups and append batch 2",
-        "method": "GET",
-        "endpoint": "/plan/production",
-        "assert_plan_group_counts": {"1": 9, "2": 3},
-        "assert_plan_boundary_skus": {
-            "1": {"first": "1RAT000001", "last": "1RAT000013"},
-            "2": {"first": "1RAK000005", "last": "1RAK000011"},
-        },
-        "wait_after": 1,
-    },
+    "wait_after": 1,
+},
 ]
 
 
 class APITester:
     def __init__(self, base_url: str):
+        """初始化对象依赖、配置和运行时状态。
+
+        Args:
+            self: 当前对象实例。
+            base_url: 用于本函数处理的 `base_url` 参数。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         self.base_url = base_url.rstrip("/")
         self.api_url = f"{self.base_url}{API_PREFIX}"
         self.session = requests.Session()
         self.saved_data: Dict[str, Any] = {}
 
     def cleanup_pending_tasks(self) -> None:
+        """执行 cleanup 待处理 tasks 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+
+        Returns:
+            None: 处理后的结果。
+        """
         pending_url = f"{self.api_url}/task/pending"
         feedback_url = f"{self.api_url}/task/feedback"
         print("\n" + "=" * 80)
@@ -1151,6 +1275,15 @@ class APITester:
                 print(f"cleanup request error: {e}")
 
     def execute_scenario(self, scenario: Dict[str, Any]) -> bool:
+        """执行 execute scenario 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            scenario: 用于本函数处理的 `scenario` 参数。
+
+        Returns:
+            bool: 处理后的结果。
+        """
         print("\n" + "=" * 80)
         print(f"Run: {scenario['name']}")
         print("=" * 80)
@@ -1357,6 +1490,16 @@ class APITester:
         return True
 
     def _execute_multi_post(self, scenario: Dict[str, Any], url: str) -> bool:
+        """执行 execute multi post 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            scenario: 用于本函数处理的 `scenario` 参数。
+            url: 用于本函数处理的 `url` 参数。
+
+        Returns:
+            bool: 处理后的结果。
+        """
         assigned_key = str(scenario.get("assigned_source_key") or "assigned_tasks")
         assigned = self.saved_data.get(assigned_key, {})
         task_items = []
@@ -1395,6 +1538,15 @@ class APITester:
         return success > 0
 
     def run_all(self, scenarios: List[Dict[str, Any]]) -> bool:
+        """执行 run all 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            scenarios: 用于本函数处理的 `scenarios` 参数。
+
+        Returns:
+            bool: 处理后的结果。
+        """
         total = len(scenarios)
         print(f"Base URL: {self.api_url}")
         print(f"Scenarios: {total}")
@@ -1419,6 +1571,11 @@ class APITester:
 
 
 def build_scenarios() -> List[Dict[str, Any]]:
+    """构建scenarios相关逻辑。
+
+    Returns:
+        List[Dict[str, Any]]: 处理后的结果。
+    """
     cfg = load_config()
     match_fields = load_match_fields(cfg)
     outbound_feature_fields_by_line = load_outbound_feature_fields_by_line(cfg)
@@ -1436,7 +1593,15 @@ def build_scenarios() -> List[Dict[str, Any]]:
     return scenarios
 
 
+# ==========================================================================
+# 主函数：API 回归场景执行入口
+# ==========================================================================
 def main() -> int:
+    """执行模块的主入口流程。
+
+    Returns:
+        int: 处理后的结果。
+    """
     parser = argparse.ArgumentParser(description="Warehouse API flow test")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help=f"default: {DEFAULT_BASE_URL}")
     parser.add_argument("--log-file", default="", help="log file path; default auto-generate under logs/")

@@ -8,32 +8,45 @@
 
 import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 import pandas as pd
 import pytz
 
 
-def to_ts(val) -> pd.Timestamp:
-    """将时间值转为带时区的 Timestamp（北京时间），失败返回 NaT"""
+def to_ts(val: Any) -> Optional[pd.Timestamp]:
+    """将单元格时间转换为带北京时间时区的时间戳。
+
+    Args:
+        val: Excel/CSV 单元格中的时间值或原始字符串。
+
+    Returns:
+        带 ``Asia/Shanghai`` 时区的时间；空值或无法解析时返回 ``None``。
+    """
     try:
         china_tz = pytz.timezone('Asia/Shanghai')
-        if isinstance(val, pd.Timestamp):
-            dt = val
-        else:
-            dt = pd.to_datetime(val, errors='coerce')
-        if pd.isna(dt):
-            return pd.NaT
+        dt = val if isinstance(val, pd.Timestamp) else pd.to_datetime(val, errors="coerce")
+        # 表格单元格应只解析为单个 Timestamp，数组、索引和 NaT 都视为无效时间。
+        if not isinstance(dt, pd.Timestamp) or pd.isna(dt):
+            return None
         if dt.tzinfo is None:
             dt = china_tz.localize(dt)
         else:
             dt = dt.tz_convert(china_tz)
-        return dt
+        # pytz.localize 的静态返回类型是 datetime；统一封装为 pandas Timestamp。
+        return cast(pd.Timestamp, pd.Timestamp(dt))
     except Exception:
-        return pd.NaT
+        return None
 
 
 def _base_sku(code_raw) -> str:
-    """取 '/' 前的部分作为 SKU 基码，去空白；非字符串则转成字符串后处理。"""
+    """取 '/' 前的部分作为 SKU 基码，去空白；非字符串则转成字符串后处理。
+
+    Args:
+        code_raw (Any): 供当前处理流程使用的 `code_raw` 值。
+
+    Returns:
+        str: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     if isinstance(code_raw, str):
         return code_raw.split("/")[0].strip()
     if pd.isna(code_raw):
@@ -42,14 +55,24 @@ def _base_sku(code_raw) -> str:
 
 
 def load_inbound_table_with_details(path: Path, arrival_col: str, beam_cols: List[str]) -> List[Tuple[pd.Timestamp, List[str], dict]]:
-    """
-    加载完整的入库表，包含所有原始信息
+    """加载完整的入库表，包含所有原始信息
     返回: [(arrival_time, [beam_codes], original_row_dict), ...]
+
+    Args:
+        path (Path): 需要读取、写入或检查的文件路径。
+        arrival_col (str): 供当前处理流程使用的 `arrival_col` 值。
+        beam_cols (List[str]): 供当前处理流程使用的 `beam_cols` 值。
+
+    Returns:
+        List[Tuple[pd.Timestamp, List[str], dict]]: 当前处理得到的文本标识、格式化结果或诊断信息。
     """
     df = pd.read_excel(path) if path.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(path)
     inbound_rows: List[Tuple[pd.Timestamp, List[str], dict]] = []
     for _, row in df.iterrows():
         ts = to_ts(row.get(arrival_col))
+        if ts is None:
+            # 无到达时间的入库记录不能与出库创建时间比较，跳过以免污染排序结果。
+            continue
         beams: List[str] = []
         for col in beam_cols:
             base = _base_sku(row.get(col))
@@ -60,21 +83,31 @@ def load_inbound_table_with_details(path: Path, arrival_col: str, beam_cols: Lis
 
 
 def load_outbound_table(path: Path, creation_col: str, sku_cols: List[str]) -> List[Tuple[pd.Timestamp, List[str], int]]:
-    """
-    返回按创建时间排序的任务列表: (creation_time, sku_list, row_idx)
+    """返回按创建时间排序的任务列表: (creation_time, sku_list, row_idx)
+
+    Args:
+        path (Path): 需要读取、写入或检查的文件路径。
+        creation_col (str): 供当前处理流程使用的 `creation_col` 值。
+        sku_cols (List[str]): 供当前处理流程使用的 `sku_cols` 值。
+
+    Returns:
+        List[Tuple[pd.Timestamp, List[str], int]]: 当前处理得到的文本标识、格式化结果或诊断信息。
     """
     df = pd.read_excel(path) if path.suffix.lower() in [".xlsx", ".xls"] else pd.read_csv(path)
     # 添加缺失值处理，对时间列进行前向填充
-    df[creation_col] = df[creation_col].fillna(method='ffill')
+    df[creation_col] = df[creation_col].ffill()
     tasks: List[Tuple[pd.Timestamp, List[str], int]] = []
     for idx, row in df.iterrows():
         ct = to_ts(row.get(creation_col))
+        if ct is None:
+            continue
         skus: List[str] = []
         for col in sku_cols:
             base = _base_sku(row.get(col))
             if base:
                 skus.append(base)
-        tasks.append((ct, skus, idx + 1))
+        # 原始 DataFrame 索引可能是字符串；使用当前任务数量生成稳定的展示行号。
+        tasks.append((ct, skus, len(tasks) + 1))
     tasks.sort(key=lambda x: x[0])
     return tasks
 
@@ -82,35 +115,42 @@ def load_outbound_table(path: Path, creation_col: str, sku_cols: List[str]) -> L
 def simulate_check_and_track_usage(inbound_rows: List[Tuple[pd.Timestamp, List[str], dict]],
                                    outbound_tasks: List[Tuple[pd.Timestamp, List[str], int]],
                                    prefer_latest: bool = False) -> List[Tuple[int, List[int], pd.Timestamp]]:
-    """
-    完全模拟原始验证过程，跟踪每个出库任务实际使用的入库记录
+    """完全模拟原始验证过程，跟踪每个出库任务实际使用的入库记录
     prefer_latest=False 时，为每个 SKU 选择"最早但不晚于创建时间"的入库记录（正向遍历出库任务）。
     返回: [(inbound_row_index, [used_beam_indices], usage_time), ...]（顺序按处理出库任务的遍历顺序）
+
+    Args:
+        inbound_rows (List[Tuple[pd.Timestamp, List[str], dict]]): 供当前处理流程使用的 `inbound_rows` 值。
+        outbound_tasks (List[Tuple[pd.Timestamp, List[str], int]]): 用于当前计算的任务列表。
+        prefer_latest (bool，可选): 供当前处理流程使用的 `prefer_latest` 值。
+
+    Returns:
+        List[Tuple[int, List[int], pd.Timestamp]]: 符合当前筛选或计算条件的结果集合。
     """
     from bisect import bisect_right
     # 构建 inbound 字典，记录每个 SKU 的所有入库时间和对应行信息
     inbound_records: Dict[str, List[Tuple[pd.Timestamp, int, int]]] = {}  # {sku: [(time, row_idx, beam_idx)]}
-    
+
     for row_idx, (arrival_time, beams, _) in enumerate(inbound_rows):
         for beam_idx, beam in enumerate(beams):
             if beam not in inbound_records:
                 inbound_records[beam] = []
             inbound_records[beam].append((arrival_time, row_idx, beam_idx))
-    
+
     # 对每个SKU的记录按时间排序（从早到晚）
     for beam in inbound_records:
         inbound_records[beam].sort(key=lambda x: x[0])
-    
+
     # 记录实际使用的入库记录
     actual_usage: List[Tuple[int, List[int], pd.Timestamp]] = []  # [(row_idx, [beam_indices], usage_time)]
-    
+
     # 按顺序处理出库任务，模拟 check_consistency 的逻辑
     for ct, skus, _ in outbound_tasks:
         used_in_this_task: Dict[int, List[int]] = {}  # {row_idx: [beam_indices]}
-        
+
         for sku in skus:
             records = inbound_records.get(sku, [])
-            if not records or pd.isna(ct):
+            if not records:
                 continue
 
             if prefer_latest:
@@ -131,17 +171,18 @@ def simulate_check_and_track_usage(inbound_rows: List[Tuple[pd.Timestamp, List[s
                 # 消费掉这条记录
                 records.pop(idx)
                 inbound_records[sku] = records
-        
+
         # 将本次任务的使用情况加入总使用记录
         for row_idx, beam_indices in used_in_this_task.items():
             actual_usage.append((row_idx, beam_indices, ct))
-    
+
     return actual_usage
 
 
-def fmt_ts(ts: pd.Timestamp) -> str:
+def fmt_ts(ts: Optional[pd.Timestamp]) -> str:
+    """将入库记录或出库任务时间格式化为北京时间字符串。"""
     try:
-        if pd.isna(ts):
+        if ts is None:
             return ""
         return ts.tz_convert(pytz.timezone('Asia/Shanghai')).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -153,40 +194,40 @@ def clean_inbound_records(inbound_rows: List[Tuple[pd.Timestamp, List[str], dict
                          beam_cols: List[str]) -> List[dict]:
     """
     根据实际使用情况清理入库记录
-    
+
     Args:
         inbound_rows: 入库数据 [(arrival_time, [beams], original_row_dict)]
         actual_usage: 实际使用情况 [(inbound_row_index, [used_beam_indices], usage_time)]
         beam_cols: 纵梁列名列表
-    
+
     Returns:
         清理后的行数据列表
     """
     # 统计每个入库行被使用的beam以及使用时间
     used_beams_per_row: Dict[int, List[int]] = {}
     usage_times_per_beam: Dict[int, Dict[int, pd.Timestamp]] = {}  # {row_idx: {beam_idx: usage_time}}
-    
+
     for row_idx, beam_indices, usage_time in actual_usage:
         if row_idx not in used_beams_per_row:
             used_beams_per_row[row_idx] = []
             usage_times_per_beam[row_idx] = {}
-            
+
         for beam_idx in beam_indices:
             if beam_idx not in used_beams_per_row[row_idx]:
                 used_beams_per_row[row_idx].append(beam_idx)
                 usage_times_per_beam[row_idx][beam_idx] = usage_time
-    
+
     # 记录处理统计信息
     total_rows = len(inbound_rows)
     removed_rows = 0
     partial_cleaned_rows = 0
-    
+
     # 创建一个新数据列表用于存储结果
     cleaned_rows = []
-    
+
     for idx, (arrival_time, beams, original_row) in enumerate(inbound_rows):
         used_beam_indices = used_beams_per_row.get(idx, [])
-        
+
         # 如果至少有一个纵梁需要保留
         if used_beam_indices:
             new_row = original_row.copy()
@@ -199,7 +240,7 @@ def clean_inbound_records(inbound_rows: List[Tuple[pd.Timestamp, List[str], dict
                     partial_cleaned_rows += 1
                 # 如果两个都被使用，保持原样
                 # 如果都不被使用（理论上不可能走到这里），也保持原样
-            
+
             # 添加使用时间列
             for i in range(len(beams)):
                 if i in usage_times_per_beam.get(idx, {}):
@@ -207,69 +248,79 @@ def clean_inbound_records(inbound_rows: List[Tuple[pd.Timestamp, List[str], dict
                     new_row[f"{beam_cols[i]}使用时间"] = fmt_ts(usage_time)
                 else:
                     new_row[f"{beam_cols[i]}使用时间"] = ""
-            
+
             cleaned_rows.append(new_row)
         else:
             # 所有纵梁都不需要保留，整行删除
             removed_rows += 1
-    
+
     print(f"原始记录数: {total_rows}")
     print(f"删除整行记录数: {removed_rows}")
     print(f"部分清理记录数(只保留一个纵梁): {partial_cleaned_rows}")
     print(f"保留记录数: {len(cleaned_rows)}")
-    
+
     return cleaned_rows
 
 
 def main():
     # ===== 配置：如需调整路径/列名，修改下方常量 =====
     # 使用绝对路径或相对于当前工作目录的路径
+    """作为脚本入口，解析运行参数并按既定顺序调用本文件的主要处理流程。
+
+    输入：无显式业务输入；依赖实例字段或模块配置。
+
+    Args:
+        None: 无显式业务参数；使用实例状态或模块配置。
+
+    Returns:
+        None: 通过实例状态、队列或外部副作用完成处理。
+    """
     inbound_table = Path("simulation/data/aisle_allocation2.xlsx")
     outbound_table = Path("simulation/data/production_plan.xlsx")
-    
+
     # 确保路径存在
     if not inbound_table.exists():
         print(f"警告: 入库表文件不存在: {inbound_table}")
         return
-    
+
     if not outbound_table.exists():
         print(f"警告: 出库表文件不存在: {outbound_table}")
         return
-        
+
     arrival_col = "到达时间"  # 入库记录中的到货时间列名
     beam_cols = ["纵梁A", "纵梁B"]  # 入库记录中的纵梁代码列名
     creation_col = "开始时间"  # 出库任务中的创建时间列名
     outbound_sku_cols = ["零件号（左主）", "零件号（左副）", "零件号（右主）", "零件号（右副）"]  # 出库任务中的SKU列名
     # ===============================================
-    
+
     # 加载数据
     print("正在加载入库数据...")
     inbound_rows = load_inbound_table_with_details(inbound_table, arrival_col=arrival_col, beam_cols=beam_cols)
     print(f"加载入库记录 {len(inbound_rows)} 条")
-    
+
     print("正在加载出库数据...")
     outbound_tasks = load_outbound_table(outbound_table, creation_col=creation_col, sku_cols=outbound_sku_cols)
     print(f"加载出库任务 {len(outbound_tasks)} 个")
-    
+
     # 模拟验证过程并跟踪实际使用情况
     print("正在分析实际使用的纵梁（正向遍历，选用最早但不晚于创建时间的入库记录）...")
     actual_usage = simulate_check_and_track_usage(inbound_rows, outbound_tasks, prefer_latest=False)
     print(f"发现实际使用的入库记录数: {len(actual_usage)}")
-    
+
     # 清理入库记录
     print("正在清理未使用的入库记录...")
     cleaned_rows = clean_inbound_records(inbound_rows, actual_usage, beam_cols)
-    
+
     # 保存结果
     output_file = inbound_table.parent / f"{inbound_table.stem}_cleaned{inbound_table.suffix}"
-    
+
     if cleaned_rows:
         df_cleaned = pd.DataFrame(cleaned_rows)
         if output_file.suffix.lower() in [".xlsx", ".xls"]:
             df_cleaned.to_excel(output_file, index=False)
         else:
             df_cleaned.to_csv(output_file, index=False)
-        
+
         print(f"清理完成！结果已保存至: {output_file}")
     else:
         print("没有需要保留的记录")

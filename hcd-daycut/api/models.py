@@ -3,8 +3,14 @@ Pydantic 数据模型定义
 基于 API接口字段说明文档 定义所有请求/响应模型
 """
 
+"""API 边界的 Pydantic 请求与响应模型。
+
+路由层用本模块将外部 JSON 规范化为服务层输入；服务层再转换为内部任务与货位。
+SKU 附加属性校验读取仓库 ``match_fields``，使 API 接收条件与库存配对一致。
+"""
+
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 import json
 from pathlib import Path
 from enum import Enum
@@ -19,19 +25,29 @@ else:
     root_validator = None
 
 if not hasattr(BaseModel, "model_dump"):
-    BaseModel.model_dump = BaseModel.dict
+    # Pydantic v1 没有 model_dump；以运行时属性兼容 v2 调用点。
+    setattr(BaseModel, "model_dump", BaseModel.dict)
 
-from config_loader import load_jsonc
+from config_loader import get_runtime_root, load_jsonc
 
 
 _MATCH_FIELDS: Optional[List[str]] = None
 
 
 def _load_match_fields() -> List[str]:
+    """懒加载 SKU 匹配字段并缓存，避免每个请求重复读取仓库配置。
+
+    Args:
+        None: 无显式业务参数；使用实例状态或模块配置。
+
+    Returns:
+        List[str]: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     global _MATCH_FIELDS
     if _MATCH_FIELDS is not None:
         return _MATCH_FIELDS
-    config_path = Path(__file__).resolve().parents[1] / "config" / "warehouse.json"
+    # 打包后 API 模块位于 _internal；配置仍应从 exe 同级 config 读取。
+    config_path = get_runtime_root() / "config" / "warehouse.json"
     try:
         cfg = load_jsonc(config_path)
         _MATCH_FIELDS = list(cfg.get("match_fields", []) or [])
@@ -52,6 +68,15 @@ class SkuAttrsMixin(BaseModel):
             extra = "allow"
 
     def _check_match_fields(self):
+        # 库存位置以同一属性集合判断配对，缺字段会使后续匹配语义不确定。
+        """执行 `_check_match_fields` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：无显式业务输入；依赖实例字段或模块配置。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        """
         match_fields = _load_match_fields()
         if not match_fields:
             return self
@@ -67,10 +92,29 @@ class SkuAttrsMixin(BaseModel):
     if model_validator is not None:
         @model_validator(mode="after")
         def _validate_match_fields(self):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            输入：无显式业务输入；依赖实例字段或模块配置。
+
+            Args:
+                None: 无显式业务参数；使用实例状态或模块配置。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             return self._check_match_fields()
     else:
+        assert root_validator is not None
         @root_validator(skip_on_failure=True)
-        def _validate_match_fields(cls, values):
+        def _validate_match_fields_v1(cls, values):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            Args:
+                values (Any): 待解析、格式化或计算的原始值集合。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             instance = cls.construct(**values)
             instance._check_match_fields()
             return values
@@ -82,42 +126,58 @@ class SkuAttrsMixin(BaseModel):
 
 class TaskType(str, Enum):
     """任务类型枚举"""
-    INBOUND = "INBOUND"           # 入库货位分配
-    INBOUND_AISLE = "INBOUND_AISLE"  # 入库巷道选择
-    OUTBOUND = "OUTBOUND"         # 出库
+    # 入库货位分配
+    INBOUND = "INBOUND"
+    # 入库巷道选择
+    INBOUND_AISLE = "INBOUND_AISLE"
+    # 出库
+    OUTBOUND = "OUTBOUND"
 
 
 class TaskStatus(str, Enum):
     """任务状态枚举"""
-    PENDING = "PENDING"           # 待执行
-    EXECUTING = "EXECUTING"       # 执行中
-    COMPLETED = "COMPLETED"       # 已完成
-    FAILED = "FAILED"             # 失败
+    # 待执行
+    PENDING = "PENDING"
+    # 执行中
+    EXECUTING = "EXECUTING"
+    # 已完成
+    COMPLETED = "COMPLETED"
+    # 失败
+    FAILED = "FAILED"
 
 
 class ScheduleStatus(str, Enum):
     """调度状态枚举"""
-    SUCCESS = "SUCCESS"           # 成功
-    PARTIAL_SUCCESS = "PARTIAL_SUCCESS"  # 部分成功
-    FAILED = "FAILED"             # 失败
+    # 成功
+    SUCCESS = "SUCCESS"
+    # 部分成功
+    PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
+    # 失败
+    FAILED = "FAILED"
 
 
 class OperationType(str, Enum):
     """操作类型枚举"""
-    ADD = "ADD"                   # 新增
-    UPDATE = "UPDATE"             # 更新
+    # 新增
+    ADD = "ADD"
+    # 更新
+    UPDATE = "UPDATE"
 
 
 class BankType(str, Enum):
     """库区类型枚举"""
-    LEFT = "LEFT"                 # 左库
-    RIGHT = "RIGHT"               # 右库
+    # 左库
+    LEFT = "LEFT"
+    # 右库
+    RIGHT = "RIGHT"
 
 
 class ShelfPosition(str, Enum):
     """货架位置枚举"""
-    UPPER = "UPPER"               # 上层
-    LOWER = "LOWER"               # 下层
+    # 上层
+    UPPER = "UPPER"
+    # 下层
+    LOWER = "LOWER"
 
 
 class BeamSide(str, Enum):
@@ -128,9 +188,12 @@ class BeamSide(str, Enum):
 
 class UnavailableReason(str, Enum):
     """巷道不可用原因"""
-    MAINTENANCE = "MAINTENANCE"   # 维护
-    ERROR = "ERROR"               # 故障
-    OCCUPIED = "OCCUPIED"         # 被占用
+    # 维护
+    MAINTENANCE = "MAINTENANCE"
+    # 故障
+    ERROR = "ERROR"
+    # 被占用
+    OCCUPIED = "OCCUPIED"
 
 
 # ============================================================
@@ -142,6 +205,14 @@ class SkuInfo(SkuAttrsMixin):
     skuId: str = Field(..., description="货物ID")
     quantity: int = Field(..., ge=0, description="货物数量（0表示空货位，1表示有货）")
     beamSide: Optional[BeamSide] = Field(None, description="单梁左右位置，仅单梁入库时使用")
+    inboundTime: Optional[Union[float, str]] = Field(
+        None,
+        description="库存同步时该 SKU 的实际入库时间：Unix 秒时间戳或 ISO 8601 字符串；用于 FIFO 排序",
+    )
+    arrivalTime: Optional[Union[float, str]] = Field(
+        None,
+        description="inboundTime 的兼容别名；同时传入时以 inboundTime 为准",
+    )
 
     inLine: Optional[int] = Field(None, ge=1, description="入库线/入库口编号(入库任务可选)")
 
@@ -228,6 +299,14 @@ class ScheduleTaskRequest(BaseModel):
     }
 
     def _check_single_beam_requirements(self):
+        """执行 `_check_single_beam_requirements` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：无显式业务输入；依赖实例字段或模块配置。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        """
         if self.taskType == TaskType.INBOUND and len(self.skus) == 1 and self.skus[0].quantity > 0:
             if self.skus[0].beamSide is None:
                 raise ValueError("single inbound SKU requires beamSide")
@@ -236,10 +315,29 @@ class ScheduleTaskRequest(BaseModel):
     if model_validator is not None:
         @model_validator(mode="after")
         def _validate_single_beam_requirements(self):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            输入：无显式业务输入；依赖实例字段或模块配置。
+
+            Args:
+                None: 无显式业务参数；使用实例状态或模块配置。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             return self._check_single_beam_requirements()
     else:
+        assert root_validator is not None
         @root_validator(skip_on_failure=True)
-        def _validate_single_beam_requirements(cls, values):
+        def _validate_single_beam_requirements_v1(cls, values):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            Args:
+                values (Any): 待解析、格式化或计算的原始值集合。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             task_type = values.get("taskType")
             skus = values.get("skus") or []
             if task_type == TaskType.INBOUND and len(skus) == 1 and getattr(skus[0], "quantity", 0) > 0:
@@ -552,6 +650,14 @@ class TaskFeedbackRequest(BaseModel):
     }
 
     def _check_failure_reason(self):
+        """执行 `_check_failure_reason` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：无显式业务输入；依赖实例字段或模块配置。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        """
         if self.status == TaskStatus.FAILED and not (self.failureReason or "").strip():
             raise ValueError("failureReason is required when status is FAILED")
         return self
@@ -559,10 +665,29 @@ class TaskFeedbackRequest(BaseModel):
     if model_validator is not None:
         @model_validator(mode="after")
         def _validate_failure_reason(self):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            输入：无显式业务输入；依赖实例字段或模块配置。
+
+            Args:
+                None: 无显式业务参数；使用实例状态或模块配置。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             return self._check_failure_reason()
     else:
+        assert root_validator is not None
         @root_validator(skip_on_failure=True)
-        def _validate_failure_reason(cls, values):
+        def _validate_failure_reason_v1(cls, values):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            Args:
+                values (Any): 待解析、格式化或计算的原始值集合。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             if values.get("status") == TaskStatus.FAILED and not (values.get("failureReason") or "").strip():
                 raise ValueError("failureReason is required when status is FAILED")
             return values
@@ -629,6 +754,14 @@ class InboundTaskRequest(BaseModel):
     }
 
     def _check_single_beam_requirements(self):
+        """执行 `_check_single_beam_requirements` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：无显式业务输入；依赖实例字段或模块配置。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        """
         if len(self.skus) == 1 and self.skus[0].quantity > 0:
             if self.skus[0].beamSide is None:
                 raise ValueError("single inbound SKU requires beamSide")
@@ -637,10 +770,29 @@ class InboundTaskRequest(BaseModel):
     if model_validator is not None:
         @model_validator(mode="after")
         def _validate_single_beam_requirements(self):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            输入：无显式业务输入；依赖实例字段或模块配置。
+
+            Args:
+                None: 无显式业务参数；使用实例状态或模块配置。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             return self._check_single_beam_requirements()
     else:
+        assert root_validator is not None
         @root_validator(skip_on_failure=True)
-        def _validate_single_beam_requirements(cls, values):
+        def _validate_single_beam_requirements_v1(cls, values):
+            """校验输入数据的完整性和业务约束，并在不满足时给出验证结果。
+
+            Args:
+                values (Any): 待解析、格式化或计算的原始值集合。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             skus = values.get("skus") or []
             if len(skus) == 1 and getattr(skus[0], "quantity", 0) > 0:
                 if getattr(skus[0], "beamSide", None) is None:
@@ -1010,4 +1162,3 @@ class BomUpdateResponse(BaseModel):
             }
         }
     }
-

@@ -3,6 +3,12 @@ FastAPI应用入口
 仓库调度系统API服务
 """
 
+"""FastAPI 应用装配入口。
+
+应用启动时创建进程级 ``WarehouseService`` 与反馈状态机；两者只驻留当前服务
+进程，重启后需由外部系统重新同步库存、任务和生产计划。
+"""
+
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -10,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from .routes import schedule_router, feedback_router, inbound_router, bom_router
+from .logging_setup import create_uvicorn_log_config
 from .services.warehouse_service import init_warehouse_service, get_warehouse_service
 from .state import reset_task_state_manager
 from .services.warehouse_service import reset_warehouse_service
@@ -20,15 +27,23 @@ API_VERSION = "1.0.0"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """初始化进程级服务对象，并在关闭阶段保留日志钩子。
+
+    Args:
+        app (FastAPI): 供当前处理流程使用的 `app` 值。
+
+    Returns:
+        None: 通过实例状态、队列或外部副作用完成处理。
+    """
     """应用生命周期管理"""
     # 启动时初始化
     print("[API] 初始化仓库调度服务...")
     init_warehouse_service()
     reset_task_state_manager()
     print("[API] 服务初始化完成")
-    
+
     yield
-    
+
     # 关闭时清理
     print("[API] 关闭仓库调度服务...")
 
@@ -63,8 +78,13 @@ app = FastAPI(
 - **产线 ID**: `1`, `2`, `3`
 
 ### 注意事项
-- 每次发出调度指令后，必须等待外部系统返回 **EXECUTING** 状态的反馈
-- 只有收到确认后才能处理下一个调度请求（否则返回 409 冲突）
+- `assignedTask` 是本轮优先推荐；实际可执行任务以 `executableTasksByAisle` 为准
+- 已下发任务应通过 `/api/v1/task/feedback` 回传 EXECUTING、COMPLETED 或 FAILED
+- `/api/v1/task/unconfirmed` 可按巷道查询 can_executing、pending 与 running 状态
+
+### 5. BOM 配置
+- `POST /api/v1/bom/update`：更新完整 SKU/BOM 配置
+- `GET /api/v1/bom/config`：查询当前进程正在使用的 SKU/BOM 配置
 """,
     version=API_VERSION,
     lifespan=lifespan,
@@ -95,7 +115,15 @@ app.include_router(bom_router, prefix="/api/v1")
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
-    """请求参数验证失败（422）"""
+    """请求参数验证失败（422）
+
+    Args:
+        request (Any): 本次 HTTP 请求对应的 Pydantic 请求对象。
+        exc (Any): 供当前处理流程使用的 `exc` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     errors = exc.errors()
     details = []
     for err in errors:
@@ -113,7 +141,15 @@ async def validation_exception_handler(request, exc):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
-    """HTTP异常处理"""
+    """HTTP异常处理
+
+    Args:
+        request (Any): 本次 HTTP 请求对应的 Pydantic 请求对象。
+        exc (Any): 供当前处理流程使用的 `exc` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -126,7 +162,15 @@ async def http_exception_handler(request, exc):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
-    """通用异常处理"""
+    """通用异常处理
+
+    Args:
+        request (Any): 本次 HTTP 请求对应的 Pydantic 请求对象。
+        exc (Any): 供当前处理流程使用的 `exc` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     return JSONResponse(
         status_code=500,
         content={
@@ -143,7 +187,14 @@ async def general_exception_handler(request, exc):
 
 @app.get("/", tags=["基础"])
 async def root():
-    """根路径"""
+    """根路径
+
+    Args:
+        None: 无显式业务参数；使用实例状态或模块配置。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     return {
         "status": "SUCCESS",
         "message": "仓库调度系统 API 服务正常",
@@ -158,7 +209,14 @@ async def root():
 
 @app.get("/api/v1/status", tags=["基础"])
 async def system_status():
-    """获取系统状态（调试接口）"""
+    """获取系统状态（调试接口）
+
+    Args:
+        None: 无显式业务参数；使用实例状态或模块配置。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     try:
         service = get_warehouse_service()
         return {
@@ -185,10 +243,13 @@ async def system_status():
 if os.getenv("WMS_ENABLE_DEBUG_RESET") == "1":
     @app.post("/api/v1/debug/reset", tags=["调试"])
     async def debug_reset():
-        """
-        Reset in-memory warehouse service + task state.
+        """Reset in-memory warehouse service + task state.
 
         This endpoint exists for automated tests and local debugging only.
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
         """
         reset_warehouse_service()
         init_warehouse_service()
@@ -207,6 +268,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        log_level="info"
+        log_level="info",
+        log_config=create_uvicorn_log_config(),
     )
 

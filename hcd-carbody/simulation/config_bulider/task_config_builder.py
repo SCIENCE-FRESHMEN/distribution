@@ -1,3 +1,5 @@
+"""将任务记录整理为仿真初始化所需的配置数据。"""
+
 import json
 import re
 from pathlib import Path
@@ -7,6 +9,9 @@ import pandas as pd
 import pytz
 
 
+# ==========================================================================
+# 主类：源表读取、任务配置构建与 JSON 导出
+# ==========================================================================
 class TaskConfigBuilder:
     PRODUCTION_CODE_TO_LINE = {
         "WB1": 1,
@@ -34,6 +39,17 @@ class TaskConfigBuilder:
         inbound_source_path: str = "simulation/data/inbound_task.xlsx",
         include_blocked_inbound_skus: bool = False,
     ):
+        """初始化对象依赖、配置和运行时状态。
+
+        Args:
+            self: 当前对象实例。
+            outbound_source_path: 用于本函数处理的 `outbound_source_path` 参数。
+            inbound_source_path: 用于本函数处理的 `inbound_source_path` 参数。
+            include_blocked_inbound_skus: 用于本函数处理的 `include_blocked_inbound_skus` 参数。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         self.outbound_source_path = outbound_source_path
         self.inbound_source_path = inbound_source_path
         self.include_blocked_inbound_skus = bool(include_blocked_inbound_skus)
@@ -45,7 +61,18 @@ class TaskConfigBuilder:
         self._skipped_rows = 0
 
     @staticmethod
+    # ==========================================================================
+    # 辅助函数：字段归一化、列识别和 SKU 规则处理
+    # ==========================================================================
     def _to_seconds(val) -> Optional[float]:
+        """执行 to seconds 对应的业务处理。
+
+        Args:
+            val: 用于本函数处理的 `val` 参数。
+
+        Returns:
+            Optional[float]: 处理后的结果。
+        """
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return None
         try:
@@ -66,6 +93,14 @@ class TaskConfigBuilder:
 
     @staticmethod
     def _to_str(val) -> Optional[str]:
+        """执行 to str 对应的业务处理。
+
+        Args:
+            val: 用于本函数处理的 `val` 参数。
+
+        Returns:
+            Optional[str]: 处理后的结果。
+        """
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return None
         text = str(val).strip()
@@ -73,6 +108,14 @@ class TaskConfigBuilder:
 
     @staticmethod
     def _parse_int_like(val) -> Optional[int]:
+        """执行 parse int like 对应的业务处理。
+
+        Args:
+            val: 用于本函数处理的 `val` 参数。
+
+        Returns:
+            Optional[int]: 处理后的结果。
+        """
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return None
         try:
@@ -92,6 +135,16 @@ class TaskConfigBuilder:
 
     @staticmethod
     def _normalize_port_key(val, default_col: int = 1, fallback: str = "L1C1") -> str:
+        """标准化port key相关逻辑。
+
+        Args:
+            val: 用于本函数处理的 `val` 参数。
+            default_col: 用于本函数处理的 `default_col` 参数。
+            fallback: 用于本函数处理的 `fallback` 参数。
+
+        Returns:
+            str: 处理后的结果。
+        """
         text = str(val).strip() if val is not None else ""
         if not text:
             return fallback
@@ -108,6 +161,14 @@ class TaskConfigBuilder:
 
     @staticmethod
     def _read_table(path: str) -> pd.DataFrame:
+        """执行 read table 对应的业务处理。
+
+        Args:
+            path: 输入或输出文件路径。
+
+        Returns:
+            pd.DataFrame: 处理后的结果。
+        """
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Input file not found: {path}")
@@ -120,6 +181,15 @@ class TaskConfigBuilder:
 
     @staticmethod
     def _find_col_exact(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+        """查找col exact相关逻辑。
+
+        Args:
+            df: 用于本函数处理的 `df` 参数。
+            names: 用于本函数处理的 `names` 参数。
+
+        Returns:
+            Optional[str]: 处理后的结果。
+        """
         for n in names:
             if n in df.columns:
                 return n
@@ -127,6 +197,15 @@ class TaskConfigBuilder:
 
     @staticmethod
     def _find_col_contains(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
+        """查找col contains相关逻辑。
+
+        Args:
+            df: 用于本函数处理的 `df` 参数。
+            keywords: 用于本函数处理的 `keywords` 参数。
+
+        Returns:
+            Optional[str]: 处理后的结果。
+        """
         lower_map = {str(c).lower(): c for c in df.columns}
         for k in keywords:
             lk = k.lower()
@@ -137,6 +216,15 @@ class TaskConfigBuilder:
 
     @classmethod
     def _is_blocked_inbound_sku(cls, sku: str) -> bool:
+        """判断blocked 入库 sku相关逻辑。
+
+        Args:
+            cls: 当前类对象。
+            sku: 用于本函数处理的 `sku` 参数。
+
+        Returns:
+            bool: 判断结果。
+        """
         s = str(sku).strip()
         if not s:
             return True
@@ -153,6 +241,15 @@ class TaskConfigBuilder:
 
     @staticmethod
     def _build_outbound_sku10(car_body_id: str, skid_state_val: Optional[str]) -> str:
+        """构建出库 sku10相关逻辑。
+
+        Args:
+            car_body_id: 用于本函数处理的 `car_body_id` 参数。
+            skid_state_val: 用于本函数处理的 `skid_state_val` 参数。
+
+        Returns:
+            str: 处理后的结果。
+        """
         body = str(car_body_id).strip()
         body_tail9 = body[-9:] if len(body) > 9 else body
         if len(body_tail9) < 9:
@@ -175,6 +272,20 @@ class TaskConfigBuilder:
         color_col: Optional[str],
         role: str,
     ) -> List[dict]:
+        """执行 collect skus 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            row: 用于本函数处理的 `row` 参数。
+            car_body_col: 用于本函数处理的 `car_body_col` 参数。
+            skid_state_col: 用于本函数处理的 `skid_state_col` 参数。
+            skid_type_col: 用于本函数处理的 `skid_type_col` 参数。
+            color_col: 用于本函数处理的 `color_col` 参数。
+            role: 用于本函数处理的 `role` 参数。
+
+        Returns:
+            List[dict]: 处理后的结果。
+        """
         if not car_body_col:
             return []
 
@@ -196,7 +307,7 @@ class TaskConfigBuilder:
         if color_val:
             features["color"] = color_val
         skid_type_val = self._to_str(row.get(skid_type_col)) if skid_type_col else None
-        # Inbound fallback: infer skid_type from the first digit of RFID/car body id.
+        # 入库回退处理：从 RFID 或车身编号的首位推断 skid_type。
         # Example: "0..." -> short skid, "1..." -> long skid.
         if skid_type_val is None and role == "inbound":
             raw_text = str(raw_sku).strip()
@@ -214,7 +325,16 @@ class TaskConfigBuilder:
         return skus
 
     def _resolve_columns(self, df: pd.DataFrame) -> dict:
-        # use unicode escapes to avoid source-encoding issues
+        # 使用 Unicode 转义，避免源文件编码差异造成问题。
+        """执行 resolve columns 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            df: 用于本函数处理的 `df` 参数。
+
+        Returns:
+            dict: 处理后的结果。
+        """
         col_type = self._find_col_exact(df, ["type", "task_type", "\u7c7b\u578b"])
         col_car_body = self._find_col_exact(df, ["\u8f66\u8eab\u7f16\u53f7", "RFID", "rfid"])
         if col_car_body is None:
@@ -229,7 +349,7 @@ class TaskConfigBuilder:
         col_start = self._find_col_exact(df, ["\u5f00\u59cb\u65f6\u95f4", "start_time"])
         col_color = self._find_col_exact(df, ["\u989c\u8272", "color"])
         col_skid_state = self._find_col_exact(df, ["\u6ed1\u6a47\u72b6\u6001", "skid_state"])  # 滑橇状态
-        col_skid_type = self._find_col_exact(df, ["\u6ed1\u6a47\u7c7b\u578b", "skid_type", "skidType"]) 
+        col_skid_type = self._find_col_exact(df, ["\u6ed1\u6a47\u7c7b\u578b", "skid_type", "skidType"])
 
         return {
             "type": col_type,
@@ -246,6 +366,17 @@ class TaskConfigBuilder:
         }
 
     def _process_df(self, df: pd.DataFrame, forced_role: str, sort_by: Optional[str] = None):
+        """处理df相关逻辑。
+
+        Args:
+            self: 当前对象实例。
+            df: 用于本函数处理的 `df` 参数。
+            forced_role: 用于本函数处理的 `forced_role` 参数。
+            sort_by: 用于本函数处理的 `sort_by` 参数。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         if sort_by and sort_by in df.columns:
             df = df.sort_values([sort_by])
 
@@ -306,7 +437,19 @@ class TaskConfigBuilder:
                 self.outbound_creation_times[line_key].append(task_time)
                 self.outbound_out_lines[line_key].append(out_line)
 
+    # ==========================================================================
+    # 主函数：任务配置构建与导出
+    # ==========================================================================
     def build(self, sort_by: Optional[str] = None):
+        """执行 build 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            sort_by: 用于本函数处理的 `sort_by` 参数。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         self.inbound_records = []
         self.outbound_plan = {}
         self.outbound_creation_times = {}
@@ -320,6 +463,14 @@ class TaskConfigBuilder:
         return self
 
     def to_dict(self):
+        """执行 to dict 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         return {
             "inbound_records": self.inbound_records,
             "production_plan": self.outbound_plan,
@@ -332,6 +483,16 @@ class TaskConfigBuilder:
         inbound_path: str = "simulation/data/inbound_task_config.json",
         outbound_path: str = "simulation/data/outbound_task_config.json",
     ):
+        """执行 save split json 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            inbound_path: 用于本函数处理的 `inbound_path` 参数。
+            outbound_path: 用于本函数处理的 `outbound_path` 参数。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         Path(inbound_path).parent.mkdir(parents=True, exist_ok=True)
         Path(outbound_path).parent.mkdir(parents=True, exist_ok=True)
 

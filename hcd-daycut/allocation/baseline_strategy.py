@@ -1,5 +1,8 @@
-"""
-Baseline Strategy
+"""基线入库巷道与货位分配策略。
+
+模块用于与改进策略进行同条件仿真比较。它读取 ``WarehouseCore`` 的库存、BOM
+和 pending 入库队列，在副本上检查容量后返回巷道或货位；不直接写库存或任务
+状态，正式状态修改仍由核心或 API 服务完成。
 """
 
 from typing import List, Dict, Optional, Tuple
@@ -8,7 +11,6 @@ import sys
 sys.path.append('..')
 from simulation.position import InventoryPosition
 from simulation.task_data import TaskData
-from simulation.config_bulider.sku_config_builder import SKUConfigBuilder
 
 class BaselineAisleAllocator:
     """
@@ -16,29 +18,52 @@ class BaselineAisleAllocator:
     """
 
     def __init__(self, warehouse_core):
+        """初始化对象的运行状态和依赖对象，使实例可被调用方继续使用。
+
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         self.warehouse_core = warehouse_core
         self.aisles = warehouse_core.aisles
         self.match_fields = getattr(warehouse_core, 'match_fields', [])
         self.used_roadway_list = [] # 需要外部维护或每次从core获取
 
         # 配置加载
-        self.config_data = SKUConfigBuilder.load_json("simulation/data/sku_config.json")
-        self.sku_pairs = self.config_data["sku_pairs"]
-        self.sku_solo = self.config_data["sku_solo"]
+        self.sku_pairs = getattr(warehouse_core, "sku_pairs", {}) or {}
+        self.sku_solo = getattr(warehouse_core, "sku_solo", {}) or {}
         self.position_allocator = BaselinePositionAllocator(warehouse_core)
 
     def _extract_attrs(self, sku_entry: Optional[Dict]) -> Dict:
+        """从复合对象中提取目标字段，统一不同输入格式的读取方式。
+
+        输入：sku_entry（Optional[Dict]）
+        输出：Dict
+
+        """
         if not self.match_fields or not isinstance(sku_entry, dict):
             return {}
         return {k: sku_entry.get(k) for k in self.match_fields}
 
     def _get_sku_attrs(self, skus_data: List[Dict], sku_id: str) -> Dict:
+        """读取并返回指定条件下的状态、对象或计算结果，不主动改变业务状态。
+
+        输入：skus_data（List[Dict]）、sku_id（str）
+        输出：Dict
+
+        """
         for entry in skus_data or []:
             if isinstance(entry, dict) and entry.get('skuId') == sku_id:
                 return self._extract_attrs(entry)
         return {}
 
     def _attrs_equal(self, attrs_a: Optional[Dict], attrs_b: Optional[Dict]) -> bool:
+        """执行 `_attrs_equal` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：attrs_a（Optional[Dict]）、attrs_b（Optional[Dict]）
+        输出：bool
+
+        """
         if not self.match_fields:
             return True
         if attrs_a is None or attrs_b is None:
@@ -50,6 +75,11 @@ class BaselineAisleAllocator:
 
     def _build_task_for_simulation(self, skus_data: List[Dict], aisle: int,
                                    task_id: Optional[str] = None) -> TaskData:
+        """构造下游调用所需的对象、请求载荷或配置结果。
+
+        输出：TaskData
+
+        """
         return TaskData(
             task_id=task_id or f"SIM_INBOUND_{aisle}",
             task_type="INBOUND",
@@ -61,6 +91,12 @@ class BaselineAisleAllocator:
                                allocated_positions: List[InventoryPosition],
                                sku_count: int,
                                non_null_idx: int) -> Optional[str]:
+        """执行 `_resolve_inbound_layer` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：pos（InventoryPosition）、allocated_positions（List[InventoryPosition]）、sku_count（int）、non_null_idx（int）
+        输出：Optional[str]
+
+        """
         if pos.is_double_layer and sku_count > 1:
             if len(allocated_positions) == 2:
                 if allocated_positions[0] == allocated_positions[1]:
@@ -89,6 +125,12 @@ class BaselineAisleAllocator:
 
     def _apply_simulated_inbound(self, allocated_positions: List[InventoryPosition],
                                  skus_data: List[Dict]) -> bool:
+        """执行 `_apply_simulated_inbound` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：allocated_positions（List[InventoryPosition]）、skus_data（List[Dict]）
+        输出：bool
+
+        """
         sku_entries = [s for s in skus_data if isinstance(s, dict)]
         sku_ids = [s.get('skuId') for s in sku_entries if s.get('skuId') is not None]
         non_null_idx = 0
@@ -131,6 +173,11 @@ class BaselineAisleAllocator:
                                   inventory_positions: List[InventoryPosition],
                                   skus_data: List[Dict],
                                   current_task_id: Optional[str] = None) -> bool:
+        """在货位副本上依次模拟前序 pending 入库和当前任务的可落位性。
+
+        返回值仅表示巷道是否还能承接，不把推演结果写回真实库存。
+
+        """
         aisle_positions = [deepcopy(p) for p in inventory_positions if p.aisle == aisle]
         if not aisle_positions:
             return False
@@ -138,6 +185,7 @@ class BaselineAisleAllocator:
         pending_by_aisle = getattr(self.warehouse_core, 'pending_inbound_by_aisle', {}) or {}
         pending_tasks = list(pending_by_aisle.get(aisle, []))
 
+        # pending 队列顺序决定先后占位；当前任务只能使用其后的剩余空间。
         for pending_task in pending_tasks:
             if current_task_id and getattr(pending_task, 'task_id', None) == current_task_id:
                 continue
@@ -158,8 +206,8 @@ class BaselineAisleAllocator:
 
     def allocate(self, task_info: TaskData,
                 inventory_positions: List[InventoryPosition]) -> Optional[int]:
-        """
-        对应 Java: allocateLocation 方法
+        """对应 Java: allocateLocation 方法
+
         """
         try:
             task_id = getattr(task_info, 'task_id', None)
@@ -173,7 +221,7 @@ class BaselineAisleAllocator:
             else:
                 print(f"[WARN][allocator] BaselineAisleAllocator: no skus, return None task={task_id}")
                 return None
-            
+
             if not skus_data:
                 print(f"[WARN][allocator] BaselineAisleAllocator: empty skus, return None task={task_id}")
                 return None
@@ -186,16 +234,18 @@ class BaselineAisleAllocator:
             # 2. 分支处理
             # 对应 Java: if (beamCodeA != null && beamCodeB != null)
             if len(sku_ids) == 2:
-                sku1, sku2 = sku_ids       
+                sku1, sku2 = sku_ids
                 # 模拟 Java: isSingleMatch 判断
 
                 attrs1 = self._get_sku_attrs(skus_data, sku1)
                 attrs2 = self._get_sku_attrs(skus_data, sku2)
                 is_match = self._is_match_sku(sku1, sku2) and self._attrs_equal(attrs1, attrs2)
-                
+
                 if is_match:
                     # 对应 allocateEmptyLocationForMatchedBeam
-                    result = self._allocate_empty_location_for_matched_beam(sku1, sku2, inventory_positions, skus_data, task_id)
+                    result = self._allocate_empty_location_for_matched_beam(
+                        sku1, sku2, inventory_positions, attrs1, attrs2, skus_data, task_id
+                    )
                 else:
                     # 对应 allocateForNotMatched
                     result = self._allocate_for_not_matched(sku1, sku2, inventory_positions, attrs1, attrs2, skus_data, task_id)
@@ -225,14 +275,14 @@ class BaselineAisleAllocator:
             return None
 
     def _is_single_layer_sku(self, sku: str) -> bool:
-        """
-        判断是否为单层梁 SKU。
+        """判断是否为单层梁 SKU。
         逻辑：在 sku_solo 列表中，或者在 sku_pairs 中但配对是自己，或者不在配对表中(视为独立)
+
         """
         # 如果明确在 solo 列表
         if sku in self.sku_solo:
             return True
-        
+
         # 如果在配对列表
         if sku in self.sku_pairs:
             # 配对是自己 -> 单层梁
@@ -240,12 +290,14 @@ class BaselineAisleAllocator:
                 return True
             # 配对是别人 -> 双层梁 (Dual Beam)
             return False
-            
+
         # 默认情况: 如果既不在pairs也不在solo，通常视为单层梁(独立)
         return True
 
     def _is_match_sku(self, sku1: str, sku2: str) -> bool:
-        """辅助判断：是否配对"""
+        """辅助判断：是否配对
+
+        """
         # 严格配对：sku1 的 mate 是 sku2
         return self.sku_pairs.get(sku1) == sku2
 
@@ -253,9 +305,9 @@ class BaselineAisleAllocator:
                      sku_location_list: List[InventoryPosition],
                      available_roadway_list: List[int],
                      used_roadway_list: List[int]) -> List[int]:
-        """
-        对应 Java: roadwayRank 方法
+        """对应 Java: roadwayRank 方法
         完全复刻排序逻辑：Used -> BOM Asc -> Empty Desc
+
         """
         # 1. sku 计数
         seen_ids = set()
@@ -270,7 +322,7 @@ class BaselineAisleAllocator:
         for loc in unique_sku_locs:
             if loc.aisle in bom_count_map:
                 bom_count_map[loc.aisle] += 1
-        
+
         # 2. Empty 计数
         empty_count_map = {r: 0 for r in available_roadway_list}
         for loc in empty_location_list:
@@ -278,10 +330,18 @@ class BaselineAisleAllocator:
                 empty_count_map[loc.aisle] += 1
 
         def rank_key(roadway_id):
-            is_used = roadway_id in used_roadway_list 
+            """执行 `rank_key` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+            Args:
+                roadway_id (Any): 当前对象的唯一标识。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
+            is_used = roadway_id in used_roadway_list
             bom_count = bom_count_map.get(roadway_id, 0)
             empty_count = empty_count_map.get(roadway_id, 0)
-            
+
             # Python sort 是升序
             # 1. used: False(0) < True(1) -> 未使用优先
             # 2. bom: 小 < 大 -> 分散库存
@@ -293,18 +353,16 @@ class BaselineAisleAllocator:
     def _allocate_for_not_matched(self, sku1: str, sku2: str, inventory_positions: List[InventoryPosition],
                                   attrs1: Optional[Dict] = None, attrs2: Optional[Dict] = None,
                                   skus_data: Optional[List[Dict]] = None, task_id: Optional[str] = None) -> Optional[int]:
-        """
-        对应 Java: allocateForNotMatched
+        """对应 Java: allocateForNotMatched
+
         """
         empty_location_list = [p for p in inventory_positions if p.is_empty()]
-        
+
         # 模拟 findBomLocationList
         sku_location_list = []
         for p in inventory_positions:
             if p.is_empty(): continue
-            av_skus = p.get_available_skus()
-            
-            if sku1 in av_skus:
+            if p.matches_sku(sku1, attrs1, self.match_fields):
                 sku_location_list.append(p)
 
         ranked_roadway_list = self._roadway_rank(
@@ -338,61 +396,66 @@ class BaselineAisleAllocator:
             return better_result_list[0]
         if good_result_list:
             return good_result_list[0]
-            
+
         return None
 
     def _allocate_empty_location_for_matched_beam(self, sku1: str, sku2: str, inventory_positions: List[InventoryPosition],
-                                                  skus_data: Optional[List[Dict]] = None, task_id: Optional[str] = None) -> Optional[int]:
-        """
-        对应 Java: allocateEmptyLocationForMatchedBeam
+                                                   attrs1: Optional[Dict] = None, attrs2: Optional[Dict] = None,
+                                                   skus_data: Optional[List[Dict]] = None, task_id: Optional[str] = None) -> Optional[int]:
+        """对应 Java: allocateEmptyLocationForMatchedBeam
+
         """
         empty_location_list = [p for p in inventory_positions if p.is_empty()]
         # 配对成功的BOM Location逻辑
-        sku_location_list = [p for p in inventory_positions 
-                            if not p.is_empty() and (sku1 in p.get_available_skus())]
-        
+        sku_location_list = [
+            p for p in inventory_positions
+            if not p.is_empty() and p.matches_sku(sku1, attrs1, self.match_fields)
+        ]
+
         ranked_roadway_list = self._roadway_rank(
             empty_location_list, sku_location_list, self.aisles, self.used_roadway_list
         )
-        
+
         # 只在empty里找
         for roadway_id in ranked_roadway_list:
             if self._can_accept_task_in_aisle(roadway_id, inventory_positions, skus_data or [], task_id):
                 return roadway_id
-        
+
         return None
 
     def _allocate_single_for_beam_code(self, sku: str, inventory_positions: List[InventoryPosition],
                                        preferred_side: Optional[str] = None, sku_attrs: Optional[Dict] = None,
                                        skus_data: Optional[List[Dict]] = None, task_id: Optional[str] = None) -> Optional[int]:
-        """
-        Corresponds to Java: allocateSingleForBeamCodeA
+        """Corresponds to Java: allocateSingleForBeamCodeA
+
         """
         empty_location_list = [p for p in inventory_positions if p.is_empty()]
-        
-        sku_location_list = [p for p in inventory_positions 
-                            if not p.is_empty() and sku in p.get_available_skus()]
+
+        sku_location_list = [
+            p for p in inventory_positions
+            if not p.is_empty() and p.matches_sku(sku, sku_attrs, self.match_fields)
+        ]
 
         ranked_roadway_list = self._roadway_rank(
             empty_location_list, sku_location_list, self.aisles, self.used_roadway_list
         )
-        
+
         best_result_list = []   # 找到 LOW 位
         better_result_list = [] # 只找到 HIGH 位
-        
+
         # 确定尝试顺序：preferred_side 优先
         sides_to_try = []
         if preferred_side in ('A', 'B'):
             sides_to_try.append(preferred_side)
         # 添加另一个侧边
         sides_to_try += [s for s in ('A', 'B') if s not in sides_to_try]
-        
+
         for roadway_id in ranked_roadway_list:
             if not self._can_accept_task_in_aisle(roadway_id, inventory_positions, skus_data or [], task_id):
                 continue
             found_placement = False
             found_low = False
-            
+
             # 按优先级尝试两侧
             for side in sides_to_try:
                 result = self._allocate_single_in_roadway(sku, roadway_id, inventory_positions, side=side, sku_attrs=sku_attrs)
@@ -413,50 +476,56 @@ class BaselineAisleAllocator:
             return best_result_list[0]
         if better_result_list:
             return better_result_list[0]
-        
+
         return None
 
     def _allocate_single_in_roadway(self, sku: str, roadway_id: int,
                                   inventory_positions: List[InventoryPosition], side: str,
                                   sku_attrs: Optional[Dict] = None) -> Optional[str]:
-        """
-        通用单SKU在指定巷道查找逻辑
+        """通用单SKU在指定巷道查找逻辑
         Side A -> Row 1 (Odd)
         Side B -> Row 2 (Even)
         Returns: 'LOW', 'HIGH', or None
+
         """
         target_row = 1 if side == 'A' else 2
-        
+
         # 1. 尝试 LOW
         if sku in self.sku_solo:
             for pos in inventory_positions:
-                if (pos.aisle == roadway_id and 
-                    pos.row == target_row and 
+                if (pos.aisle == roadway_id and
+                    pos.row == target_row and
                     pos.is_empty()):
                     return 'HIGH'
         target_sku_for_match = self.sku_pairs.get(sku)
-        
+
         if target_sku_for_match:
             for pos in inventory_positions:
-                if (pos.aisle == roadway_id and 
-                    pos.row == target_row and 
+                if (pos.aisle == roadway_id and
+                    pos.row == target_row and
                     not pos.is_empty() and
                     pos.matches_sku(target_sku_for_match, sku_attrs, self.match_fields)):
-                    
+
                     # 检查是否有空间 (Stock状态)
                     if pos.has_space() and pos.can_place_sku('lower'):
                         return 'LOW'
 
         # 2. 尝试 HIGH
         for pos in inventory_positions:
-            if (pos.aisle == roadway_id and 
-                pos.row == target_row and 
+            if (pos.aisle == roadway_id and
+                pos.row == target_row and
                 pos.is_empty()):
                 return 'HIGH'
-                
+
         return None
 
     def _get_position_id(self, location: InventoryPosition) -> str:
+        """读取并返回指定条件下的状态、对象或计算结果，不主动改变业务状态。
+
+        输入：location（InventoryPosition）
+        输出：str
+
+        """
         return f"{location.aisle}-{location.row}-{location.column}-{location.level}"
 
 
@@ -466,24 +535,47 @@ class BaselinePositionAllocator:
     """
 
     def __init__(self, warehouse_core):
+        """初始化对象的运行状态和依赖对象，使实例可被调用方继续使用。
+
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         self.warehouse_core = warehouse_core
-        self.config_data = SKUConfigBuilder.load_json("simulation/data/sku_config.json")
-        self.sku_pairs = self.config_data["sku_pairs"]
-        self.sku_solo = self.config_data["sku_solo"]
+        self.sku_pairs = getattr(warehouse_core, "sku_pairs", {}) or {}
+        self.sku_solo = getattr(warehouse_core, "sku_solo", {}) or {}
         self.match_fields = getattr(warehouse_core, 'match_fields', [])
 
     def _extract_attrs(self, sku_entry: Optional[Dict]) -> Dict:
+        """从复合对象中提取目标字段，统一不同输入格式的读取方式。
+
+        输入：sku_entry（Optional[Dict]）
+        输出：Dict
+
+        """
         if not self.match_fields or not isinstance(sku_entry, dict):
             return {}
         return {k: sku_entry.get(k) for k in self.match_fields}
 
     def _get_sku_attrs(self, skus_data: List[Dict], sku_id: str) -> Dict:
+        """读取并返回指定条件下的状态、对象或计算结果，不主动改变业务状态。
+
+        输入：skus_data（List[Dict]）、sku_id（str）
+        输出：Dict
+
+        """
         for entry in skus_data or []:
             if isinstance(entry, dict) and entry.get('skuId') == sku_id:
                 return self._extract_attrs(entry)
         return {}
 
     def _resolve_single_beam_side(self, skus_data: List[Dict], sku_slots: List[Optional[str]]) -> Optional[str]:
+        """执行 `_resolve_single_beam_side` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：skus_data（List[Dict]）、sku_slots（List[Optional[str]]）
+        输出：Optional[str]
+
+        """
         for entry in skus_data or []:
             if not isinstance(entry, dict) or not entry.get("skuId"):
                 continue
@@ -508,6 +600,12 @@ class BaselinePositionAllocator:
                 return "A"
         return None
     def _attrs_equal(self, attrs_a: Optional[Dict], attrs_b: Optional[Dict]) -> bool:
+        """执行 `_attrs_equal` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：attrs_a（Optional[Dict]）、attrs_b（Optional[Dict]）
+        输出：bool
+
+        """
         if not self.match_fields:
             return True
         if attrs_a is None or attrs_b is None:
@@ -517,9 +615,14 @@ class BaselinePositionAllocator:
                 return False
         return True
 
-    def allocate(self, inventory_positions: List[InventoryPosition], 
-                 task_info: TaskData, 
+    def allocate(self, inventory_positions: List[InventoryPosition],
+                 task_info: TaskData,
                  current_position: Optional[InventoryPosition] = None) -> List[InventoryPosition]:
+        """执行 `allocate` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输出：List[InventoryPosition]
+
+        """
         task_id = getattr(task_info, 'task_id', None)
         if task_id is None and isinstance(task_info, dict):
             task_id = task_info.get('task_id') or task_info.get('id')
@@ -557,16 +660,34 @@ class BaselinePositionAllocator:
         return result
 
     def _is_single_layer_sku(self, sku: str) -> bool:
+        """根据输入状态和业务规则返回布尔判断结果。
+
+        输入：sku（str）
+        输出：bool
+
+        """
         if sku in self.sku_solo: return True
         if sku in self.sku_pairs:
             return self.sku_pairs[sku] == sku
         return True
 
     def _is_match_sku(self, sku1: str, sku2: str) -> bool:
+        """根据输入状态和业务规则返回布尔判断结果。
+
+        输入：sku1（str）、sku2（str）
+        输出：bool
+
+        """
         return self.sku_pairs.get(sku1) == sku2
 
     def _allocate_matched_positions(self, positions: List[InventoryPosition], sku1: str, sku2: str) -> List[InventoryPosition]:
         # 找第一个空货位
+        """执行 `_allocate_matched_positions` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：positions（List[InventoryPosition]）、sku1（str）、sku2（str）
+        输出：List[InventoryPosition]
+
+        """
         for pos in positions:
             if pos.is_empty():
                 return [pos, pos]
@@ -574,19 +695,29 @@ class BaselinePositionAllocator:
 
     def _allocate_not_matched_positions(self, positions: List[InventoryPosition], sku1: str, sku2: str,
                                         attrs1: Optional[Dict] = None, attrs2: Optional[Dict] = None) -> List[InventoryPosition]:
+        """执行 `_allocate_not_matched_positions` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输出：List[InventoryPosition]
+
+        """
         pos1, _ = self._find_best_in_side(positions, sku1, 'A', sku_attrs=attrs1)
-        
+
         if not pos1:
             return []
         pos2, _ = self._find_best_in_side(positions, sku2, 'B', sku_attrs=attrs2)
-        
+
         if pos1 and pos2:
             return [pos1, pos2]
-            
+
         return []
 
     def _allocate_single_position(self, positions: List[InventoryPosition], sku: str, side: str,
                                   sku_attrs: Optional[Dict] = None) -> List[InventoryPosition]:
+        """执行 `_allocate_single_position` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输出：List[InventoryPosition]
+
+        """
         pos, _ = self._find_best_in_side(positions, sku, side, sku_attrs=sku_attrs)
         if pos:
             return [pos]
@@ -594,35 +725,38 @@ class BaselinePositionAllocator:
 
     def _find_best_in_side(self, positions: List[InventoryPosition], sku: str, side: str,
                            sku_attrs: Optional[Dict] = None) -> Tuple[Optional[InventoryPosition], Optional[str]]:
-        """
-        在指定侧查找，并过滤掉 excluded 列表中的位置。
+        """在指定侧查找，并过滤掉 excluded 列表中的位置。
         Returns: (Position, Status['LOW'|'HIGH'|None])
+
         """
         target_row = 1 if side == 'A' else 2
-        
+
         # 1. 优先找 Stock (LOW)
-    
+
         target_sku_for_match = self.sku_pairs.get(sku)
 
         # 过滤候选：行符合 + 不在排除列表中
         candidates = [p for p in positions if p.row == target_row]
-        # 排序: layer, col desc
-        candidates.sort(key=lambda p: (p.level, -p.column))
+        # 保守策略仍先选低层；同层货位按照配置指定的列号模式消除并列。
+        candidates.sort(key=lambda p: (
+            p.level,
+            *self.warehouse_core.get_position_column_preference_key(p.aisle, p.column),
+        ))
         if sku in self.sku_solo:
             for pos in candidates:
                 if pos.is_empty():
                     return pos, 'HIGH'
-            
+
         if target_sku_for_match:
             for pos in candidates:
-                if (not pos.is_empty() and 
-                    pos.matches_sku(target_sku_for_match, sku_attrs, self.match_fields) and 
+                if (not pos.is_empty() and
+                    pos.matches_sku(target_sku_for_match, sku_attrs, self.match_fields) and
                     pos.can_place_sku('lower')):
                     return pos, 'LOW'
-                
+
         # 2. 其次找 Empty (HIGH)
         for pos in candidates:
             if pos.is_empty():
                 return pos, 'HIGH'
-                
+
         return None, None

@@ -2,18 +2,43 @@
 任务执行反馈接口路由
 """
 
+"""任务反馈与执行前调整路由。
+
+路由将外部 EXECUTING、COMPLETED、FAILED 转换为服务层状态迁移；调整路由在
+执行前变更入库巷道、SKU 或位置，并返回校验后冻结的位置。
+"""
+
+import logging
+
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
+from typing import Any, Dict, Union
 
 from ..models import ApiResponse, TaskFeedbackRequest, TaskAdjustRequest, TaskStatus
 from ..services.warehouse_service import WarehouseService, get_warehouse_service
 from ..state import TaskStateManager, get_task_state_manager
 
 router = APIRouter(prefix="/task", tags=["任务反馈"])
+logger = logging.getLogger("api.business")
 
 
 
+# ============================================================================
+# 辅助函数：反馈位置与调整失败响应构造
+# ============================================================================
 def _failed_adjust_response(task_id: str, reason: str) -> JSONResponse:
+    """执行 `_failed_adjust_response` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    输入：task_id（str）、reason（str）
+    输出：JSONResponse
+
+    Args:
+        task_id (str): 任务唯一标识。
+        reason (str): 供当前处理流程使用的 `reason` 值。
+
+    Returns:
+        JSONResponse: 封装处理结果或错误信息的 HTTP 响应。
+    """
     status_code = 400
     if "位置冲突" in reason:
         status_code = 409
@@ -25,6 +50,17 @@ def _failed_adjust_response(task_id: str, reason: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=payload.model_dump())
 
 def _build_feedback_position_payload(task_obj):
+    """将冻结内部位置转换为外部行号和 UPPER/LOWER 表达。
+
+    优先使用 ``_api_positions``，确保 mixed、adjust 与 feedback 对同一任务返回
+    一致的位置口径；仅在缓存缺失时根据内部库存位置构造兼容响应。
+
+    Args:
+        task_obj (Any): 当前处理的任务对象。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     frozen_positions = getattr(task_obj, "_api_positions", None)
     if frozen_positions:
         return [dict(position) for position in frozen_positions]
@@ -49,6 +85,12 @@ def _build_feedback_position_payload(task_obj):
     is_outbound_task = getattr(task_obj, "task_type", "") == "OUTBOUND"
 
     def append_position_payload(pos, shelf, sku_id, quantity):
+        """执行 `append_position_payload` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         positions.append(
             {
                 "row": 2 * (pos.aisle - 1) + pos.row,
@@ -110,6 +152,7 @@ def _build_feedback_position_payload(task_obj):
                     else:
                         append_position_payload(pos, None, "", 0)
         else:
+            quantity = 0
             if is_outbound_task:
                 sku_id = getattr(pos, "sku", "") or ""
                 quantity = getattr(pos, "quantity", 0) or 0
@@ -122,7 +165,18 @@ def _build_feedback_position_payload(task_obj):
 
 
 def _build_success_data(warehouse_service: WarehouseService, task_id: str):
-    data = {"taskId": task_id}
+    """构造下游调用所需的对象、请求载荷或配置结果。
+
+    输入：warehouse_service（WarehouseService）、task_id（str）
+
+    Args:
+        warehouse_service (WarehouseService): API 服务实例，负责同步状态、生成调度结果和处理反馈。
+        task_id (str): 任务唯一标识。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
+    data: Dict[str, Any] = {"taskId": task_id}
     running_task = warehouse_service.core.running_tasks.get(task_id)
     if running_task is not None:
         assigned_aisle = getattr(running_task, "assigned_aisle", None)
@@ -132,6 +186,9 @@ def _build_success_data(warehouse_service: WarehouseService, task_id: str):
     return data
 
 
+# ============================================================================
+# 主流程：任务反馈、未确认任务查询和入库调整
+# ============================================================================
 @router.post(
     "/feedback",
     response_model=ApiResponse,
@@ -167,27 +224,34 @@ async def task_feedback(
     warehouse_service: WarehouseService = Depends(get_warehouse_service),
     task_manager: TaskStateManager = Depends(get_task_state_manager),
 ) -> ApiResponse:
-    """
-    任务执行反馈接口
-    
+    """任务执行反馈接口
+
     外部系统报告任务执行状态。
-    
+
     状态说明：
     - EXECUTING: 任务正在执行中（收到此状态表示指令已成功传输）
     - COMPLETED: 任务已完成
     - FAILED: 任务执行失败
+
+    Args:
+        request (TaskFeedbackRequest): 本次 HTTP 请求对应的 Pydantic 请求对象。
+        warehouse_service (WarehouseService，可选): API 服务实例，负责同步状态、生成调度结果和处理反馈。
+        task_manager (TaskStateManager，可选): 任务状态管理器，用于读取和更新 API 任务状态。
+
+    Returns:
+        ApiResponse: 封装处理结果或错误信息的 HTTP 响应。
     """
     task_id = request.taskId
     status = request.status
-    
+
     # 获取任务信息（可能在pending中，也可能不在）
     pending_task = task_manager.get_task(task_id)
-    
+
     try:
         # 根据状态处理
         if status == TaskStatus.EXECUTING:
             # 通知warehouse_core任务正在执行
-            feedback_data = {
+            feedback_data: Dict[str, Any] = {
                 "taskId": task_id,
                 "taskType": request.taskType.value,
                 "status": "EXECUTING",
@@ -199,6 +263,12 @@ async def task_feedback(
                 feedback_data["positions"] = [position.model_dump() for position in request.positions]
             if not warehouse_service.apply_feedback(feedback_data):
                 reason = warehouse_service.get_last_feedback_error() or "任务反馈处理失败"
+                logger.warning(
+                    "event=task_feedback_rejected task_id=%s task_type=%s status=EXECUTING reason=%s",
+                    task_id,
+                    request.taskType.value,
+                    reason,
+                )
                 return ApiResponse(
                     status="FAILED",
                     message=f"反馈处理失败: {task_id}",
@@ -207,14 +277,25 @@ async def task_feedback(
             # 确认任务开始执行 - warehouse侧成功后再清理未确认状态
             if pending_task:
                 task_manager.confirm_task(task_id)
-                print(f"[API] 任务 {task_id} 已确认开始执行")
             notice = warehouse_service.get_last_feedback_notice()
             if notice:
+                logger.info(
+                    "event=task_feedback_success task_id=%s task_type=%s status=EXECUTING notice=%s",
+                    task_id,
+                    request.taskType.value,
+                    notice,
+                )
                 return ApiResponse(
                     status="SUCCESS",
                     message=notice,
                     data=_build_success_data(warehouse_service, task_id),
                 )
+            logger.info(
+                "event=task_feedback_success task_id=%s task_type=%s status=EXECUTING positions=%s",
+                task_id,
+                request.taskType.value,
+                _build_success_data(warehouse_service, task_id).get("positions") or [],
+            )
             return ApiResponse(
                 status="SUCCESS",
                 message="反馈处理成功",
@@ -231,6 +312,12 @@ async def task_feedback(
             }
             if not warehouse_service.apply_feedback(feedback_data):
                 reason = warehouse_service.get_last_feedback_error()
+                logger.warning(
+                    "event=task_feedback_rejected task_id=%s task_type=%s status=COMPLETED reason=%s",
+                    task_id,
+                    request.taskType.value,
+                    reason or "任务反馈处理失败",
+                )
                 return ApiResponse(
                     status="FAILED",
                     message=f"反馈处理失败: {task_id}",
@@ -239,8 +326,7 @@ async def task_feedback(
             # 标记任务完成
             if pending_task:
                 task_manager.complete_task(task_id)
-                print(f"[API] 任务 {task_id} 已完成")
-            
+
         elif status == TaskStatus.FAILED:
             # 通知warehouse_core任务失败
             feedback_data = {
@@ -252,6 +338,12 @@ async def task_feedback(
             }
             if not warehouse_service.apply_feedback(feedback_data):
                 reason = warehouse_service.get_last_feedback_error()
+                logger.warning(
+                    "event=task_feedback_rejected task_id=%s task_type=%s status=FAILED reason=%s",
+                    task_id,
+                    request.taskType.value,
+                    reason or "任务反馈处理失败",
+                )
                 return ApiResponse(
                     status="FAILED",
                     message=f"反馈处理失败: {task_id}",
@@ -260,12 +352,18 @@ async def task_feedback(
             # 标记任务失败
             if pending_task:
                 task_manager.fail_task(task_id)
-                print(f"[API] 任务 {task_id} 执行失败: {request.failureReason}")
-        
+        logger.info(
+            "event=task_feedback_success task_id=%s task_type=%s status=%s reason=%s",
+            task_id,
+            request.taskType.value,
+            status.value,
+            request.failureReason or "",
+        )
+
         return ApiResponse(status="SUCCESS", message="反馈处理成功", data=None)
 
     except Exception as exc:
-        print(f"[API] 处理任务反馈失败: {exc}")
+        logger.exception("event=task_feedback_error task_id=%s error=%s", task_id, str(exc))
         return ApiResponse(status="FAILED", message=f"反馈处理失败: {str(exc)}", data=None)
 
 
@@ -274,11 +372,17 @@ async def get_pending_tasks(
     task_manager: TaskStateManager = Depends(get_task_state_manager),
     warehouse_service: WarehouseService = Depends(get_warehouse_service),
 ):
-    """
-    获取当前任务状态（调试接口）。
+    """获取当前任务状态（调试接口）。
 
     除 TaskStateManager 中的待反馈任务外，也返回 warehouse_service 中真实存在的
     入库/出库 pending 队列及 running 任务，避免遗漏出库任务。
+
+    Args:
+        task_manager (TaskStateManager，可选): 任务状态管理器，用于读取和更新 API 任务状态。
+        warehouse_service (WarehouseService，可选): API 服务实例，负责同步状态、生成调度结果和处理反馈。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
     """
     pending = task_manager.get_all_pending_tasks()
     merged_tasks = {}
@@ -356,14 +460,23 @@ async def get_unconfirmed_tasks(
     task_manager: TaskStateManager = Depends(get_task_state_manager),
     warehouse_service: WarehouseService = Depends(get_warehouse_service),
 ):
-    """
-    获取可 EXECUTING 的任务列表（兼容旧路径）。
+    """获取可 EXECUTING 的任务列表（兼容旧路径）。
     若某巷道存在当前推荐任务，则该任务在该巷道列表中排第一。
+
+    Args:
+        task_manager (TaskStateManager，可选): 任务状态管理器，用于读取和更新 API 任务状态。
+        warehouse_service (WarehouseService，可选): API 服务实例，负责同步状态、生成调度结果和处理反馈。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
     """
     grouped = warehouse_service.get_tasks_by_aisle_for_api()
     by_aisle = {}
 
     def _build_task_data(task, aisle: int):
+        """构造下游调用所需的对象、请求载荷或配置结果。
+
+        """
         return {
             "taskId": getattr(task, "task_id", ""),
             "taskType": getattr(task, "task_type", ""),
@@ -397,8 +510,16 @@ async def get_unconfirmed_tasks(
 async def adjust_task(
     request: TaskAdjustRequest,
     warehouse_service: WarehouseService = Depends(get_warehouse_service),
-) -> ApiResponse:
-    """独立任务调整接口：调整入库任务的巷道/SKU/位置。"""
+) -> Union[ApiResponse, JSONResponse]:
+    """独立任务调整接口：调整入库任务的巷道/SKU/位置。
+
+    Args:
+        request (TaskAdjustRequest): 本次 HTTP 请求对应的 Pydantic 请求对象。
+        warehouse_service (WarehouseService，可选): API 服务实例，负责同步状态、生成调度结果和处理反馈。
+
+    Returns:
+        ApiResponse: 封装处理结果或错误信息的 HTTP 响应。
+    """
     if request.taskType.value != "INBOUND":
         return ApiResponse(
             status="FAILED",

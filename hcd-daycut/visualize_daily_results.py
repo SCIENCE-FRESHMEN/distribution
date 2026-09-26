@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, TypedDict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -40,7 +40,70 @@ COLORS = {
 OUTPUT_DIR = Path("visualization/daily")
 
 
+class RelocationInterval(TypedDict):
+    """一段移库占用区间及其所属巷道。"""
+
+    aisle: int
+    start: float
+    end: float
+
+
+class TaskInterval(TypedDict):
+    """一条已完成任务在日志中记录的时间区间。"""
+
+    type: str
+    id: str
+    aisle: Optional[int]
+    start: float
+    end: float
+
+
+def _is_outbound_task(task: Mapping[str, Any]) -> bool:
+    """根据输入状态和业务规则返回布尔判断结果。
+
+    输入：task（dict）
+    输出：bool
+
+    Args:
+        task (dict): 当前处理的任务记录。
+
+    Returns:
+        bool: 条件满足、处理成功或校验通过时为 ``True``，否则为 ``False``。
+    """
+    task_id = str(task.get("id", "")).upper()
+    task_type = str(task.get("type", ""))
+    return task_id.startswith("OUT") or "出库" in task_type
+
+
+def _is_inbound_task(task: Mapping[str, Any]) -> bool:
+    """根据输入状态和业务规则返回布尔判断结果。
+
+    输入：task（dict）
+    输出：bool
+
+    Args:
+        task (dict): 当前处理的任务记录。
+
+    Returns:
+        bool: 条件满足、处理成功或校验通过时为 ``True``，否则为 ``False``。
+    """
+    task_id = str(task.get("id", "")).upper()
+    task_type = str(task.get("type", ""))
+    return task_id.startswith("IN") or "入库" in task_type
+
+
 def save_fig(filename: str) -> None:
+    """将当前处理结果按约定格式写入目标文件或状态载体。
+
+    输入：filename（str）
+    输出：None
+
+    Args:
+        filename (str): 输入或输出文件名。
+
+    Returns:
+        None: 不返回业务数据；处理结果写入实例状态、传入对象或外部响应。
+    """
     out_path = OUTPUT_DIR / Path(filename).name
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
@@ -49,16 +112,38 @@ def save_fig(filename: str) -> None:
 SELECT_DATES = []
 START_DATE = "20251012"
 END_DATE = "20251030"
-# Match run_daily suffix: "-lam{POISSON_X}".
+# 匹配 run_daily 生成的 ``-lam{POISSON_X}`` 日志后缀。
 POISSON_X = 50  # [50,70,100,120]
 
 
 def _extract_date_dir(dir_name: str) -> Optional[str]:
+    """从复合对象中提取目标字段，统一不同输入格式的读取方式。
+
+    输入：dir_name（str）
+    输出：Optional[str]
+
+    Args:
+        dir_name (str): 供当前处理流程使用的 `dir_name` 值。
+
+    Returns:
+        Optional[str]: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     match = re.search(r"(\d{8})", dir_name)
     return match.group(1) if match else None
 
 
 def _parse_completion(log_text: str) -> Dict[int, Tuple[int, int]]:
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：log_text（str）
+    输出：Dict[int, Tuple[int, int]]
+
+    Args:
+        log_text (str): 供当前处理流程使用的 `log_text` 值。
+
+    Returns:
+        Dict[int, Tuple[int, int]]: 按函数约定字段组织的计算结果映射。
+    """
     results: Dict[int, Tuple[int, int]] = {}
     patterns = [
         r"\[INFO\]\[DAY\s+\d+\]\s*产线(\d+)\s+当日计划已完成：(\d+)/(\d+)\s+组",
@@ -74,8 +159,19 @@ def _parse_completion(log_text: str) -> Dict[int, Tuple[int, int]]:
 
 
 def _parse_pairing_end(log_text: str) -> Dict[str, float]:
-    # Example:
+# 示例：
     # [DAY 1 结束] 货位配对率: 67/81 = 82.72%; 梁配对率(不含solo): 134/274 = 48.91%; 梁配对率(含solo): 198/274 = 72.26%
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：log_text（str）
+    输出：Dict[str, float]
+
+    Args:
+        log_text (str): 供当前处理流程使用的 `log_text` 值。
+
+    Returns:
+        Dict[str, float]: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     pat = (
         r"\[DAY\s+\d+\s+结束\]\s+货位配对率:\s+\d+/\d+\s+=\s+([\d.]+)%.*?"
         r"梁配对率\(不含solo\):\s+\d+/\d+\s+=\s+([\d.]+)%.*?"
@@ -92,8 +188,19 @@ def _parse_pairing_end(log_text: str) -> Dict[str, float]:
 
 
 def _parse_pairing_start(log_text: str) -> Dict[str, float]:
-    # Example:
+# 示例：
     # [DAY 1 开始] 货位配对率: 67/81 = 82.72%; 梁配对率(不含solo): 134/274 = 48.91%; 梁配对率(含solo): 198/274 = 72.26%
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：log_text（str）
+    输出：Dict[str, float]
+
+    Args:
+        log_text (str): 供当前处理流程使用的 `log_text` 值。
+
+    Returns:
+        Dict[str, float]: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     pat_new = (
         r"\[DAY\s+\d+\s+开始\]\s+货位配对率:\s+\d+/\d+\s+=\s+([\d.]+)%.*?"
         r"梁配对率\(不含solo\):\s+\d+/\d+\s+=\s+([\d.]+)%.*?"
@@ -122,6 +229,17 @@ def _parse_pairing_start(log_text: str) -> Dict[str, float]:
 
 
 def _parse_end_hours(log_text: str) -> Optional[float]:
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：log_text（str）
+    输出：Optional[float]
+
+    Args:
+        log_text (str): 供当前处理流程使用的 `log_text` 值。
+
+    Returns:
+        Optional[float]: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     m = re.search(r"\[DAY\s+\d+\]\s+日内结束，当前时间\s+([\d.]+)\s+小时", log_text)
     if not m:
         return None
@@ -129,14 +247,35 @@ def _parse_end_hours(log_text: str) -> Optional[float]:
 
 
 def _parse_relocation_count(log_text: str) -> Optional[int]:
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：log_text（str）
+    输出：Optional[int]
+
+    Args:
+        log_text (str): 供当前处理流程使用的 `log_text` 值。
+
+    Returns:
+        Optional[int]: 计算得到的编号或索引；无可用结果时返回 ``None``。
+    """
     matches = re.findall(r"移库数量:\s*(\d+)", log_text)
     if not matches:
         return None
     return int(matches[-1])
 
-def _parse_relocation_intervals(log_text: str):
+def _parse_relocation_intervals(log_text: str) -> List[RelocationInterval]:
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：log_text（str）
+
+    Args:
+        log_text (str): 供当前处理流程使用的 `log_text` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     pattern = r"\[移库占用\]\s+巷道\s+(\d+)\s+在时间\s+([\d.]+)s\s+到\s+([\d.]+)s"
-    intervals = []
+    intervals: List[RelocationInterval] = []
     for m in re.finditer(pattern, log_text):
         intervals.append(
             {
@@ -148,12 +287,22 @@ def _parse_relocation_intervals(log_text: str):
     return intervals
 
 
-def _parse_task_details(log_text: str):
+def _parse_task_details(log_text: str) -> List[TaskInterval]:
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：log_text（str）
+
+    Args:
+        log_text (str): 供当前处理流程使用的 `log_text` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     pattern = (
         r"第\s*(\d+)\s*个(入库|出库)任务\s+([\w\-]+)\s+完成"
         r"\s*(?:\(巷道\s+(\d+)\))?.*?起止\s+([\d.]+)s~([\d.]+)s"
     )
-    tasks = []
+    tasks: List[TaskInterval] = []
     for m in re.finditer(pattern, log_text):
         aisle = int(m.group(4)) if m.group(4) else None
         tasks.append(
@@ -167,9 +316,17 @@ def _parse_task_details(log_text: str):
         )
     return tasks
 
-def _find_overlaps(tasks):
-    overlaps = []
-    aisle_map: Dict[int, list] = {}
+def _find_overlaps(tasks: List[TaskInterval]) -> List[Tuple[int, TaskInterval, TaskInterval]]:
+    """在候选集合中按既定约束查找匹配对象或可用位置。
+
+    Args:
+        tasks (Any): 供当前处理流程使用的 `tasks` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
+    overlaps: List[Tuple[int, TaskInterval, TaskInterval]] = []
+    aisle_map: Dict[int, List[TaskInterval]] = {}
     for t in tasks:
         aisle = t["aisle"]
         if aisle is None:
@@ -194,14 +351,23 @@ def _find_overlaps(tasks):
     return overlaps
 
 
-def _calculate_avg_utilization(tasks) -> Optional[float]:
+def _calculate_avg_utilization(tasks: List[TaskInterval]) -> Optional[float]:
+    """根据输入状态执行计算并返回指标或中间结果。
+    输出：Optional[float]
+
+    Args:
+        tasks (Any): 供当前处理流程使用的 `tasks` 值。
+
+    Returns:
+        Optional[float]: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     if not tasks:
         return None
-    outbound_end = [t["end"] for t in tasks if t["type"] == "出库"]
+    outbound_end = [t["end"] for t in tasks if _is_outbound_task(t)]
     simulation_end = max(outbound_end) if outbound_end else max(t["end"] for t in tasks)
     if simulation_end <= 0:
         return None
-    aisle_intervals: Dict[int, list] = {}
+    aisle_intervals: Dict[int, List[Tuple[float, float]]] = {}
     for t in tasks:
         if t["end"] > simulation_end:
             continue
@@ -213,7 +379,7 @@ def _calculate_avg_utilization(tasks) -> Optional[float]:
     utilizations = []
     for aisle, intervals in aisle_intervals.items():
         intervals = sorted(intervals, key=lambda x: x[0])
-        merged = []
+        merged: List[List[float]] = []
         for s, e in intervals:
             if not merged or s > merged[-1][1]:
                 merged.append([s, e])
@@ -224,14 +390,23 @@ def _calculate_avg_utilization(tasks) -> Optional[float]:
     return sum(utilizations) / len(utilizations)
 
 
-def _calculate_used_time_std(tasks) -> Optional[float]:
+def _calculate_used_time_std(tasks: List[TaskInterval]) -> Optional[float]:
+    """根据输入状态执行计算并返回指标或中间结果。
+    输出：Optional[float]
+
+    Args:
+        tasks (Any): 供当前处理流程使用的 `tasks` 值。
+
+    Returns:
+        Optional[float]: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     if not tasks:
         return None
-    outbound_end = [t["end"] for t in tasks if t["type"] == "出库"]
+    outbound_end = [t["end"] for t in tasks if _is_outbound_task(t)]
     simulation_end = max(outbound_end) if outbound_end else max(t["end"] for t in tasks)
     if simulation_end <= 0:
         return None
-    aisle_intervals: Dict[int, list] = {}
+    aisle_intervals: Dict[int, List[Tuple[float, float]]] = {}
     for t in tasks:
         if t["end"] > simulation_end:
             continue
@@ -243,7 +418,7 @@ def _calculate_used_time_std(tasks) -> Optional[float]:
     used_times = []
     for intervals in aisle_intervals.values():
         intervals = sorted(intervals, key=lambda x: x[0])
-        merged = []
+        merged: List[List[float]] = []
         for s, e in intervals:
             if not merged or s > merged[-1][1]:
                 merged.append([s, e])
@@ -256,23 +431,44 @@ def _calculate_used_time_std(tasks) -> Optional[float]:
     return variance ** 0.5
 
 
-def _count_tasks_by_aisle(tasks):
+def _count_tasks_by_aisle(
+    tasks: List[TaskInterval],
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
+    """执行 `_count_tasks_by_aisle` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    Args:
+        tasks (Any): 供当前处理流程使用的 `tasks` 值。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     inbound_counts: Dict[int, int] = {}
     outbound_counts: Dict[int, int] = {}
     for t in tasks:
         aisle = t["aisle"]
         if aisle is None:
             continue
-        if t["type"] == "入库":
+        if _is_inbound_task(t):
             inbound_counts[aisle] = inbound_counts.get(aisle, 0) + 1
-        elif t["type"] == "出库":
+        elif _is_outbound_task(t):
             outbound_counts[aisle] = outbound_counts.get(aisle, 0) + 1
     total_counts = {a: inbound_counts.get(a, 0) + outbound_counts.get(a, 0)
                     for a in set(inbound_counts) | set(outbound_counts)}
     return inbound_counts, outbound_counts, total_counts
 
 
-def parse_log_file(path: Path) -> Dict[str, object]:
+def parse_log_file(path: Path) -> Dict[str, Any]:
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：path（Path）
+    输出：Dict[str, object]
+
+    Args:
+        path (Path): 需要读取、写入或检查的文件路径。
+
+    Returns:
+        Dict[str, Any]: 包含完成率、配对率、任务区间和巷道统计的日志结果。
+    """
     text = path.read_text(encoding="utf-8")
     completion = _parse_completion(text)
     pairing = _parse_pairing_end(text)
@@ -308,14 +504,42 @@ def parse_log_file(path: Path) -> Dict[str, object]:
 
 
 def _format_lambda_suffix(value: Optional[float]) -> str:
+    """将内部数据格式化为日志、展示或接口输出所需的形式。
+
+    输入：value（Optional[float]）
+    输出：str
+
+    Args:
+        value (Optional[float]): 待解析、格式化或计算的原始值。
+
+    Returns:
+        str: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     if value is None:
         return ""
     text = f"{value}".replace(".", "p")
     return f"-lam{text}"
 
 
-def load_daily_results(log_root: Path, dates_filter: Optional[set], lambda_suffix: str) -> Dict[str, Dict[str, Dict[str, object]]]:
-    all_data: Dict[str, Dict[str, Dict[str, object]]] = {}
+def load_daily_results(
+    log_root: Path,
+    dates_filter: Optional[Set[str]],
+    lambda_suffix: str,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """加载配置、文件或既有状态，并转换为当前模块可消费的数据。
+
+    输入：log_root（Path）、dates_filter（Optional[set]）、lambda_suffix（str）
+    输出：Dict[str, Dict[str, Dict[str, object]]]
+
+    Args:
+        log_root (Path): 供当前处理流程使用的 `log_root` 值。
+        dates_filter (Optional[set]): 供当前处理流程使用的 `dates_filter` 值。
+        lambda_suffix (str): 供当前处理流程使用的 `lambda_suffix` 值。
+
+    Returns:
+        Dict[str, Dict[str, Dict[str, object]]]: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
+    all_data: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for date_dir in sorted(log_root.iterdir()):
         if not date_dir.is_dir():
             continue
@@ -332,6 +556,20 @@ def load_daily_results(log_root: Path, dates_filter: Optional[set], lambda_suffi
 
 
 def _plot_grouped_bars(dates, values_by_strategy, ylabel, title, out_name, legend_labels=None, strategies=None):
+    """执行 `_plot_grouped_bars` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    Args:
+        dates (Any): 供当前处理流程使用的 `dates` 值。
+        values_by_strategy (Any): 供当前处理流程使用的 `values_by_strategy` 值。
+        ylabel (Any): 供当前处理流程使用的 `ylabel` 值。
+        title (Any): 供当前处理流程使用的 `title` 值。
+        out_name (Any): 供当前处理流程使用的 `out_name` 值。
+        legend_labels (Any，可选): 供当前处理流程使用的 `legend_labels` 值。
+        strategies (Any，可选): 供当前处理流程使用的 `strategies` 值。
+
+    Returns:
+        None: 通过实例状态、队列或外部副作用完成处理。
+    """
     plt.figure(figsize=(12, 7))
     strategies = strategies or list(STRATEGIES.keys())
     x = np.arange(len(dates))
@@ -387,7 +625,44 @@ def _plot_grouped_bars(dates, values_by_strategy, ylabel, title, out_name, legen
     plt.show()
 
 
+def _plot_used_time_std_by_day(dates, values_by_strategy):
+    """执行 `_plot_used_time_std_by_day` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    Args:
+        dates (Any): 供当前处理流程使用的 `dates` 值。
+        values_by_strategy (Any): 供当前处理流程使用的 `values_by_strategy` 值。
+
+    Returns:
+        None: 通过实例状态、队列或外部副作用完成处理。
+    """
+    legend_labels = {}
+    for strategy, values in values_by_strategy.items():
+        nums = [v for v in values if isinstance(v, (int, float))]
+        if nums:
+            avg = sum(nums) / len(nums)
+            legend_labels[strategy] = f"{STRATEGIES[strategy]}: {avg:.2f}s"
+        else:
+            legend_labels[strategy] = STRATEGIES[strategy]
+
+    _plot_grouped_bars(
+        dates,
+        values_by_strategy,
+        ylabel="Aisle Busy Time Std (s)",
+        title="Aisle Busy Time Std by Date",
+        out_name="daily_aisle_busy_time_std.png",
+        legend_labels=legend_labels,
+    )
+
+
 def print_daily_aisle_stats(all_data):
+    """执行 `print_daily_aisle_stats` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    Args:
+        all_data (Any): 按策略汇总的完整仿真或统计数据。
+
+    Returns:
+        None: 通过实例状态、队列或外部副作用完成处理。
+    """
     print("\n=== 各日期巷道入/出库次数与利用率方差 ===")
     for date in sorted(all_data.keys()):
         print(f"\n[Date {date}]")
@@ -411,10 +686,24 @@ def print_daily_aisle_stats(all_data):
 
 
 def main():
+    """作为脚本入口，解析运行参数并按既定顺序调用本文件的主要处理流程。
+
+    输入：无显式业务输入；依赖实例字段或模块配置。
+
+    Args:
+        None: 无显式业务参数；使用实例状态或模块配置。
+
+    Returns:
+        None: 通过实例状态、队列或外部副作用完成处理。
+    """
     parser = argparse.ArgumentParser(description="Visualize daily logs produced by run_daily.")
+    # run_daily 输出的按日日志根目录。
     parser.add_argument("--log-root", default="logs/daily", help="Root directory for daily logs.")
+    # 每日图表和汇总结果的输出目录。
     parser.add_argument("--out-dir", default="visualization/daily", help="Output directory for visualizations.")
+    # 显式指定纳入汇总的日期集合，优先级低于模块级 SELECT_DATES 配置。
     parser.add_argument("--dates", help="Comma/space separated list of YYYYMMDD to include.")
+    # 仅匹配指定泊松到达率后缀的日志，便于比较同一入库强度的多日结果。
     parser.add_argument("--poisson-x", type=float, help="Match log suffix -lamX (X used in run_daily).")
     args = parser.parse_args()
 
@@ -453,7 +742,7 @@ def main():
         print("[WARN] No daily logs found.")
         return
 
-    # export relocation intervals
+# 导出移库任务的时间区间。
     relocation_rows = []
     for date, per_strategy in all_data.items():
         for strategy, info in per_strategy.items():
@@ -475,7 +764,7 @@ def main():
             writer.writerows(relocation_rows)
         print(f"[INFO] Relocation intervals saved to {csv_path}")
 
-    # warn overlaps
+# 输出巷道占用区间重叠告警。
     for date, per_strategy in all_data.items():
         for strategy, info in per_strategy.items():
             overlaps = info.get("overlaps") or []
@@ -499,6 +788,7 @@ def main():
     end_hours_vals = {s: [] for s in STRATEGIES.keys()}
     relocation_vals = {s: [] for s in STRATEGIES.keys()}
     utilization_vals = {s: [] for s in STRATEGIES.keys()}
+    used_time_std_vals = {s: [] for s in STRATEGIES.keys()}
 
     for date in dates:
         for strategy in STRATEGIES.keys():
@@ -511,6 +801,7 @@ def main():
                 end_hours_vals[strategy].append(None)
                 relocation_vals[strategy].append(None)
                 utilization_vals[strategy].append(None)
+                used_time_std_vals[strategy].append(None)
                 continue
             completion_vals[strategy].append(info.get("completion_ratio"))
             if pairing_vals is not None:
@@ -520,6 +811,7 @@ def main():
             reloc = info.get("relocation_count")
             relocation_vals[strategy].append(int(reloc) if reloc is not None else None)
             utilization_vals[strategy].append(info.get("avg_utilization"))
+            used_time_std_vals[strategy].append(info.get("used_time_std"))
 
     _plot_grouped_bars(
         dates,
@@ -593,6 +885,7 @@ def main():
         out_name="daily_avg_utilization.png",
         legend_labels=utilization_labels,
     )
+    _plot_used_time_std_by_day(dates, used_time_std_vals)
 
 
 if __name__ == "__main__":

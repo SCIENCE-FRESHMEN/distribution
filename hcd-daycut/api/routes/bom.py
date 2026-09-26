@@ -2,6 +2,12 @@
 BOM配置接口路由
 """
 
+"""BOM 与 SKU 配置更新路由。
+
+配置写入由服务层完成，并被核心库存、入库分配和出库配对共同读取；路由只负责
+协议校验与标准响应封装。
+"""
+
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 
@@ -56,20 +62,26 @@ async def update_bom_config(
     request: BomUpdateRequest,
     warehouse_service: WarehouseService = Depends(get_warehouse_service)
 ) -> ApiResponse:
-    """
-    更新 BOM 配置（SKU 配置）
-    
+    """更新 BOM 配置（SKU 配置）
+
     此接口用于更新系统的 SKU 配置信息，包括：
     - sku_types: SKU 类型列表
     - sku_pairs: SKU 配对关系（可放在同一货位的上下两层）
     - sku_solo: 需要单独存放的 SKU
     - sku_to_production_line: SKU 到产线的映射关系
-    
+
     **注意事项：**
     - 配置更新会立即生效
     - 不会影响现有库存和任务状态
     - 建议在系统空闲时更新
     - 必须提供完整的配置数据
+
+    Args:
+        request (BomUpdateRequest): 本次 HTTP 请求对应的 Pydantic 请求对象。
+        warehouse_service (WarehouseService，可选): API 服务实例，负责同步状态、生成调度结果和处理反馈。
+
+    Returns:
+        ApiResponse: 封装处理结果或错误信息的 HTTP 响应。
     """
     try:
         # 转换配置数据格式
@@ -77,10 +89,10 @@ async def update_bom_config(
             config_data = request.config.model_dump()
         else:
             config_data = request.config.dict()
-        
+
         # 调用 warehouse_service 更新配置
         success = warehouse_service.update_sku_config(config_data)
-        
+
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if success:
             return ApiResponse(
@@ -94,7 +106,7 @@ async def update_bom_config(
                 message="SKU配置更新失败",
                 data={"timestamp": timestamp}
             )
-            
+
     except ValueError as e:
         raise HTTPException(
             status_code=400,
@@ -111,8 +123,13 @@ async def update_bom_config(
 async def get_bom_config(
     warehouse_service: WarehouseService = Depends(get_warehouse_service)
 ):
-    """
-    获取当前 BOM 配置（调试接口）
+    """获取当前 BOM 配置（调试接口）
+
+    Args:
+        warehouse_service (WarehouseService，可选): API 服务实例，负责同步状态、生成调度结果和处理反馈。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
     """
     try:
         config = {

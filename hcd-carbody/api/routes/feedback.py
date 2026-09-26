@@ -1,5 +1,7 @@
 """Task feedback routes."""
 
+import logging
+
 from fastapi import APIRouter, Depends
 
 from ..models import TaskAdjustRequest, TaskFeedbackRequest, TaskStatus
@@ -8,8 +10,12 @@ from ..services.warehouse_service import WarehouseService, _get_or_create_wareho
 from ..state import TaskStateManager, get_task_state_manager
 
 router = APIRouter(prefix="/task", tags=["task-feedback"])
+logger = logging.getLogger("api.business")
 
 
+# ==========================================================================
+# 主函数：任务反馈、待处理查询与入库调整 API 路由
+# ==========================================================================
 @router.post("/feedback")
 async def task_feedback(
     request: TaskFeedbackRequest,
@@ -18,9 +24,9 @@ async def task_feedback(
 ):
     """
     任务执行反馈接口
-    
+
     外部系统报告任务执行状态。
-    
+
     状态说明：
     - EXECUTING: 任务正在执行中（收到此状态表示指令已成功传输）
     - COMPLETED: 任务已完成
@@ -41,6 +47,14 @@ async def task_feedback(
         }
         result = warehouse_service.apply_feedback(feedback_payload)
         if not result.get("success", False):
+            logger.warning(
+                "event=task_feedback_rejected task_id=%s task_type=%s status=%s aisle_id=%s reason=%s",
+                task_id,
+                request.taskType.value,
+                request.status.value,
+                request.aisleId,
+                result.get("reason", "未知原因。"),
+            )
             return fail(
                 message="任务反馈被拒绝。",
                 http_status=400,
@@ -62,6 +76,14 @@ async def task_feedback(
             if pending_task:
                 task_manager.fail_task(task_id)
 
+        logger.info(
+            "event=task_feedback_success task_id=%s task_type=%s status=%s aisle_id=%s positions=%s",
+            task_id,
+            request.taskType.value,
+            request.status.value,
+            result.get("aisleId"),
+            result.get("positions") or [],
+        )
         return ok(
             status_code="SUCCESS",
             message=result.get("message", "任务反馈处理成功。"),
@@ -74,12 +96,14 @@ async def task_feedback(
             },
         )
     except ValueError as e:
+        logger.warning("event=task_feedback_validation_error task_id=%s reason=%s", task_id, str(e))
         return fail(
             message="任务反馈参数校验失败。",
             http_status=400,
             data={"taskId": task_id, "reason": str(e)},
         )
     except Exception as e:
+        logger.exception("event=task_feedback_error task_id=%s", task_id)
         return fail(
             message="任务反馈处理失败。",
             http_status=500,
@@ -94,7 +118,7 @@ async def get_pending_tasks(
 ):
     """
     获取所有待处理任务（调试接口）
-    
+
     返回当前所有待反馈确认的任务列表。
     """
     merged_tasks = []
@@ -191,13 +215,13 @@ async def get_pending_tasks(
 @router.get("/unconfirmed")
 async def get_unconfirmed_tasks(
     task_manager: TaskStateManager = Depends(get_task_state_manager),
+    warehouse_service: WarehouseService = Depends(get_warehouse_service),
 ):
     """
     获取未确认的任务（调试接口）
-    
+
     返回已发送但尚未收到EXECUTING反馈的任务列表。
     """
-    warehouse_service = _get_or_create_warehouse_service()
     grouped = warehouse_service.get_tasks_by_aisle_for_api()
     tasks_by_aisle = {
         str(aisle): {
@@ -223,6 +247,15 @@ async def task_adjust(
     request: TaskAdjustRequest,
     warehouse_service: WarehouseService = Depends(get_warehouse_service),
 ):
+    """执行 任务 adjust 对应的业务处理。
+
+    Args:
+        request: 接口请求对象。
+        warehouse_service: 用于本函数处理的 `warehouse_service` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     if request.taskType.value != "INBOUND":
         return fail(
             message="任务调整被拒绝。",

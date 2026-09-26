@@ -1,3 +1,5 @@
+"""将入库到货表转换为仿真和调度可消费的入库任务记录。"""
+
 import pandas as pd
 import json
 import pytz
@@ -5,7 +7,15 @@ import re
 from pathlib import Path
 
 class InboundConfigBuilder:
+    """解析纵梁 A/B、到达时间和入库口，并保留后续分配所需字段。"""
     def __init__(self, source_path: str):
+        """初始化对象的运行状态和依赖对象，使实例可被调用方继续使用。
+
+        输入：source_path（str）
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         self.source_path = source_path
         self.inbound_records = []
         # 可选：表格含真实到达时间（列名如“到达时间”或 arrival_time），会一并保存
@@ -13,14 +23,18 @@ class InboundConfigBuilder:
 
     @staticmethod
     def _extract_sku(raw_value):
-        """提取 SKU（去掉 / 后面的二维码部分）"""
+        """提取 SKU（去掉 / 后面的二维码部分）
+
+        """
         if not isinstance(raw_value, str):
             return None
         return raw_value.split('/')[0].strip()
 
     @staticmethod
     def _to_seconds(val):
-        """Excel 时间/字符串时间戳转秒（转换为UTC时间戳），失败则返回 0"""
+        """Excel 时间/字符串时间戳转秒（转换为UTC时间戳），失败则返回 0
+
+        """
         try:
             if isinstance(val, pd.Timestamp):
                 if val.tz is None:
@@ -33,7 +47,7 @@ class InboundConfigBuilder:
             if isinstance(val, (int, float)):
                 # 假设传入的数值型时间戳是 UTC 时间戳（单位：秒）
                 return float(val)
-            
+
             # 解析字符串或其他格式的时间
             dt = pd.to_datetime(val)
             if dt.tz is None:
@@ -45,11 +59,19 @@ class InboundConfigBuilder:
                 return dt.timestamp()
         except Exception:
             try:
-                return float(val)
+                # pandas 的 Timestamp 等对象不一定直接满足 float 协议；
+                # 转成文本后仅保留可解析的数值回退路径。
+                return float(str(val).strip())
             except Exception:
                 return 0.0
 
     def build(self):
+        """按源文件行构造入库记录；到达时间缺失时保持 0 供调用方统一处理。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        """
         df = pd.read_excel(self.source_path) if self.source_path.endswith(('.xlsx', '.xls')) else pd.read_csv(self.source_path)
 
         # 识别到达时间列（allocation中的到达时间）
@@ -67,15 +89,25 @@ class InboundConfigBuilder:
                 line_col = cand
                 break
 
+        def has_cell_value(value) -> bool:
+            """判断 Excel 单元格是否含有可用值，避免 pandas 空值的布尔歧义。"""
+            if value is None:
+                return False
+            return str(value).strip() not in {"", "nan", "NaN", "NaT", "None"}
+
         for _, row in df.iterrows():
             sku_a = self._extract_sku(row.get('纵梁A', ''))
             sku_b = self._extract_sku(row.get('纵梁B', ''))
             arrival_time = row.get(arrival_col) if arrival_col else None
-            in_line = int(row.get(line_col)) if line_col and pd.notna(row.get(line_col)) else 1
+            raw_in_line = row.get(line_col) if line_col else None
+            try:
+                in_line = int(str(raw_in_line).strip()) if has_cell_value(raw_in_line) else 1
+            except (TypeError, ValueError):
+                in_line = 1
 
             if self.has_arrival_time:
                 rec = {
-                    "arrival_time": self._to_seconds(arrival_time) if pd.notna(arrival_time) else 0.0,
+                    "arrival_time": self._to_seconds(arrival_time) if has_cell_value(arrival_time) else 0.0,
                     "skus": [],
                     "version": [],
                     "生产属性": [],
@@ -106,9 +138,23 @@ class InboundConfigBuilder:
         return self
 
     def to_dict(self):
+        """执行 `to_dict` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+        输入：无显式业务输入；依赖实例字段或模块配置。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        """
         return {"inbound_records": self.inbound_records}
 
     def save_json(self, save_path: str = "simulation/data/inbound_config.json"):
+        """将当前处理结果按约定格式写入目标文件或状态载体。
+
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, ensure_ascii=False, indent=4)
@@ -116,7 +162,12 @@ class InboundConfigBuilder:
 
     @staticmethod
     def load_json(path: str):
-        with open(path, "r", encoding="utf-8") as f:
+        """加载配置、文件或既有状态，并转换为当前模块可消费的数据。
+
+        输入：path（str）
+
+        """
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         builder = InboundConfigBuilder(source_path="")
         builder.inbound_records = data["inbound_records"]

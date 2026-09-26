@@ -9,7 +9,7 @@ from .bom import router as bom_router
 
 __all__ = [
     "schedule_router",
-    "feedback_router", 
+    "feedback_router",
     "inbound_router",
     "bom_router"
 ]

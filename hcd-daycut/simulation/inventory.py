@@ -1,26 +1,35 @@
-"""
+"""库存写入、扣减和索引维护。
 
+本模块是仓库真实库存的唯一写入口。货位对象可被分配器深拷贝用于模拟，但
+真实 ``InventoryPosition`` 的写入和扣减应通过 ``InventoryManager`` 完成，
+以同步位置索引、SKU 索引和按巷道汇总库存。
 """
 
 import random
 import copy
 from typing import List, Dict, Optional, Union, Any
 from .position import InventoryPosition
+from .task_data import TaskData
 
 
 class InventoryManager:
-    """"""
-    
+    """维护真实货位及其三类查询视图。
+
+``inventory_positions`` 保存权威货位对象；``position_map`` 按坐标主键定位
+同一对象；``sku_position_index`` 支持按 SKU 查找候选货位；``current_inventory``
+提供按巷道的汇总数量。后三者均是派生索引，直接改动货位字段后必须重建或
+同步更新，否则分配、出库匹配和统计会读取到不一致的数据。
+"""
+
     def __init__(self, num_aisles: int = 5, num_rows: int = 2, num_columns: int = 3,
                  num_levels: int = 18, total_positions: int = 1000, max_beams: int = 980,
-                 sku_types: List[str] = None, initial_inventory_ratio: float = 0.3,
+                 sku_types: Optional[List[str]] = None, initial_inventory_ratio: float = 0.3,
                  use_double_layer: bool = True,
-                 sku_pairs: dict = None,
-                 sku_solo: list = None,
+                 sku_pairs: Optional[Dict[str, Any]] = None,
+                 sku_solo: Optional[List[str]] = None,
                  disabled_positions: Optional[List[Union[str, Dict[str, int]]]] = None,
                  match_fields: Optional[List[str]] = None):
-        """
-        Args:
+        """Args:
             num_aisles: 巷道数量
             num_rows: 行数
             num_columns: 列数
@@ -33,6 +42,9 @@ class InventoryManager:
             sku_pairs: SKU配对关系字典
             sku_solo: 单独梁SKU列表
             disabled_positions: 禁用的货位列表
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
         """
         self.num_aisles = num_aisles
         self.num_rows = num_rows
@@ -44,29 +56,50 @@ class InventoryManager:
         self.use_double_layer = use_double_layer
         self.disabled_position_ids = self._normalize_disabled_positions(disabled_positions)
         self.match_fields = list(match_fields or [])
-        
+
         # SKU配置
         self.sku_types = sku_types or ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
-        self.sku_pairs = sku_pairs or {}  # SKU配对关系
-        self.sku_solo = set(sku_solo or [])  # 单独梁SKU集合
+        # SKU配对关系
+        self.sku_pairs = sku_pairs or {}
+        # 单独梁SKU集合
+        self.sku_solo = set(sku_solo or [])
         self.aisles = list(range(1, num_aisles + 1))
-        
-        # 货位管理
+
+        # ``inventory_positions`` 是权威状态；两个索引只保存其对象引用，不能
+        # 用独立副本替代，否则库存写入后会出现查询与实际货位不一致。
         self.inventory_positions: List[InventoryPosition] = []
         self.position_map: Dict[str, InventoryPosition] = {}
         self.sku_position_index: Dict[str, List[InventoryPosition]] = {}
-        
-        # 简化库存（用于快速查询）
+
+        # 按巷道汇总的快速查询视图；每次真实写入、扣减或快照恢复后均需刷新。
         self.current_inventory: Dict[int, Dict[str, int]] = {}
         # 需要额外跟踪日志的 SKU 列表
         self.sku_watchlist: set = set()
 
+    # ========================================================================
+    # 主流程：库存初始化与初始状态构建
+    # ========================================================================
     def set_sku_watchlist(self, skus: List[str]):
-        """设置需要额外输出日志的 SKU 列表"""
+        """设置需要额外输出日志的 SKU 列表
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         self.sku_watchlist = set(skus or [])
-    
+
     def initialize(self):
-        """初始化仓库"""
+        """按配置构建真实货位和所有派生索引。
+
+        该方法由 ``WarehouseCore`` 初始化时调用。返回值为 ``None``，但会替换
+        ``inventory_positions``、``position_map``、``sku_position_index`` 和
+        ``current_inventory``，因此不应在已有运行任务期间调用。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         mode_str = "Double Shelf Warehouse" if self.use_double_layer else "Single Shelf Warehouse"
         print(f"[INIT] {mode_str}...")
 
@@ -74,12 +107,12 @@ class InventoryManager:
         if self.match_fields and self.initial_inventory_ratio > 0:
             print("[WARN] match_fields 已启用，禁用随机初始库存以避免属性缺失")
             self.initial_inventory_ratio = 0.0
-        
+
         self.inventory_positions = []
         self.position_map = {}
         self.sku_position_index = {sku: [] for sku in self.sku_types}
-        
-        # 
+
+        #
         positions_created = 0
         for aisle in range(1, self.num_aisles + 1):
             for row in range(1, self.num_rows + 1):
@@ -87,25 +120,25 @@ class InventoryManager:
                     for level in range(1, self.num_levels + 1):
                         if positions_created >= self.total_positions:
                             break
-                        
+
                         if self.use_double_layer:
-                            # 
+                            #
                             position = self._create_double_layer_position(aisle, row, column, level)
                         else:
-                            # 
+                            #
                             position = self._create_single_layer_position(aisle, row, column, level)
-                        
+
                         self.inventory_positions.append(position)
                         self.position_map[position.get_position_id()] = position
-                        
-                        # SKU
+
+        # SKU 配置。
                         if not position.is_empty():
                             for sku in position.get_available_skus():
                                 if sku and sku not in self.sku_position_index:
                                     self.sku_position_index[sku] = []
                                 if position not in self.sku_position_index[sku]:
                                     self.sku_position_index[sku].append(position)
-                        
+
                         positions_created += 1
                         if positions_created >= self.total_positions:
                             break
@@ -115,24 +148,25 @@ class InventoryManager:
                     break
             if positions_created >= self.total_positions:
                 break
-        
-        # 
+
+        #
         self._update_simplified_inventory()
 
-    def _extract_sku_attrs(self, record: dict, idx: int) -> Dict[str, Any]:
-        attrs: Dict[str, Any] = {}
-        if not record or not self.match_fields:
-            return attrs
-        for field in self.match_fields:
-            values = record.get(field)
-            if isinstance(values, list) and idx < len(values):
-                attrs[field] = values[idx]
-        return attrs
-    
+    # ========================================================================
+    # 主流程：按历史入库记录构建初始库存
+    # ========================================================================
     def initialize_from_inbound_tasks(self, inbound_records, aisles, inbound_position_allocator=None, inbound_aisle_allocator=None, initial_inventory_count=250):
-        """通过读取出入库任务记录来进行库存初始化，位置随机分配"""
+        """通过历史入库任务初始化库存。
+
+        方法只用于仿真初始状态构造：最多读取前 ``initial_inventory_count``
+        条记录，优先调用入库策略决定巷道和货位，策略无法分配时才使用
+        随机巷道作为兼容兜底，最后通过 add_inventory 同步所有库存索引。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         print(f"[INFO] 通过前{initial_inventory_count}组入库任务初始化库存...")
-        
+
         # 获取前N组入库任务
         inbound_tasks = inbound_records[:initial_inventory_count] if len(inbound_records) >= initial_inventory_count else inbound_records
 
@@ -149,7 +183,13 @@ class InventoryManager:
                     skus.append(sku_entry)
                 non_null_skus = [s for s in skus if s['skuId'] is not None]
 
-                task_info = type('TaskData', (), {'skus': skus, 'assigned_aisle': None})()
+                # 使用正式 TaskData 而非临时动态对象，使分配器读取的 ``skus``、
+                # ``assigned_aisle`` 与正常入库流程拥有一致的类型契约。
+                task_info = TaskData(
+                    task_id=f"INITIAL_INBOUND_{len(self.inventory_positions)}",
+                    task_type="INBOUND",
+                    skus=skus,
+                )
 
                 aisle = None
                 if inbound_aisle_allocator is not None:
@@ -157,7 +197,7 @@ class InventoryManager:
                         aisle = inbound_aisle_allocator.allocate(task_info, self.inventory_positions)
                     except Exception as e:
                         print(f"[ERROR] 使用巷道分配器分配巷道失败: {e}")
-                
+
                 # 如果没有设置巷道分配器或分配失败，则使用随机分配
                 if aisle is None:
                     aisle = random.choice(aisles)
@@ -165,10 +205,10 @@ class InventoryManager:
                 elif aisle not in aisles:
                     print(f"[WARN] 巷道分配器返回了无效巷道: {aisle}，使用随机分配")
                     aisle = random.choice(aisles)
-                
+
                 # 更新task_info中的aisle信息
                 task_info.assigned_aisle = aisle
-                
+
                 # 使用货位分配器分配位置
                 if inbound_position_allocator is not None:
                     positions = inbound_position_allocator.allocate(self.inventory_positions, task_info)
@@ -228,24 +268,48 @@ class InventoryManager:
                         continue
 
             except Exception as e:
-                print(f"[ERROR] 处理入库任务 {sku} 时发生异常: {e}")
+                print(f"[ERROR] 处理入库任务 {record} 时发生异常: {e}")
                 continue
-        
+
         # 更新简化库存
         self._update_simplified_inventory()
         print(f"[INFO] 基于前 {initial_inventory_count} 组入库任务的库存初始化完成")
-    
+
+    # ========================================================================
+    # 辅助函数：入库属性提取与货位对象构造
+    # ========================================================================
+    def _extract_sku_attrs(self, record: dict, idx: int) -> Dict[str, Any]:
+        """从批量入库记录中提取第 ``idx`` 根梁的匹配属性。
+
+        Args:
+            record: 一条原始入库记录。
+            idx: 当前 SKU 在记录属性数组中的下标。
+
+        Returns:
+            当前 SKU 对应的匹配属性字典。
+        """
+        attrs: Dict[str, Any] = {}
+        if not record or not self.match_fields:
+            return attrs
+        for field in self.match_fields:
+            values = record.get(field)
+            if isinstance(values, list) and idx < len(values):
+                attrs[field] = values[idx]
+        return attrs
+
     def _create_single_layer_position(self, aisle: int, row: int, column: int, level: int) -> InventoryPosition:
-        """"""
+        """创建单层货位并应用禁用状态和初始库存比例。
+
+        """
         disabled = self._is_disabled(aisle, row, column, level)
-        # 
+        #
         if (not disabled) and random.random() < self.initial_inventory_ratio:
             sku = random.choice(self.sku_types)
             quantity = 1
         else:
             sku = ""
             quantity = 0
-        
+
         return InventoryPosition(
             aisle=aisle,
             row=row,
@@ -256,9 +320,11 @@ class InventoryManager:
             is_double_layer=False,
             disabled=disabled
         )
-    
+
     def _create_double_layer_position(self, aisle: int, row: int, column: int, level: int) -> InventoryPosition:
-        """创建双层货位"""
+        """创建双层货位
+
+        """
         disabled = self._is_disabled(aisle, row, column, level)
         position = InventoryPosition(
             aisle=aisle,
@@ -270,20 +336,21 @@ class InventoryManager:
         )
         if disabled:
             return position
-        
+
         # 根据初始库存比例决定是否初始化库存
         rand_val = random.random()
-        
+
         if rand_val < self.initial_inventory_ratio:
             # 上层放置随机SKU
             position.upper_sku = random.choice(self.sku_types)
             position.upper_quantity = 1
-            
+
             # 判断是否需要放置下层SKU
             # 如果是solo类型SKU，则不放置下层
             # 如果在sku_pairs中，则放置其配对的SKU作为下层
-            if (position.upper_sku not in self.sku_solo and 
-                random.random() < 0.8):  # 80%概率放置下层
+            if (position.upper_sku not in self.sku_solo and
+                # 80%概率放置下层
+                random.random() < 0.8):
                 # 检查是否在配对关系中
                 if position.upper_sku in self.sku_pairs:
                     # 放置配对的SKU作为下层
@@ -293,16 +360,25 @@ class InventoryManager:
             # 只放置上层SKU
             position.upper_sku = random.choice(self.sku_types)
             position.upper_quantity = 1
-        
+
         return position
 
     def _format_position_id(self, aisle: int, row: int, column: int, level: int) -> str:
+        """按核心内部坐标生成稳定位置主键。
+
+        """
         return f"{aisle:01d}-{row:01d}-{column:02d}-{level:02d}"
 
     def _is_disabled(self, aisle: int, row: int, column: int, level: int) -> bool:
+        """判断内部坐标是否命中配置的禁用货位集合。
+
+        """
         return self._format_position_id(aisle, row, column, level) in self.disabled_position_ids
 
     def _normalize_disabled_positions(self, disabled_positions: Optional[List[Union[str, Dict[str, int]]]]) -> set:
+        """将字符串或字典形式的禁用坐标归一化为位置 ID 集合。
+
+        """
         ids = set()
         for item in disabled_positions or []:
             if isinstance(item, str):
@@ -321,15 +397,28 @@ class InventoryManager:
                 except Exception:
                     continue
         return ids
-    
+
+    # ========================================================================
+    # 阶段处理：库存索引维护与查询
+    # ========================================================================
     def _update_simplified_inventory(self):
-        """"""
-        self.current_inventory = {aisle: {sku: 0 for sku in self.sku_types} 
+        """从权威货位重算 ``current_inventory`` 汇总视图。
+
+        输入为当前 ``inventory_positions``，无返回值。该全量重算用于避免双层
+        上下层清空、批量初始化或快照恢复后发生累计误差；它不重建 SKU 位置索引。
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
+        self.current_inventory = {aisle: {sku: 0 for sku in self.sku_types}
                                  for aisle in self.aisles}
-        
+
         for position in self.inventory_positions:
             if position.is_double_layer:
-                # 
+                #
                 if position.upper_quantity > 0 and position.upper_sku:
                     self._register_sku_if_needed(position.upper_sku)
                     self.current_inventory[position.aisle][position.upper_sku] += position.upper_quantity
@@ -337,12 +426,19 @@ class InventoryManager:
                     self._register_sku_if_needed(position.lower_sku)
                     self.current_inventory[position.aisle][position.lower_sku] += position.lower_quantity
             else:
-                # 
+                #
                 if not position.is_empty():
-                    self._register_sku_if_needed(position.sku)
-                    self.current_inventory[position.aisle][position.sku] += position.quantity
+                    sku = position.sku
+                    if sku:
+                        self._register_sku_if_needed(sku)
+                        self.current_inventory[position.aisle][sku] += position.quantity
 
     def _register_sku_if_needed(self, sku: Optional[str]):
+        """注册新 SKU 并为所有巷道初始化汇总字典键。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         if not sku:
             return
         if sku not in self.sku_types:
@@ -353,36 +449,36 @@ class InventoryManager:
             if aisle not in self.current_inventory:
                 self.current_inventory[aisle] = {}
             self.current_inventory[aisle].setdefault(sku, 0)
-    
-    def get_empty_positions(self, aisle: int = None) -> List[InventoryPosition]:
+
+    def get_empty_positions(self, aisle: Optional[int] = None) -> List[InventoryPosition]:
         """
-        
+
         Args:
             aisle: None
-            
+
         Returns:
-            
+
         """
         if aisle is None:
             return [p for p in self.inventory_positions if p.is_empty()]
         else:
             return [p for p in self.inventory_positions if p.aisle == aisle and p.is_empty()]
 
-    
-    def get_sku_positions(self, sku: str, aisle: int = None, 
+
+    def get_sku_positions(self, sku: str, aisle: Optional[int] = None,
                          only_available: bool = True) -> List[InventoryPosition]:
         """获取包含指定SKU的货位列表
-        
+
         Args:
             sku: SKU类型
             aisle: 巷道号，None表示所有巷道
             only_available: 是否只返回有库存的货位
-            
+
         Returns:
             包含指定SKU的货位列表
         """
         positions = self.sku_position_index.get(sku, [])
-        
+
         if only_available:
             # 只返回有库存的货位
             filtered = []
@@ -395,14 +491,16 @@ class InventoryManager:
                     if p.quantity > 0:
                         filtered.append(p)
             positions = filtered
-        
+
         if aisle is not None:
             positions = [p for p in positions if p.aisle == aisle]
 
         return positions
-    
+
     def get_sku_total_quantity(self, sku: Optional[str]) -> int:
-        """返回当前仓库中某个SKU的总数量（包含上下层）"""
+        """返回当前仓库中某个SKU的总数量（包含上下层）
+
+        """
         if not sku:
             return 0
         total = 0
@@ -416,9 +514,13 @@ class InventoryManager:
                 if pos.sku == sku:
                     total += pos.quantity
         return total
-    
+
     def log_sku_snapshot(self, sku: str):
-        """打印指定SKU的总量及分布，便于快速追踪"""
+        """打印指定SKU的总量及分布，便于快速追踪
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         total = self.get_sku_total_quantity(sku)
         parts = []
         for pos in self.get_sku_positions(sku, aisle=None, only_available=False):
@@ -432,19 +534,28 @@ class InventoryManager:
                     parts.append(f"{pos.get_position_id()} x{pos.quantity}")
         distribution = ", ".join(parts) if parts else "无在库位置"
         print(f"[INFO][SKU {sku}] 总量 {total}，分布: {distribution}")
-    
+
+    # ========================================================================
+    # 主流程：真实库存写入、扣减与快照输出
+    # ========================================================================
     def add_inventory(self, position: InventoryPosition, sku: str, quantity: int = 1,
                       layer: Optional[str] = None, attrs: Optional[Dict[str, Any]] = None):
-        """
-        在指定货位增加库存
-        
+        """向真实货位写入库存，并同步全部派生索引。
+
         Args:
             position: 货位对象
             sku: SKU类型
             quantity: 数量
-            layer: 层位 ('upper' 或 'lower' 或 None)
+            layer: 层位 ('upper' 或 'lower' 或 None)。双层库由任务 positions
+                与上下层规则共同决定；``None`` 仅在调用方未指定层时自动选择。
+            attrs: 与 SKU 一起保存的匹配属性。
+
+        Returns:
+            ``None``。成功时修改 ``position_map`` 对应的权威对象、
+            ``sku_position_index`` 和 ``current_inventory``；冲突时抛出
+            ``ValueError``，不会写入部分库存。
         """
-        # 通过 position_map 获取实际的位置对象
+        # 任务和模拟器可能携带深拷贝的位置对象；必须按主键回到权威对象写入。
         position_id = position.get_position_id()
         actual_position = self.position_map.get(position_id)
 
@@ -452,10 +563,10 @@ class InventoryManager:
         if sku is None:
             return
         self._register_sku_if_needed(sku)
-        
+
         if actual_position is None:
             raise ValueError(f"位置 {position_id} 不存在于 position_map 中")
-        
+
         if actual_position.is_double_layer:
             # 双层货位
             if layer == 'upper':
@@ -489,8 +600,8 @@ class InventoryManager:
             actual_position.sku = sku
             actual_position.quantity = quantity
             actual_position.sku_attrs = attrs or {}
-        
-        # 更新SKU索引
+
+        # 写入后先维护 SKU 倒排索引，再重算按巷道汇总，保证出库查询可立即命中。
         if sku not in self.sku_position_index:
             self.sku_position_index[sku] = []
         if actual_position not in self.sku_position_index[sku]:
@@ -501,30 +612,33 @@ class InventoryManager:
         print(f"[INFO] 位置 {position_id} 增加 {sku} {quantity} {layer} 库存，总计 {total_sku_qty} attrs={attrs_info}")
         if sku in self.sku_watchlist:
             self.log_sku_snapshot(sku)
-        
+
         self._update_simplified_inventory()
-    
+
     def remove_inventory(self, position: InventoryPosition, sku: Optional[str] = None, quantity: int = 1):
-        """
-        从指定货位移除库存
-        
+        """从真实货位扣减库存，并同步 SKU 索引和巷道汇总。
+
         Args:
             position: 货位对象
             sku: SKU类型（对于双层货位必须指定）
             quantity: 数量
+
+        Returns:
+            ``None``。双层货位按实际命中的层扣减，库存归零时清除该层 SKU 和
+            属性；若该 SKU 不再位于此货位，则从 ``sku_position_index`` 移除。
         """
-        # 通过 position_map 获取实际的位置对象
+        # 与写入相同：调用方传入的可能是快照/任务副本，扣减必须命中权威对象。
         position_id = position.get_position_id()
         actual_position = self.position_map.get(position_id)
-        
+
         if actual_position is None:
             raise ValueError(f"位置 {position_id} 不存在于 position_map 中")
-        
+
         if actual_position.is_double_layer:
             # 双层货位需要指定SKU
             if sku is None:
                 raise ValueError("双层货位需要指定SKU")
-            
+
             # 检查并减少相应层的库存（优先从下层扣减，避免上下层同SKU时总是取上层）
             if actual_position.lower_sku == sku and actual_position.lower_quantity >= quantity:
                 actual_position.lower_quantity -= quantity
@@ -540,7 +654,7 @@ class InventoryManager:
                     actual_position.upper_attrs = {}
             else:
                 raise ValueError(f"位置 {actual_position.get_position_id()} 没有足够的 {sku} 库存")
-            
+
             # 检查该货位是否还包含此SKU，如果不包含则从索引中移除
             if actual_position.upper_sku != sku and actual_position.lower_sku != sku:
                 if sku in self.sku_position_index and actual_position in self.sku_position_index[sku]:
@@ -549,9 +663,9 @@ class InventoryManager:
             # 单层货位
             if actual_position.quantity < quantity:
                 raise ValueError(f"位置 {actual_position.get_position_id()} 没有足够的库存")
-            
+
             actual_position.quantity -= quantity
-            
+
             # 如果库存为0，清空SKU信息并从索引中移除
             if actual_position.quantity == 0:
                 removed_sku = actual_position.sku
@@ -559,11 +673,16 @@ class InventoryManager:
                 actual_position.sku_attrs = {}
                 if removed_sku in self.sku_position_index and actual_position in self.sku_position_index[removed_sku]:
                     self.sku_position_index[removed_sku].remove(actual_position)
-        
+
         self._update_simplified_inventory()
-    
+
     def get_inventory_snapshot(self) -> Dict:
-        """获取库存快照"""
+        """获取库存快照
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        """
         return {
             'current_inventory': copy.deepcopy(self.current_inventory),
             'total_occupied': sum(1 for p in self.inventory_positions if not p.is_empty()),
@@ -573,17 +692,42 @@ class InventoryManager:
                 for sku in self.sku_types
             }
         }
-    
+
     def print_distribution(self):
-        """打印库存分布情况"""
+        """打印库存分布情况
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         snapshot = self.get_inventory_snapshot()
-        
+        # ``is_empty`` 会把禁用/预留货位视为不可分配，不能拿它统计库存占用；这里仅按
+        # 上下层实际数量统计含 SKU 的货位，禁用货位则在下方单独列出。
+        inventory_occupied = sum(
+            1
+            for position in self.inventory_positions
+            if (
+                (position.upper_quantity > 0 or position.lower_quantity > 0)
+                if position.is_double_layer
+                else position.quantity > 0
+            )
+        )
+        disabled_position_ids = [
+            position.get_position_id()
+            for position in self.inventory_positions
+            if position.disabled
+        ]
+
         print(f"[INFO] 库存分布情况:")
-        print(f"  总占用货位: {snapshot['total_occupied']}/{self.total_positions} "
-              f"({snapshot['total_occupied']/self.total_positions*100:.1f}%)")
+        print(f"  库存占用货位: {inventory_occupied}/{self.total_positions} "
+              f"({inventory_occupied/self.total_positions*100:.1f}%)")
+        if disabled_position_ids:
+            print(f"  禁用货位: {len(disabled_position_ids)} ({', '.join(disabled_position_ids)})")
         # print(f"  总梁数: {snapshot['total_beams']}/{self.max_beams} "
         #       f"({snapshot['total_beams']/self.max_beams*100:.1f}%)")
-        
+
         for sku in self.sku_types:
             total_qty = snapshot['sku_distribution'][sku]
             if total_qty > 0:
@@ -592,13 +736,12 @@ class InventoryManager:
                     qty = self.current_inventory[aisle].get(sku, 0)
                     if qty > 0:
                         aisle_dist[aisle] = qty
-                
+
                 dist_str = ", ".join([f"{a}:{q}" for a, q in aisle_dist.items()])
                 print(f"  {sku}: {total_qty} ({dist_str})")
 
-    def get_pairing_stats(self) -> Dict[str, Union[int, float, Dict[int, int]]]:
-        """
-        统计当前双层货位的配对情况：
+    def get_pairing_stats(self) -> Dict[str, Any]:
+        """统计当前双层货位的配对情况：
         - matched_pairs: 上下层 SKU 与 sku_pairs 成功配对的货位数量
         - total_pairs: 上下层均有货的双层货位数量
         - match_rate: matched_pairs / total_pairs（无总数时为 0）
@@ -615,10 +758,14 @@ class InventoryManager:
         - double_slots_by_aisle: 每个巷道中的双层货位总数
         - total_goods: 总货物数量（总梁数）
         - goods_by_aisle: 每个巷道中的货物数量
-        - beam_match_rate:  
-        - beam_match_rate_including_solo: 
-        - paired_beams: 
+        - beam_match_rate:
+        - beam_match_rate_including_solo:
+        - paired_beams:
         - paired_beams_including_solo: paired_beams + solo_beams
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
         """
 
         matched_pairs = 0
@@ -688,7 +835,8 @@ class InventoryManager:
             if sku == pair_sku:
                 # 自配对，比如 A:A
                 count = remaining.get(sku, 0)
-                pairs = count // 2              # 一组要用掉 2 根
+                # 一组要用掉 2 根
+                pairs = count // 2
                 max_possible_pairs += pairs
                 remaining[sku] = count - 2 * pairs
             else:

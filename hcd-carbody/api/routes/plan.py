@@ -9,20 +9,40 @@ from ..services.warehouse_service import WarehouseService, get_warehouse_service
 router = APIRouter(prefix="/plan", tags=["production-plan"])
 
 
+# ==========================================================================
+# 主函数：生产计划写入与查询 API 路由
+# ==========================================================================
 @router.post("/production")
 async def set_production_plan(
     request: ProductionPlanRequest,
     warehouse_service: WarehouseService = Depends(get_warehouse_service),
 ):
+    """设置生产 计划相关逻辑。
+
+    Args:
+        request: 接口请求对象。
+        warehouse_service: 用于本函数处理的 `warehouse_service` 参数。
+
+    Returns:
+        None: 通过修改对象或外部状态完成处理。
+    """
     try:
         is_update = request.operationType == OperationType.UPDATE
-        success = warehouse_service.set_production_plan(
+        result = warehouse_service.set_production_plan(
             request,
             update=is_update,
             reset_assigned=bool(getattr(request, "resetAssigned", False)),
         )
-        if success:
-            return ok(status_code="SUCCESS", message="生产计划更新成功。", data={"success": True})
+        if result.get("success"):
+            ignored_plan_ids = list(result.get("ignoredPlanIds", []) or [])
+            message = "生产计划更新成功。"
+            if ignored_plan_ids:
+                message = "生产计划更新成功，已忽略重复的 planId。"
+            return ok(
+                status_code="SUCCESS",
+                message=message,
+                data={"success": True, "ignoredPlanIds": ignored_plan_ids},
+            )
         return fail(message="生产计划更新失败。", http_status=500, data={"success": False})
     except ValueError as e:
         return fail(message="生产计划参数校验失败。", http_status=400, data={"detail": str(e)})

@@ -36,7 +36,6 @@ CONFIGS: List[Tuple[str, str, str]] = [
 
 
 PARAM_ENV_MAP = {
-    "future_n": "PROPOSED_FUTURE_N",
     "future_weight": "PROPOSED_FUTURE_WEIGHT",
     "future_tail_weight": "PROPOSED_FUTURE_TAIL_WEIGHT",
     "feature_weight": "PROPOSED_FEATURE_WEIGHT",
@@ -46,27 +45,38 @@ PARAM_ENV_MAP = {
     "recent_select_window": "PROPOSED_RECENT_SELECT_WINDOW",
     "w_in": "PROPOSED_W_IN",
     "w_out": "PROPOSED_W_OUT",
+    "workload_time_weight": "PROPOSED_WORKLOAD_TIME_WEIGHT",
 }
 
 
-# Default is a single-point grid (current values). Replace with your ranges,
-# or pass --grid-json to load ranges dynamically.
+# 默认网格只有当前参数这一组取值；如需搜索范围，可直接替换为多个取值
 DEFAULT_GRID: Dict[str, List[Any]] = {
-  "future_n": [4],
-  "future_weight": [1.0, 4.0],
+  "future_weight": [4.0, 6.0, 8.0],
   "future_tail_weight": [0.0],
-  "feature_weight": [1.0],
-  "pending_weight": [8.0, 12.0],
-  "recent_weight": [4.0, 8.0],
-  "capacity_ratio_weight": [20.0, 30.0],
+  "feature_weight": [4.0],
+  "pending_weight": [4.0],
+  "recent_weight": [4.0, 6.0, 8.0],
+  "capacity_ratio_weight": [30.0, 50.0],
   "recent_select_window": [4],
   "w_in": [1.0],
-  "w_out": [3.0, 5.0],
+  "w_out": [4.0],
+  "workload_time_weight": [0.01, 0.03, 0.05],
 }
 
 
 
+# ==========================================================================
+# 辅助函数：参数网格、试验执行和结果汇总
+# ==========================================================================
 def load_grid(path: str | None) -> Dict[str, List[Any]]:
+    """加载grid相关逻辑。
+
+    Args:
+        path: 输入或输出文件路径。
+
+    Returns:
+        Dict[str, List[Any]]: 处理后的结果。
+    """
     if not path:
         return DEFAULT_GRID
     p = Path(path)
@@ -84,6 +94,14 @@ def load_grid(path: str | None) -> Dict[str, List[Any]]:
 
 
 def iter_param_combinations(grid: Dict[str, List[Any]]) -> Iterable[Dict[str, Any]]:
+    """执行 iter param combinations 对应的业务处理。
+
+    Args:
+        grid: 用于本函数处理的 `grid` 参数。
+
+    Returns:
+        Iterable[Dict[str, Any]]: 处理后的结果。
+    """
     keys = list(PARAM_ENV_MAP.keys())
     value_lists = [grid.get(k, DEFAULT_GRID[k]) for k in keys]
     for values in itertools.product(*value_lists):
@@ -91,6 +109,14 @@ def iter_param_combinations(grid: Dict[str, List[Any]]) -> Iterable[Dict[str, An
 
 
 def avg_completion_hours(parsed: Dict[str, Any]) -> float | None:
+    """执行 avg completion hours 对应的业务处理。
+
+    Args:
+        parsed: 用于本函数处理的 `parsed` 参数。
+
+    Returns:
+        float | None: 处理后的结果。
+    """
     day_tasks = parsed.get("task_completion_details", {}) or {}
     days = sorted(day_tasks.keys())
     if not days:
@@ -111,9 +137,27 @@ def run_one(
     trial_id: int,
     logs_dir: Path,
     python_exe: str,
+    real_time_days: int,
 ) -> Tuple[float | None, Path]:
+    """执行 run one 对应的业务处理。
+
+    Args:
+        params: 用于本函数处理的 `params` 参数。
+        config: 配置数据。
+        trial_id: 用于本函数处理的 `trial_id` 参数。
+        logs_dir: 用于本函数处理的 `logs_dir` 参数。
+        python_exe: 用于本函数处理的 `python_exe` 参数。
+
+    Returns:
+        Tuple[float | None, Path]: 处理后的结果。
+    """
     allocation, position, scheduler = config
     log_file = logs_dir / f"trial{trial_id:04d}-{allocation[:4]}-{position[:4]}-{scheduler[:3]}.log"
+
+    # trial 编号会在一次新的网格搜索中从 1 重新开始。运行前删除旧文件，避免 run.py
+    # 的追加式日志把多轮试验混入同一文件，导致按天解析时重复统计任务完成记录。
+    if log_file.exists():
+        log_file.unlink()
 
     env = os.environ.copy()
     for k, env_name in PARAM_ENV_MAP.items():
@@ -130,6 +174,8 @@ def run_one(
         scheduler,
         "--log-file",
         str(log_file),
+        "--real-time-days",
+        str(real_time_days),
     ]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=False)
     try:
@@ -162,12 +208,25 @@ def run_trial(
     logs_dir: Path,
     python_exe: str,
     parallel_configs: bool = False,
+    real_time_days: int = 15,
 ) -> Dict[str, Any]:
+    """执行 run trial 对应的业务处理。
+
+    Args:
+        trial_id: 用于本函数处理的 `trial_id` 参数。
+        params: 用于本函数处理的 `params` 参数。
+        logs_dir: 用于本函数处理的 `logs_dir` 参数。
+        python_exe: 用于本函数处理的 `python_exe` 参数。
+        parallel_configs: 用于本函数处理的 `parallel_configs` 参数。
+
+    Returns:
+        Dict[str, Any]: 处理后的结果。
+    """
     row: Dict[str, Any] = {"trial_id": trial_id, **params}
     per_cfg = []
     if parallel_configs and len(CONFIGS) > 1:
         with ThreadPoolExecutor(max_workers=len(CONFIGS)) as ex:
-            fut_map = {ex.submit(run_one, params, cfg, trial_id, logs_dir, python_exe): cfg for cfg in CONFIGS}
+            fut_map = {ex.submit(run_one, params, cfg, trial_id, logs_dir, python_exe, real_time_days): cfg for cfg in CONFIGS}
             for fut in as_completed(fut_map):
                 cfg = fut_map[fut]
                 avg_h, log_path = fut.result()
@@ -178,7 +237,7 @@ def run_trial(
                     per_cfg.append(avg_h)
     else:
         for cfg in CONFIGS:
-            avg_h, log_path = run_one(params, cfg, trial_id, logs_dir, python_exe)
+            avg_h, log_path = run_one(params, cfg, trial_id, logs_dir, python_exe, real_time_days)
             key = cfg[2]  # heuristic / optimization
             row[f"avg_completion_{key}_hours"] = avg_h
             row[f"log_{key}"] = str(log_path)
@@ -189,6 +248,15 @@ def run_trial(
 
 
 def flush_rows_csv(rows: List[Dict[str, Any]], out_csv: Path) -> None:
+    """执行 flush rows csv 对应的业务处理。
+
+    Args:
+        rows: 用于本函数处理的 `rows` 参数。
+        out_csv: 用于本函数处理的 `out_csv` 参数。
+
+    Returns:
+        None: 处理后的结果。
+    """
     if not rows:
         return
     with out_csv.open("w", newline="", encoding="utf-8-sig") as f:
@@ -198,6 +266,14 @@ def flush_rows_csv(rows: List[Dict[str, Any]], out_csv: Path) -> None:
 
 
 def load_existing_rows(out_csv: Path) -> List[Dict[str, Any]]:
+    """加载existing rows相关逻辑。
+
+    Args:
+        out_csv: 用于本函数处理的 `out_csv` 参数。
+
+    Returns:
+        List[Dict[str, Any]]: 处理后的结果。
+    """
     if not out_csv.exists():
         return []
     rows: List[Dict[str, Any]] = []
@@ -222,15 +298,24 @@ def load_existing_rows(out_csv: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+# ==========================================================================
+# 主函数：改进分配策略网格搜索入口
+# ==========================================================================
 def main() -> None:
+    """执行模块的主入口流程。
+
+    Returns:
+        None: 处理后的结果。
+    """
     parser = argparse.ArgumentParser(description="Grid search for proposed strategy params")
     parser.add_argument("--grid-json", type=str, default=None, help="JSON file: {param: [values,...]}")
     parser.add_argument("--max-trials", type=int, default=0, help="0 means run all combinations")
     parser.add_argument("--output-csv", type=str, default="logs/grid_search_proposed_future_results.csv")
     parser.add_argument("--logs-dir", type=str, default="logs/grid_search_future")
     parser.add_argument("--python", type=str, default=sys.executable)
-    parser.add_argument("--jobs", type=int, default=8, help="parallel trials to run")
+    parser.add_argument("--jobs", type=int, default=6, help="parallel trials to run")
     parser.add_argument("--parallel-configs", action="store_true", help="run heuristic/optimization in parallel inside each trial")
+    parser.add_argument("--real-time-days", type=int, default=15, help="每次试验使用的真实数据天数")
     parser.add_argument("--resume", action="store_true", help="resume from existing output-csv by skipping completed trial_id")
     args = parser.parse_args()
 
@@ -263,7 +348,7 @@ def main() -> None:
     if jobs == 1:
         for i, params in pending:
             print(f"[INFO] trial {i}/{len(all_params)} params={params}")
-            row = run_trial(i, params, logs_dir, args.python, args.parallel_configs)
+            row = run_trial(i, params, logs_dir, args.python, args.parallel_configs, args.real_time_days)
             rows.append(row)
             rows.sort(key=lambda r: int(r.get("trial_id", 0)))
             flush_rows_csv(rows, out_csv)
@@ -272,7 +357,7 @@ def main() -> None:
             future_map = {}
             for i, params in pending:
                 print(f"[INFO] submit trial {i}/{len(all_params)} params={params}")
-                fut = ex.submit(run_trial, i, params, logs_dir, args.python, args.parallel_configs)
+                fut = ex.submit(run_trial, i, params, logs_dir, args.python, args.parallel_configs, args.real_time_days)
                 future_map[fut] = i
             done_cnt = 0
             for fut in as_completed(future_map):

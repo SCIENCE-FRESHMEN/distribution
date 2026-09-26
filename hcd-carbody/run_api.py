@@ -14,8 +14,18 @@
 import argparse
 import uvicorn
 
+from api.logging_setup import create_uvicorn_log_config
 
+
+# ==========================================================================
+# 主函数：API 服务启动入口
+# ==========================================================================
 def main():
+    """执行模块的主入口流程。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
     parser = argparse.ArgumentParser(description="仓库调度系统 API 服务")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="监听端口 (默认: 8000)")
@@ -39,6 +49,7 @@ def main():
         reload=args.reload,
         workers=args.workers if not args.reload else 1,
         log_level="info",
+        log_config=create_uvicorn_log_config(),
     )
 
 

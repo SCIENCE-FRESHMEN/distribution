@@ -1,5 +1,6 @@
 """Mixed scheduling API routes."""
 
+import logging
 import traceback
 import uuid
 from datetime import datetime
@@ -14,9 +15,24 @@ from ..services.warehouse_service import WarehouseService, get_warehouse_service
 from ..state import PendingTaskStatus, TaskStateManager, get_task_state_manager
 
 router = APIRouter(prefix="/schedule", tags=["schedule"])
+logger = logging.getLogger("api.business")
 
 
+# ==========================================================================
+# 辅助函数：线路、SKU 属性和禁配校验归一化
+# ==========================================================================
 def _line_ref_to_token(core: Any, line_ref: Any, *, inbound: bool, aisle: Any = None) -> Any:
+    """将线路编号或既有 LxCy 口坐标转换为统一的库口位置标记。
+
+    Args:
+        core: WarehouseCore，提供 TimeEstimator 及巷道异构尺寸信息。
+        line_ref: 数字线路号、LxCy 标记或空值。
+        inbound: True 读取入库口映射，False 读取出库口映射。
+        aisle: 可选巷道号，用于异构巷道的库口坐标换算。
+
+    Returns:
+        Any: 标准 ``L{层}C{列}`` 标记；无法换算时保留原始非空值。
+    """
     if line_ref is None:
         return None
     s = str(line_ref).strip()
@@ -31,6 +47,8 @@ def _line_ref_to_token(core: Any, line_ref: Any, *, inbound: bool, aisle: Any = 
         return s
     try:
         est = getattr(core, "time_estimator", None)
+        if est is None:
+            return s
         if inbound:
             col, level = est.resolve_inbound_dock(line_num, default_layer=1, aisle=aisle)
         else:
@@ -41,10 +59,20 @@ def _line_ref_to_token(core: Any, line_ref: Any, *, inbound: bool, aisle: Any = 
 
 
 def _extract_line_meta_from_positions(core: Any, positions: List[Any], *, inbound: bool) -> Any:
+    """从已冻结货位提取入库线或出库线元数据。
+
+    Args:
+        core: 预留的上下文参数，保持与其他线路解析函数调用方式一致。
+        positions: 已匹配位置，优先读取其专用 in_line/out_line 字段。
+        inbound: True 提取入库线，False 提取出库线。
+
+    Returns:
+        Any: 首个有效线路元数据；找不到时返回 None。
+    """
     if not positions:
         return None
 
-    # Preferred: dedicated position-level metadata (not features payload).
+    # 优先使用独立的货位级元数据，不把货位信息混入 features 字段。
     for pos in positions:
         if inbound:
             val = getattr(pos, "in_line", None)
@@ -64,16 +92,32 @@ def _extract_line_meta_from_positions(core: Any, positions: List[Any], *, inboun
                     return v
 
     def _normalize_key(k: Any) -> str:
+        """将特征键转换为忽略下划线和大小写的比较形式。
+
+        Args:
+            k: 原始特征键。
+
+        Returns:
+            str: 例如 ``out_line`` 转为 ``outline``。
+        """
         return str(k).replace("_", "").strip().lower()
 
     def _pick_from_dict(d: Any) -> Any:
+        """从位置特征字典中兼容读取 inLine/outLine 别名。
+
+        Args:
+            d: 单层或上下层货位附带的特征字典。
+
+        Returns:
+            Any: 首个有效线路值；字典不含目标字段时返回 None。
+        """
         if not isinstance(d, dict):
             return None
-        # first pass: exact common names
+        # 第一轮：按常见名称精确查找。
         for key in ("inLine", "in_line") if inbound else ("outLine", "out_line"):
             if key in d and d[key] is not None and str(d[key]).strip():
                 return d[key]
-        # second pass: normalized key lookup
+        # 第二轮：对键名归一化后再查找。
         for k, v in d.items():
             if v is None or not str(v).strip():
                 continue
@@ -94,11 +138,21 @@ def _extract_line_meta_from_positions(core: Any, positions: List[Any], *, inboun
 
 
 def _normalize_sku_features(core: Any, skus: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """将 API SKU 条目的嵌套/顶层特征合并为标准化键值对。
+
+    Args:
+        core: WarehouseCore，用于执行键别名归一化。
+        skus: 一个任务的 SKU 条目列表。
+
+    Returns:
+        List[Dict[str, str]]: 与有效 SKU 对应的标准化属性集合。
+    """
     rows: List[Dict[str, str]] = []
     for s in skus or []:
         if not isinstance(s, dict):
             continue
-        feats = s.get("features") if isinstance(s.get("features"), dict) else {}
+        raw_features = s.get("features")
+        feats: Dict[str, Any] = raw_features if isinstance(raw_features, dict) else {}
         merged = dict(feats)
         for k, v in s.items():
             if k in ("skuId", "quantity", "features"):
@@ -123,6 +177,17 @@ def _normalize_sku_features(core: Any, skus: List[Dict[str, Any]]) -> List[Dict[
 
 
 def _evaluate_forbidden(core: Any, aisle_id: int, skus: List[Dict[str, Any]], task_id: str) -> Dict[str, Any]:
+    """执行 evaluate forbidden 对应的业务处理。
+
+    Args:
+        core: 用于本函数处理的 `core` 参数。
+        aisle_id: 目标巷道编号。
+        skus: 用于本函数处理的 `skus` 参数。
+        task_id: 任务唯一标识。
+
+    Returns:
+        Dict[str, Any]: 处理后的结果。
+    """
     rules = (getattr(core, "aisle_forbidden", {}) or {}).get(int(aisle_id), {})
     if not rules:
         return {
@@ -162,7 +227,17 @@ def _build_aisle_forbidden_checks(
     core: Any,
     aisle_assignments: List[Dict[str, Any]],
     task_skus_map: Dict[str, List[Dict[str, Any]]],
-) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
+    """构建巷道 forbidden checks相关逻辑。
+
+    Args:
+        core: 用于本函数处理的 `core` 参数。
+        aisle_assignments: 用于本函数处理的 `aisle_assignments` 参数。
+        task_skus_map: 用于本函数处理的 `task_skus_map` 参数。
+
+    Returns:
+        Dict[str, Any]: 处理后的结果。
+    """
     checked: List[Dict[str, Any]] = []
     violations: List[Dict[str, Any]] = []
     for row in aisle_assignments:
@@ -172,7 +247,10 @@ def _build_aisle_forbidden_checks(
         if str(task.get("taskType")) != TaskType.INBOUND.value:
             continue
         task_id = str(task.get("taskId"))
-        aisle_id = int(row.get("aisleId"))
+        aisle_value = row.get("aisleId")
+        if aisle_value is None:
+            continue
+        aisle_id = int(aisle_value)
         skus = task_skus_map.get(task_id, [])
         item = _evaluate_forbidden(core, aisle_id, skus, task_id)
         checked.append(item)
@@ -188,6 +266,14 @@ def _build_aisle_forbidden_checks(
 
 
 def _find_duplicate_task_ids(tasks: List[Any]) -> List[str]:
+    """查找duplicate 任务 ids相关逻辑。
+
+    Args:
+        tasks: 待处理的任务集合。
+
+    Returns:
+        List[str]: 处理后的结果。
+    """
     seen = set()
     duplicates = set()
     for task in tasks or []:
@@ -201,6 +287,16 @@ def _find_duplicate_task_ids(tasks: List[Any]) -> List[str]:
     return sorted(duplicates)
 
 
+def _request_task_value(task: Any, field_name: str) -> Any:
+    """兼容 Pydantic 请求对象和字典任务的字段读取。"""
+    if isinstance(task, dict):
+        return task.get(field_name)
+    return getattr(task, field_name, None)
+
+
+# ==========================================================================
+# 主函数：混合调度 API 路由
+# ==========================================================================
 @router.post("/mixed")
 async def mixed_schedule(
     request: MixedScheduleRequest,
@@ -214,6 +310,7 @@ async def mixed_schedule(
     try:
         duplicate_task_ids = _find_duplicate_task_ids(request.tasks or [])
         if duplicate_task_ids:
+            logger.warning("event=mixed_schedule_rejected reason=duplicate_request_task_ids task_ids=%s", duplicate_task_ids)
             return fail(
                 message="存在重复的taskId，无法执行调度。",
                 http_status=400,
@@ -223,12 +320,13 @@ async def mixed_schedule(
         active_task_ids = warehouse_service.get_active_task_ids() | set(task_manager.get_all_pending_tasks().keys())
         duplicate_active_ids = sorted(
             {
-                str(task.taskId if hasattr(task, "taskId") else task.get("taskId"))
+                str(_request_task_value(task, "taskId"))
                 for task in (request.tasks or [])
-                if str(task.taskId if hasattr(task, "taskId") else task.get("taskId")) in active_task_ids
+                if str(_request_task_value(task, "taskId")) in active_task_ids
             }
         )
         if duplicate_active_ids:
+            logger.warning("event=mixed_schedule_rejected reason=active_task_ids task_ids=%s", duplicate_active_ids)
             return fail(
                 message="存在已下发或执行中的taskId，无法重复提交。",
                 http_status=400,
@@ -239,18 +337,20 @@ async def mixed_schedule(
         task_manager_state = task_manager.save_state()
 
         current_stage = "sync_production_context"
+        ignored_plan_ids: List[str] = []
         if request.productionPlan is not None:
             operation_type = getattr(request.productionPlan, "operationType", None)
             op_value = str(getattr(operation_type, "value", operation_type or "")).upper()
             is_update = op_value == "UPDATE"
             reset_assigned = bool(getattr(request.productionPlan, "resetAssigned", False))
-            warehouse_service.set_production_plan(
+            plan_result = warehouse_service.set_production_plan(
                 request.productionPlan,
                 update=is_update,
                 reset_assigned=reset_assigned,
                 current_groups=request.currentGroups,
                 legacy_current_groups=request.productionLineCurrentGroup,
             )
+            ignored_plan_ids = list(plan_result.get("ignoredPlanIds", []) or [])
             if is_update and reset_assigned:
                 task_manager.clear_all()
         elif request.currentGroups is not None or request.productionLineCurrentGroup is not None:
@@ -271,10 +371,10 @@ async def mixed_schedule(
         task_skus_map: Dict[str, List[Dict[str, Any]]] = {}
         task_line_map: Dict[str, Dict[str, Any]] = {}
         for t in (request.tasks or []):
-            tid = t.taskId if hasattr(t, "taskId") else t.get("taskId")
-            skus = t.skus if hasattr(t, "skus") else t.get("skus", [])
-            in_line_raw = t.inLine if hasattr(t, "inLine") else t.get("inLine")
-            out_line_raw = t.outLine if hasattr(t, "outLine") else t.get("outLine")
+            tid = _request_task_value(t, "taskId")
+            skus = _request_task_value(t, "skus") or []
+            in_line_raw = _request_task_value(t, "inLine")
+            out_line_raw = _request_task_value(t, "outLine")
             if tid is not None:
                 task_line_map[str(tid)] = {
                     "inLine": in_line_raw,
@@ -336,6 +436,7 @@ async def mixed_schedule(
 
             positions = []
             task_skus = []
+            resolved_outbound_entries = []
             for s in (assigned_task.skus or []):
                 if isinstance(s, dict):
                     task_skus.append(dict(s))
@@ -345,12 +446,18 @@ async def mixed_schedule(
                     task_skus.append(s.dict())
                 else:
                     task_skus.append({"skuId": getattr(s, "skuId", ""), "quantity": getattr(s, "quantity", 1)})
+            if assigned_task.task_type == "OUTBOUND":
+                try:
+                    resolved_outbound_entries = warehouse_service._resolve_outbound_inventory_removal_entries(assigned_task)
+                except Exception:
+                    resolved_outbound_entries = []
 
             if assigned_task.positions:
                 for idx, pos in enumerate(assigned_task.positions):
                     sku_id = ""
                     quantity = 0
                     sku_attrs: Dict[str, Any] = {}
+                    resolved_entry = resolved_outbound_entries[idx] if idx < len(resolved_outbound_entries) else None
                     if idx < len(task_skus):
                         sku_dict = task_skus[idx] or {}
                         sku_id = sku_dict.get("skuId", "") or ""
@@ -372,6 +479,13 @@ async def mixed_schedule(
                             or getattr(pos, "lower_quantity", 0)
                             or getattr(pos, "quantity", 0)
                         )
+                    if resolved_entry is not None:
+                        resolved_sku = str(resolved_entry.get("skuId") or "").strip()
+                        if resolved_sku:
+                            sku_id = resolved_sku
+                        resolved_features = resolved_entry.get("features")
+                        if isinstance(resolved_features, dict) and resolved_features:
+                            sku_attrs = dict(resolved_features)
 
                     if match_fields and not sku_attrs:
                         if hasattr(pos, "is_double_layer") and pos.is_double_layer:
@@ -428,13 +542,13 @@ async def mixed_schedule(
                 "positions": positions if positions else None,
             }
 
-            # Prefer echoing original request line refs for the same task.
+            # 同一任务存在原始请求产线标识时，优先沿用该标识返回。
             req_lines = task_line_map.get(str(assigned_task.task_id), {})
             if req_lines.get("inLine") is not None:
                 assigned_response["inLine"] = req_lines.get("inLine")
             if req_lines.get("outLine") is not None:
                 assigned_response["outLine"] = req_lines.get("outLine")
-            # For non-request-generated tasks, try inventory instance metadata.
+            # 对于不是由本次请求生成的任务，尝试从库存实例元数据中获取产线信息。
             if req_lines.get("inLine") is None:
                 meta_in = _extract_line_meta_from_positions(
                     warehouse_service.core,
@@ -471,6 +585,11 @@ async def mixed_schedule(
         if not forbidden_check.get("passed", True):
             warehouse_service.restore_state(service_state)
             task_manager.restore_state(task_manager_state)
+            logger.warning(
+                "event=mixed_schedule_rejected schedule_id=%s reason=aisle_forbidden violations=%s",
+                schedule_id,
+                forbidden_check.get("violations", []),
+            )
             return fail(
                 message="命中禁配规则，调度失败。",
                 http_status=400,
@@ -483,12 +602,31 @@ async def mixed_schedule(
                 },
             )
 
+        assigned_summary = [
+            {
+                "aisleId": assignment["aisleId"],
+                "taskId": assignment["assignedTask"]["taskId"],
+                "taskType": assignment["assignedTask"]["taskType"],
+                "positions": assignment["assignedTask"].get("positions") or [],
+            }
+            for assignment in aisle_assignments
+            if assignment.get("assignedTask") is not None
+        ]
+        logger.info(
+            "event=mixed_schedule_success schedule_id=%s request_task_ids=%s assigned=%s unsubmitted_outbound=%s unconfirmed=%s",
+            schedule_id,
+            [str(_request_task_value(task, "taskId")) for task in (request.tasks or [])],
+            assigned_summary,
+            [str(task.get("taskId", "")) for task in (unsubmitted_outbound_tasks or []) if isinstance(task, dict)],
+            unconfirmed_task_ids,
+        )
         return ok(
             status_code="SUCCESS",
             message="调度成功。",
             data={
                 "scheduleId": schedule_id,
                 "timestamp": timestamp,
+                "ignoredPlanIds": ignored_plan_ids,
                 "unconfirmedTaskIds": unconfirmed_task_ids,
                 "aisleAssignments": aisle_assignments,
                 "unsubmittedOutboundTasks": unsubmitted_outbound_tasks,
@@ -506,6 +644,12 @@ async def mixed_schedule(
         if service_state is not None and task_manager_state is not None:
             warehouse_service.restore_state(service_state)
             task_manager.restore_state(task_manager_state)
+        logger.warning(
+            "event=mixed_schedule_validation_error stage=%s task_ids=%s reason=%s",
+            current_stage,
+            [str(_request_task_value(task, "taskId")) for task in (request.tasks or [])],
+            str(e),
+        )
         return fail(
             message="请求参数校验失败。",
             http_status=400,
@@ -520,6 +664,12 @@ async def mixed_schedule(
             warehouse_service.restore_state(service_state)
             task_manager.restore_state(task_manager_state)
         tb_lines = traceback.format_exc().splitlines()
+        logger.exception(
+            "event=mixed_schedule_error stage=%s task_ids=%s error=%s",
+            current_stage,
+            [str(_request_task_value(task, "taskId")) for task in (request.tasks or [])],
+            str(e),
+        )
         return fail(
             message="调度执行失败。",
             http_status=500,
@@ -532,7 +682,7 @@ async def mixed_schedule(
                     "inventory_count": len(request.inventory or []),
                     "task_count": len(request.tasks or []),
                     "task_ids": [
-                        (t.taskId if hasattr(t, "taskId") else t.get("taskId"))
+                        _request_task_value(t, "taskId")
                         for t in (request.tasks or [])
                     ],
                 },

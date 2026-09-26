@@ -1,3 +1,7 @@
+"""time_estimator 模块。提供该文件定义的运行入口、数据处理或辅助能力。"""
+
+# 模块职责：将任务位置、出入库口和双梁顺序转换为路径，并估算设备耗时；
+# 只返回估算结果，不修改 WarehouseCore 的库存或任务状态。
 from typing import List, Optional, Dict, Any, Tuple, Union
 from pathlib import Path
 import json
@@ -11,14 +15,25 @@ from config_loader import load_jsonc
 from simulation.position import InventoryPosition
 
 import warnings
-from sklearn.base import InconsistentVersionWarning
-
-warnings.filterwarnings('ignore', category=InconsistentVersionWarning)
-
+# 反序列化旧版 sklearn 模型时可能产生版本不一致告警。不同 sklearn/Pylance
+# 类型存根版本未必公开该告警类，按稳定的告警文本过滤，避免绑定内部类型名称。
+warnings.filterwarnings(
+    "ignore",
+    message=r"Trying to unpickle estimator .*",
+    category=UserWarning,
+)
 
 def load_time_estimator_config(path: Optional[str]) -> dict:
-    """
-    Load estimator config from a JSON file if provided.
+    """读取可选的 JSON/JSONC 时间估算配置，失败时返回空配置。
+
+    估算器因此可以在无模型、无配置文件的开发环境中继续使用默认
+    物理参数，而不会阻断仓库核心初始化。
+
+    Args:
+        path (Optional[str]): 需要读取、写入或检查的文件路径。
+
+    Returns:
+        dict: 按函数约定字段组织的计算结果映射。
     """
     if not path:
         return {}
@@ -55,16 +70,18 @@ class TimeEstimator:
                  a_layer: float = 0.075,
                  config_path: Optional[str] = "config/time_estimator.json",
                  ):
-        """
-        Args:
+        """Args:
             model_path: path to residual model file
             pickup_time_default, drop_time_default: fallback pick/drop seconds when missing in data
             load_model: whether to load residual models
             config_path: config json path (default "config/time_estimator.json")
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
         """
         cfg = load_time_estimator_config(config_path)
 
-        # load model path from config (if any)
+# 如配置提供模型路径，则读取该路径。
         self.model_path = cfg.get("model_path", model_path)
 
         self.pickup_time_default = float(cfg.get("pickup_time_default", pickup_time_default))
@@ -88,8 +105,8 @@ class TimeEstimator:
             "a_col": float(physics_cfg.get("a_col", a_col)),
             "a_layer": float(physics_cfg.get("a_layer", a_layer)),
         }
-        
-        # load trained residual models if available
+
+# 如存在已训练的残差模型，则加载模型。
         self.inbound_model = None
         self.outbound_model = None
         if self.load_model:
@@ -101,7 +118,14 @@ class TimeEstimator:
         ]
 
     def _load_model(self):
-        """加载时间预测模型"""
+        """加载时间预测模型
+
+        Args:
+            None: 无显式业务参数；使用实例状态或模块配置。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
+        """
         try:
             models = joblib.load(self.model_path)
             self.inbound_model = models["inbound_model"]
@@ -113,7 +137,7 @@ class TimeEstimator:
             # 如果加载失败，保留None，后续逻辑会处理
 
     # -----------------------------
-    # Public estimate APIs
+# 对外提供的时间估算接口。
     # -----------------------------
     def estimate_inbound_time(self,
                               target_position: List[InventoryPosition],
@@ -122,7 +146,11 @@ class TimeEstimator:
                               current_position: Optional[InventoryPosition] = None,
                               ) -> float:
         """
-        入库单任务时间估计
+        估计单梁或双梁入库任务耗时（秒）。
+
+        方法把目标位置转换为统一的任务记录，先构造堆垛机路径，再按
+        列/层物理参数计算移动时间；若加载了残差模型，则以路径特征
+        预测的 residual 修正物理时间，否则使用固定残差默认值。
         Args:
             target_position: List[InventoryPosition]
             skus: SKU列表
@@ -211,20 +239,24 @@ class TimeEstimator:
             default_dock_layer=1
         )
         seq = self._augment_sequence_physics2d(seq, **self.physics_params)
-        
+
         if dual:
             # 双梁入库只计算第二个任务的时间
             i = 1
         else:
             # 单梁入库计算第一个（也是唯一一个）任务的时间
             i = 0
-            
+
         physics_time = float(seq.iloc[i].get("physics_time_total", 0.0))
         pickdrop = float(seq.iloc[i].get("取放时间_sec", self.pickup_time_default + self.drop_time_default))
-        
-        # residual features
-        X = pd.DataFrame([seq.iloc[i][self.feature_names].values], columns=self.feature_names)
-        
+
+        # 残差模型仅接收训练时约定的特征列；显式构造 Index，避免 pandas
+        # 类型存根将普通字符串列表误判为 DataFrame 的其他构造参数。
+        X = pd.DataFrame(
+            data=[seq.iloc[i][self.feature_names].values],
+            columns=pd.Index(self.feature_names),
+        )
+
         residual = 0.0
         if self.inbound_model is not None:
             pred = getattr(self.inbound_model, 'predict')(X)
@@ -232,7 +264,7 @@ class TimeEstimator:
         else:
             # 若没有模型，则使用默认值
             residual = 3.0
-        
+
         total_time = residual + physics_time + pickdrop
 
         return float(total_time)
@@ -244,7 +276,11 @@ class TimeEstimator:
                                current_position: Optional[InventoryPosition] = None,
                                ) -> float:
         """
-        出库单任务时间估计
+        估计单次出库任务耗时（秒）。
+
+        source_position 采用 ``(row, column, level)`` 结构；目标位置到
+        出库口的路径由 ``_build_sequence`` 生成，真实库存扣减不在本类
+        发生，本类只返回调度器使用的时间估计。
         Args:
             source_position: (GL_Row, GL_Column, GL_Layer)
             skus, raw_layer, current_position: same as inbound
@@ -291,7 +327,7 @@ class TimeEstimator:
             residual = 3.0
 
         total_time = residual + physics_time + pickdrop
-        
+
         return float(total_time)
 
     def _build_sequence(
@@ -306,12 +342,16 @@ class TimeEstimator:
         dock_map_out=None,
         start_pos_dict=None,
     ):
-        """
-        构建任务序列特征
+        """将原始任务表转换为逐任务路径记录。
+
+        每条记录包含起点、目标点、出入库口、列/层位移、取放时间和
+        总时间。双梁入库的第二根梁复用第一根梁的首段路径，并追加从
+        上一落位点到当前目标点的移动段，以反映同一批次的连续作业。
         每个 roadway 有通过start_pos_dict指定独立的起始位置
         增加字段：
             - 取放时间_sec：根据任务类型和QROrder自动计算
             - 移动时间_sec：= 总时间 - 取放时间_sec
+
         """
         # 如果没有提供dock_in_col和dock_out_col，则使用实例变量
         if dock_in_col is None:
@@ -320,11 +360,27 @@ class TimeEstimator:
             dock_out_col = self.dock_out_col
 
         def _parse_task(x):
+            """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+            Args:
+                x (Any): 供当前处理流程使用的 `x` 值。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             if x in [0, 1, 3, 4]:
                 return int(x)
             return np.nan
 
         def _to_seconds(val):
+            """执行 `_to_seconds` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+            Args:
+                val (Any): 待解析、格式化或计算的原始值。
+
+            Returns:
+                Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
+            """
             if pd.isna(val):
                 return np.nan
             if isinstance(val, timedelta):
@@ -495,13 +551,16 @@ class TimeEstimator:
                 last_seg2 = (seg2_col, seg2_layer)
 
         return pd.DataFrame(recs)
-    
+
     def _travel_time_1d(self, d: float, v_max: float, a: float) -> float:
-        """
-        单方向加速-匀速-减速时间计算
+        """计算单方向加速-匀速-减速时间。
+
+        距离不足以达到最大速度时使用三角速度曲线，否则使用梯形
+        速度曲线；返回值用于列向或层向时间的独立估算。
         d: 距离 (m)
         v_max: 最大速度 (m/s)
         a: 加速度 (m/s^2)
+
         """
         if d <= 0:
             return 0.0
@@ -514,13 +573,13 @@ class TimeEstimator:
         else:
             # 达到 vmax，梯形速度曲线
             return 2 * t_acc + (d - 2 * d_acc) / v_max
-    
+
     def _physics_time_2d(self, delta_col: float, delta_layer: float,
                     col_scale=15.0, layer_scale=0.5,
                     v_col_max=1.6, v_layer_max=0.6,  # 分别定义水平和垂直最大速度
                     a_col=0.2, a_layer=0.4) -> float:
-        """
-        计算堆垛机在列/层方向的物理最小时间，取两方向时间的 max
+        """计算列向与层向并行动作的物理时间，取两方向耗时的较大值。
+
         """
         d_col = abs(delta_col) * col_scale
         d_layer = abs(delta_layer) * layer_scale
@@ -535,8 +594,11 @@ class TimeEstimator:
                                 col_scale=15.0, layer_scale=0.5,
                                 v_col_max=1.5, v_layer_max=0.625,
                                 a_col=0.15, a_layer=0.075):
-        """
-        在 df_seq 中添加列/层独立距离和物理基线时间特征
+        """为路径表补充列/层距离、各段物理时间和总物理时间。
+
+        ``residual`` 记录观测移动时间与物理基线的差值，供随机森林
+        残差模型训练或诊断使用；该方法返回副本，不修改调用方原表。
+
         """
         df_seq = df_seq.copy()
         df = df_seq.copy().reset_index(drop=True)
@@ -566,12 +628,17 @@ class TimeEstimator:
         df_seq.loc[:, "residual"] = (df_seq["移动时间_sec"] - df["physics_time_total"]).values
 
         return df_seq
-    
+
 
     # -------------- 更多可扩展的方法 --------------
     def update_with_new_data(self, new_data: pd.DataFrame, task_type: str = "inbound"):
-        """
-        占位：接收新数据（历史任务），可以用于后续微调/增量训练 residual 模型
+        """接收历史任务数据的扩展接口。
+
+        当前实现只记录输入规模，不在在线调度期间修改已加载模型；
+        增量训练由独立训练脚本完成，避免运行中的模型被部分数据覆盖。
+
+        Returns:
+            None: 通过实例状态、队列或外部副作用完成处理。
         """
         # 这里只做接口占位；实际训练逻辑交由调用者或单独训练脚本实现
         print(f"[INFO] Received {len(new_data)} records to update {task_type} model. Implement training externally.")

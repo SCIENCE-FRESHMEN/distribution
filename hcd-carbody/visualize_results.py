@@ -10,6 +10,11 @@ import argparse
 import re
 import csv
 from pathlib import Path
+import matplotlib
+
+# 批量脚本只落盘 PNG/CSV，不打开交互式图窗；否则 ``plt.show()`` 会在无桌面
+# 会话中阻塞，导致后续图表无法生成。
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -38,7 +43,7 @@ STRATEGIES = {
 }
 
 # 仅使用的天数；设为空集合表示不筛选
-DAYS_FILTER = {}
+DAYS_FILTER: set = set()
 
 # 为每个策略指定固定颜色，所有图保持一致（仿照示例：灰/浅蓝/深蓝）
 COLORS = {
@@ -52,9 +57,12 @@ COLORS = {
 OUTPUT_DIR = Path("visualization/compare")
 
 
+# ==========================================================================
+# 辅助函数：日志解析、指标计算和图形输出
+# ==========================================================================
 def save_fig(filename: str) -> None:
     """保存当前图形到指定文件路径
-    
+
     Args:
         filename: 要保存的文件名
     """
@@ -64,15 +72,20 @@ def save_fig(filename: str) -> None:
     print(f"[INFO] saved {out_path}")  # 输出保存成功的提示信息
 
 
+def _get_opt_only_strategy_data(all_data: dict) -> dict:
+    """仅返回以 -opt 结尾的策略数据。"""
+    return {strategy_file: data for strategy_file, data in all_data.items() if str(strategy_file).endswith("-opt")}
+
+
 def parse_log_file(file_path: Path):
     """解析单个日志文件，返回结构化数据
-    
+
     从日志文件中提取各类统计信息，包括每日汇总、配对率、任务完成时间、
     移库数量、巷道忙碌时间等，并将其组织成易于处理的字典结构。
-    
+
     Args:
         file_path: 日志文件路径
-        
+
     Returns:
         包含解析后数据的字典
     """
@@ -89,6 +102,9 @@ def parse_log_file(file_path: Path):
         "task_completion_details": {}, # 任务完成详情
         "aisle_busy_times": {},       # 巷道忙碌时间
         "production_lines": {},       # 生产线信息
+        "optimization_solve_times": [],
+        "optimization_solve_times_by_day": {},
+        "optimization_solve_time_buckets": {"0-1s": 0, "1-2s": 0, "2s以上": 0},
     }
 
     content = file_path.read_text(encoding="utf-8")
@@ -230,18 +246,38 @@ def parse_log_file(file_path: Path):
             earliest = min(day_times)
             data["pairing_start_by_day"][day] = data["pairing_rates"][earliest]
 
+    optimize_time_pattern = re.compile(r"\[优化器\]调度完成，耗时([\d.]+)秒")
+    current_day = None
+    for line in content.splitlines():
+        day_match = re.search(r"\[DAY\s+(\d+)", line)
+        if day_match:
+            current_day = int(day_match.group(1))
+        match = optimize_time_pattern.search(line)
+        if not match:
+            continue
+        solve_seconds = float(match.group(1))
+        data["optimization_solve_times"].append(solve_seconds)
+        if current_day is not None:
+            data["optimization_solve_times_by_day"].setdefault(current_day, []).append(solve_seconds)
+        if solve_seconds < 1.0:
+            data["optimization_solve_time_buckets"]["0-1s"] += 1
+        elif solve_seconds < 2.0:
+            data["optimization_solve_time_buckets"]["1-2s"] += 1
+        else:
+            data["optimization_solve_time_buckets"]["2s以上"] += 1
+
     return data
 
 
 def _filter_days(data: dict, days_filter: set):
     """按天过滤数据，并重算相关汇总。
-    
+
     根据指定的天数过滤器，从数据中移除不需要的天的数据，并重新计算相关的汇总信息。
-    
+
     Args:
         data: 包含原始数据的字典
         days_filter: 要保留的天数集合
-        
+
     Returns:
         过滤后的数据字典
     """
@@ -249,7 +285,7 @@ def _filter_days(data: dict, days_filter: set):
         return data
 
     # 按天的字典数据过滤
-    for key in ["daily_summary", "tasks_completed_per_day", "relocation_counts_by_day", "task_completion_details", "pairing_start_by_day"]:
+    for key in ["daily_summary", "tasks_completed_per_day", "relocation_counts_by_day", "task_completion_details", "pairing_start_by_day", "optimization_solve_times_by_day"]:
         if key in data and isinstance(data[key], dict):
             data[key] = {d: v for d, v in data[key].items() if d in days_filter}
 
@@ -278,13 +314,13 @@ def _filter_days(data: dict, days_filter: set):
 
 def calculate_aisle_busy_times(task_details):
     """计算每一天的巷道忙碌时间，返回 {day: {aisle: stats}}。
-    
+
     根据任务完成详情计算每个巷道在每天的忙碌时间，包括入库时间、出库时间、
     总时间、利用率等统计信息。
-    
+
     Args:
         task_details: 任务完成详情字典，格式为 {day: [task_detail, ...]}
-        
+
     Returns:
         巷道忙碌时间统计字典，格式为 {day: {aisle: stats, "avg": avg_stats}}
     """
@@ -345,14 +381,117 @@ def calculate_aisle_busy_times(task_details):
     return day_stats
 
 
+def _calculate_aisle_load_balance_stats(aisle_busy_times):
+    """执行 calculate 巷道 load balance stats 对应的业务处理。
+
+    Args:
+        aisle_busy_times: 用于本函数处理的 `aisle_busy_times` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    numeric_aisles = [k for k in aisle_busy_times.keys() if isinstance(k, (int, float))]
+    loads = [aisle_busy_times[a]["total_time"] for a in numeric_aisles if "total_time" in aisle_busy_times[a]]
+    if not loads:
+        return None
+
+    avg_load = sum(loads) / len(loads)
+    if avg_load <= 0:
+        return {
+            "avg_load": avg_load,
+            "max_deviation_ratio": 0.0,
+            "within_10pct": True,
+            "deviation_ratios": [0.0 for _ in loads],
+        }
+
+    deviation_ratios = [abs(v - avg_load) / avg_load for v in loads]
+    max_deviation_ratio = max(deviation_ratios) if deviation_ratios else 0.0
+    return {
+        "avg_load": avg_load,
+        "max_deviation_ratio": max_deviation_ratio,
+        "within_10pct": max_deviation_ratio <= 0.10,
+        "deviation_ratios": deviation_ratios,
+    }
+
+
+def _calculate_aisle_task_count_balance_stats(day_tasks):
+    """执行 calculate 巷道 任务 count balance stats 对应的业务处理。
+
+    Args:
+        day_tasks: 用于本函数处理的 `day_tasks` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    counts_by_aisle = {}
+    for task in day_tasks or []:
+        aisle = task.get("aisle")
+        if aisle is None:
+            continue
+        counts_by_aisle[aisle] = counts_by_aisle.get(aisle, 0) + 1
+
+    counts = list(counts_by_aisle.values())
+    if not counts:
+        return None
+
+    avg_count = sum(counts) / len(counts)
+    if avg_count <= 0:
+        return {
+            "avg_count": avg_count,
+            "max_deviation_count": 0.0,
+            "max_deviation_ratio": 0.0,
+            "within_10pct": True,
+        }
+
+    deviation_counts = [abs(v - avg_count) for v in counts]
+    deviation_ratios = [abs(v - avg_count) / avg_count for v in counts]
+    max_deviation_count = max(deviation_counts) if deviation_counts else 0.0
+    max_deviation_ratio = max(deviation_ratios) if deviation_ratios else 0.0
+    return {
+        "avg_count": avg_count,
+        "max_deviation_count": max_deviation_count,
+        "max_deviation_ratio": max_deviation_ratio,
+        "within_10pct": max_deviation_ratio <= 0.10,
+    }
+
+
+def _filter_plot_days(days_list):
+    """图上保留全部天数，是否排除首日只体现在图例平均值里。"""
+    return list(days_list)
+
+
+def _format_dual_avg_label(strategy_name, day_value_pairs, formatter):
+    """执行 format dual avg label 对应的业务处理。
+
+    Args:
+        strategy_name: 用于本函数处理的 `strategy_name` 参数。
+        day_value_pairs: 用于本函数处理的 `day_value_pairs` 参数。
+        formatter: 用于本函数处理的 `formatter` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    values_all = [value for day, value in day_value_pairs if isinstance(value, (int, float)) and value > 0]
+    if not values_all:
+        return strategy_name
+
+    values_excl_day1 = [
+        value for day, value in day_value_pairs
+        if day != 1 and isinstance(value, (int, float)) and value > 0
+    ]
+    avg_all = sum(values_all) / len(values_all)
+    avg_excl_day1 = (sum(values_excl_day1) / len(values_excl_day1)) if values_excl_day1 else avg_all
+    return f"{strategy_name}: {formatter(avg_all)}({formatter(avg_excl_day1)})"
+
+
 def load_all_data(log_dir="logs"):
     """加载所有日志文件的数据并解析成结构化数据
-    
+
     遍历日志目录中的所有相关日志文件，解析每个文件并将结果组织成字典返回
-    
+
     Args:
         log_dir: 日志文件所在的目录路径
-        
+
     Returns:
         包含所有策略数据的字典，格式为 {strategy_file: parsed_data}
     """
@@ -371,9 +510,9 @@ def load_all_data(log_dir="logs"):
 
 def plot_pairing_start_by_day(all_data):
     """按天分组展示每日开始配对率（含solo）。
-    
+
     生成一个柱状图，显示每天开始时不同策略的配对率情况，便于比较不同策略的初始配对效果。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -428,9 +567,9 @@ def plot_pairing_start_by_day(all_data):
 
 def plot_tasks_completed_per_day(all_data):
     """按天分组的柱状图：同一天的三个策略并排对比。
-    
+
     生成一个柱状图，显示每天不同策略完成的任务数，包括入库和出库任务数量。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -489,9 +628,9 @@ def plot_tasks_completed_per_day(all_data):
 
 def plot_completion_times(all_data):
     """按天分组展示每日最后出库完成时间。
-    
+
     生成一个柱状图，显示每天最后一个出库任务的完成时间，用于比较不同策略的效率。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -552,10 +691,10 @@ def plot_completion_times(all_data):
 
 def _plot_daily_hourly_throughput(all_data, task_type_label: str, out_name: str, y_label: str, title: str):
     """计算并绘制日均每小时吞吐量图表（完成任务数/完成时间）。
-    
+
     计算每天每小时的平均吞吐量（任务数/小时），用于评估不同策略的效率。
     计算公式为：完成任务数 / 最后完成时间（小时）
-    
+
     Args:
         all_data: 包含所有策略数据的字典
         task_type_label: 任务类型标签（"入库" 或 "出库"）
@@ -644,9 +783,9 @@ def plot_inbound_hourly_throughput(all_data):
 
 def plot_relocation_counts_by_day(all_data):
     """按天分组展示移库数量。
-    
+
     生成一个柱状图，显示每天不同策略下的移库数量，用于比较不同策略的移库效率。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -693,9 +832,9 @@ def plot_relocation_counts_by_day(all_data):
 
 def plot_avg_utilization_by_day(all_data):
     """按天分组展示平均巷道总占用率（来自每天下的 avg 条目）。
-    
+
     生成一个柱状图，显示每天不同策略下的平均巷道占用率，用于比较不同策略的设备利用率。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -747,9 +886,298 @@ def plot_avg_utilization_by_day(all_data):
     save_fig("avg_utilization_by_day.png")
     plt.show()
 
+
+def plot_aisle_used_time_std_by_day(all_data):
+    """执行 plot 巷道 used 时间 std by day 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    plt.figure(figsize=(12, 7))
+    strategies = list(STRATEGIES.items())
+    if DAYS_FILTER:
+        days_list = sorted(DAYS_FILTER)
+    else:
+        day_set = set()
+        for data in all_data.values():
+            day_set |= set(data.get("aisle_busy_times", {}).keys())
+        days_list = sorted(day_set)
+    days_list = _filter_plot_days(days_list)
+    if not days_list:
+        print("无巷道用时标准差数据，跳过图表")
+        return
+
+    x = np.arange(len(days_list))
+    total_width = 0.75
+    bar_width = total_width / len(strategies)
+
+    for idx_strategy, (strategy_file, strategy_name) in enumerate(strategies):
+        day_stats = all_data.get(strategy_file, {}).get("aisle_busy_times", {})
+        heights = []
+        for day in days_list:
+            aisle_busy_times = day_stats.get(day, {})
+            numeric_aisles = [k for k in aisle_busy_times.keys() if isinstance(k, (int, float))]
+            used_times = [aisle_busy_times[a]["total_time"] for a in numeric_aisles]
+            if not used_times:
+                heights.append(0.0)
+                continue
+            mean_val = sum(used_times) / len(used_times)
+            variance = sum((v - mean_val) ** 2 for v in used_times) / len(used_times)
+            heights.append(variance ** 0.5)
+        legend_label = _format_dual_avg_label(
+            strategy_name,
+            list(zip(days_list, heights)),
+            lambda x: f"{x:.2f}s",
+        )
+        offsets = x + (idx_strategy - (len(strategies) - 1) / 2) * bar_width
+        bars = plt.bar(offsets, heights, width=bar_width, label=legend_label, color=COLORS.get(strategy_file))
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2, h + 0.02, f"{h:.2f}", ha="center", va="bottom", fontsize=10)
+
+    plt.xticks(x, [f"Day {d}" for d in days_list])
+    plt.xlabel("天数")
+    plt.ylabel("巷道用时标准差 (s)")
+    title = "每日巷道用时标准差"
+    plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+    plt.legend(frameon=False, ncol=len(strategies), loc="upper center", bbox_to_anchor=(0.5, 1.1))
+    plt.subplots_adjust(bottom=0.12)
+    plt.figtext(0.5, 0.005, title, ha="center", fontsize=14)
+    save_fig("aisle_used_time_std_by_day.png")
+    plt.show()
+
+
+def plot_aisle_load_max_deviation_by_day(all_data):
+    """执行 plot 巷道 load max deviation by day 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    plt.figure(figsize=(12, 7))
+    strategies = list(STRATEGIES.items())
+    if DAYS_FILTER:
+        days_list = sorted(DAYS_FILTER)
+    else:
+        day_set = set()
+        for data in all_data.values():
+            day_set |= set(data.get("aisle_busy_times", {}).keys())
+        days_list = sorted(day_set)
+    days_list = _filter_plot_days(days_list)
+    if not days_list:
+        print("无巷道时间偏差数据，跳过图表")
+        return
+
+    x = np.arange(len(days_list))
+    total_width = 0.75
+    bar_width = total_width / len(strategies)
+
+    for idx_strategy, (strategy_file, strategy_name) in enumerate(strategies):
+        day_stats = all_data.get(strategy_file, {}).get("aisle_busy_times", {})
+        heights = []
+        for day in days_list:
+            balance_stats = _calculate_aisle_load_balance_stats(day_stats.get(day, {})) if day_stats.get(day) else None
+            heights.append((balance_stats["max_deviation_ratio"] * 100.0) if balance_stats else 0.0)
+        legend_label = _format_dual_avg_label(
+            strategy_name,
+            list(zip(days_list, heights)),
+            lambda x: f"{x:.2f}%",
+        )
+        offsets = x + (idx_strategy - (len(strategies) - 1) / 2) * bar_width
+        bars = plt.bar(offsets, heights, width=bar_width, label=legend_label, color=COLORS.get(strategy_file))
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2, h + 0.3, f"{h:.1f}%", ha="center", va="bottom", fontsize=10)
+
+    plt.axhline(10.0, color="red", linestyle="--", linewidth=1.5, label="10% 阈值")
+    plt.xticks(x, [f"Day {d}" for d in days_list])
+    plt.xlabel("天数")
+    plt.ylabel("巷道最大时间偏差 (%)")
+    title = "每日巷道最大时间偏差"
+    plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+    plt.legend(frameon=False, ncol=min(len(strategies) + 1, 3), loc="upper center", bbox_to_anchor=(0.5, 1.12))
+    plt.subplots_adjust(bottom=0.12)
+    plt.figtext(0.5, 0.005, title, ha="center", fontsize=14)
+    save_fig("aisle_load_max_deviation_by_day.png")
+    plt.show()
+
+
+def plot_aisle_task_count_max_deviation_by_day(all_data):
+    """执行 plot 巷道 任务 count max deviation by day 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    plt.figure(figsize=(12, 7))
+    strategies = list(STRATEGIES.items())
+    if DAYS_FILTER:
+        days_list = sorted(DAYS_FILTER)
+    else:
+        day_set = set()
+        for data in all_data.values():
+            day_set |= set(data.get("task_completion_details", {}).keys())
+        days_list = sorted(day_set)
+    days_list = _filter_plot_days(days_list)
+    if not days_list:
+        print("无巷道任务量偏差数据，跳过图表")
+        return
+
+    x = np.arange(len(days_list))
+    total_width = 0.75
+    bar_width = total_width / len(strategies)
+
+    for idx_strategy, (strategy_file, strategy_name) in enumerate(strategies):
+        day_tasks = all_data.get(strategy_file, {}).get("task_completion_details", {})
+        heights = []
+        for day in days_list:
+            balance_stats = _calculate_aisle_task_count_balance_stats(day_tasks.get(day, []))
+            heights.append((balance_stats["max_deviation_ratio"] * 100.0) if balance_stats else 0.0)
+        legend_label = _format_dual_avg_label(
+            strategy_name,
+            list(zip(days_list, heights)),
+            lambda x: f"{x:.2f}%",
+        )
+        offsets = x + (idx_strategy - (len(strategies) - 1) / 2) * bar_width
+        bars = plt.bar(offsets, heights, width=bar_width, label=legend_label, color=COLORS.get(strategy_file))
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2, h + 0.3, f"{h:.1f}%", ha="center", va="bottom", fontsize=10)
+
+    plt.axhline(10.0, color="red", linestyle="--", linewidth=1.5, label="10% 阈值")
+    plt.xticks(x, [f"Day {d}" for d in days_list])
+    plt.xlabel("天数")
+    plt.ylabel("巷道任务量偏差 (%)")
+    title = "每日巷道任务量最大偏差"
+    plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+    plt.legend(frameon=False, ncol=min(len(strategies) + 1, 3), loc="upper center", bbox_to_anchor=(0.5, 1.12))
+    plt.subplots_adjust(bottom=0.12)
+    plt.figtext(0.5, 0.005, title, ha="center", fontsize=14)
+    save_fig("aisle_task_count_max_deviation_by_day.png")
+    plt.show()
+
+
+def plot_optimization_avg_solve_time_by_day(all_data):
+    """执行 plot optimization avg solve 时间 by day 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    opt_strategies = [(k, v) for k, v in STRATEGIES.items() if str(k).endswith("-opt")]
+    if not opt_strategies:
+        return
+    plt.figure(figsize=(12, 7))
+    if DAYS_FILTER:
+        days_list = sorted(DAYS_FILTER)
+    else:
+        day_set = set()
+        for strategy_file, _ in opt_strategies:
+            day_set |= set(all_data.get(strategy_file, {}).get("optimization_solve_times_by_day", {}).keys())
+        days_list = sorted(day_set)
+    days_list = _filter_plot_days(days_list)
+    if not days_list:
+        print("无opt求解时间数据，跳过图表")
+        return
+
+    x = np.arange(len(days_list))
+    total_width = 0.75
+    bar_width = total_width / len(opt_strategies)
+
+    for idx_strategy, (strategy_file, strategy_name) in enumerate(opt_strategies):
+        by_day = all_data.get(strategy_file, {}).get("optimization_solve_times_by_day", {})
+        heights = []
+        for day in days_list:
+            values = by_day.get(day, [])
+            heights.append(sum(values) / len(values) if values else 0.0)
+        legend_label = _format_dual_avg_label(
+            strategy_name,
+            list(zip(days_list, heights)),
+            lambda x: f"{x:.3f}s",
+        )
+        offsets = x + (idx_strategy - (len(opt_strategies) - 1) / 2) * bar_width
+        bars = plt.bar(offsets, heights, width=bar_width, label=legend_label, color=COLORS.get(strategy_file))
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2, h + 0.01, f"{h:.3f}", ha="center", va="bottom", fontsize=10)
+
+    plt.xticks(x, [f"Day {d}" for d in days_list])
+    plt.xlabel("天数")
+    plt.ylabel("opt平均求解时间 (s)")
+    title = "每日opt平均求解时间"
+    plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+    plt.legend(frameon=False, ncol=len(opt_strategies), loc="upper center", bbox_to_anchor=(0.5, 1.1))
+    plt.subplots_adjust(bottom=0.12)
+    plt.figtext(0.5, 0.005, title, ha="center", fontsize=14)
+    save_fig("optimization_avg_solve_time_by_day.png")
+    plt.show()
+
+def plot_optimization_solve_time_buckets_opt_only(all_data):
+    """执行 plot optimization solve 时间 buckets opt only 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    opt_data = _get_opt_only_strategy_data(all_data)
+    if not opt_data:
+        print("无 opt 日志数据，跳过优化器求解耗时分档图")
+        return
+
+    buckets = ["0-1s", "1-2s", "2s以上"]
+    strategy_keys = list(opt_data.keys())
+    strategy_names = [STRATEGIES.get(strategy_file, strategy_file) for strategy_file in strategy_keys]
+    bucket_counts_by_strategy = []
+    strategy_labels = []
+    for strategy_file in strategy_keys:
+        solve_times = list(opt_data[strategy_file].get("optimization_solve_times", []) or [])
+        avg_solve = (sum(solve_times) / len(solve_times)) if solve_times else 0.0
+        strategy_labels.append(f"{STRATEGIES.get(strategy_file, strategy_file)}: {avg_solve:.3f}s")
+        strategy_buckets = opt_data[strategy_file].get("optimization_solve_time_buckets", {})
+        bucket_counts_by_strategy.append([strategy_buckets.get(bucket, 0) for bucket in buckets])
+
+    if not any(count > 0 for counts in bucket_counts_by_strategy for count in counts):
+        print("无优化器求解耗时记录，跳过优化器求解耗时分档图")
+        return
+
+    plt.figure(figsize=(10, 5))
+    x = np.arange(len(buckets))
+    width = 0.8 / max(1, len(strategy_names))
+    for idx, (strategy_key, strategy_label, counts) in enumerate(zip(strategy_keys, strategy_labels, bucket_counts_by_strategy)):
+        offsets = x + (idx - (len(strategy_names) - 1) / 2) * width
+        bars = plt.bar(offsets, counts, width=width, label=strategy_label, color=COLORS.get(strategy_key, "#0066cc"))
+        for bar, count in zip(bars, counts):
+            if count > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2, count + 0.1, str(count), ha="center", va="bottom", fontsize=8)
+
+    plt.xticks(x, buckets)
+    plt.ylabel("次数")
+    plt.title("优化器求解耗时分档")
+    plt.grid(True, axis="y", linestyle="--", alpha=0.4)
+    plt.legend(frameon=False, ncol=len(strategy_names), loc="upper center", bbox_to_anchor=(0.5, 1.08))
+    plt.tight_layout()
+    save_fig("optimization_solve_time_buckets_opt_only.png")
+    plt.show()
+
+
 def print_summary_statistics(all_data):
     """打印汇总统计信息，包括各策略的总任务数
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -763,9 +1191,9 @@ def print_summary_statistics(all_data):
 
 def print_aisle_busy_times(all_data):
     """打印每个策略下各巷道的忙碌时间。
-    
+
     显示每个策略下每天各巷道的入库时间、出库时间、总时间及占用率的详细信息。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -808,9 +1236,9 @@ def print_aisle_busy_times(all_data):
 
 def print_aisle_used_time_std(all_data):
     """打印各策略的巷道使用时间标准差（按天）与均值。
-    
+
     计算并显示每个策略下每天各巷道使用时间的标准差，用于评估设备负载均衡程度。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -837,11 +1265,99 @@ def print_aisle_used_time_std(all_data):
             print(f"  平均标准差: {avg_std:.2f}s")
 
 
+def print_aisle_load_balance(all_data):
+    """执行 print 巷道 load balance 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    print("\n=== 巷道时间最大偏差 ===")
+    print("指标: max(|T_i - T_avg| / T_avg)")
+    for strategy_file, data in all_data.items():
+        all_days_stats = data.get("aisle_busy_times", {})
+        if not all_days_stats:
+            continue
+        per_day_dev = []
+        print(f"\n{STRATEGIES[strategy_file]}:")
+        for day in sorted(all_days_stats.keys()):
+            balance_stats = _calculate_aisle_load_balance_stats(all_days_stats[day])
+            if not balance_stats:
+                continue
+            dev_pct = balance_stats["max_deviation_ratio"] * 100.0
+            per_day_dev.append(dev_pct)
+            print(f"  Day {day}: {dev_pct:.2f}%")
+        if per_day_dev:
+            avg_dev = sum(per_day_dev) / len(per_day_dev)
+            print(f"  平均最大偏差率: {avg_dev:.2f}%")
+
+
+def print_aisle_task_count_balance(all_data):
+    """执行 print 巷道 任务 count balance 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    print("\n=== 巷道任务量最大偏差 ===")
+    print("指标: max(|N_i - N_avg| / N_avg)")
+    for strategy_file, data in all_data.items():
+        all_day_tasks = data.get("task_completion_details", {})
+        if not all_day_tasks:
+            continue
+        per_day_dev = []
+        print(f"\n{STRATEGIES[strategy_file]}:")
+        for day in sorted(all_day_tasks.keys()):
+            balance_stats = _calculate_aisle_task_count_balance_stats(all_day_tasks[day])
+            if not balance_stats:
+                continue
+            dev_pct = balance_stats["max_deviation_ratio"] * 100.0
+            per_day_dev.append(dev_pct)
+            print(f"  Day {day}: {dev_pct:.2f}%")
+        if per_day_dev:
+            avg_dev = sum(per_day_dev) / len(per_day_dev)
+            print(f"  平均最大偏差率: {avg_dev:.2f}%")
+
+
+def print_optimization_solve_times(all_data):
+    """执行 print optimization solve times 对应的业务处理。
+
+    Args:
+        all_data: 用于本函数处理的 `all_data` 参数。
+
+    Returns:
+        处理结果；具体类型由调用上下文决定。
+    """
+    print("\n=== opt求解时间 ===")
+    for strategy_file, strategy_name in STRATEGIES.items():
+        if not str(strategy_file).endswith("-opt"):
+            continue
+        data = all_data.get(strategy_file, {})
+        solve_times = data.get("optimization_solve_times", [])
+        solve_by_day = data.get("optimization_solve_times_by_day", {})
+        if not solve_times:
+            print(f"\n{strategy_name}: 无求解时间记录")
+            continue
+        avg_solve = sum(solve_times) / len(solve_times)
+        print(f"\n{strategy_name}:")
+        print(f"  总次数: {len(solve_times)}")
+        print(f"  整体平均: {avg_solve:.3f}s")
+        for day in sorted(solve_by_day.keys()):
+            values = solve_by_day.get(day, [])
+            if not values:
+                continue
+            print(f"  Day {day}: {sum(values) / len(values):.3f}s ({len(values)}次)")
+
+
 def print_aisle_task_counts(all_data):
     """打印每个策略下各巷道的入/出库任务次数。
-    
+
     统计并显示每个策略下各巷道处理的入库和出库任务次数，用于评估任务分配的均衡性。
-    
+
     Args:
         all_data: 包含所有策略数据的字典
     """
@@ -937,6 +1453,16 @@ def print_daily_aisle_avg_task_time(all_data):
             outbound_end_h = outbound_end_s / 3600.0 if outbound_end_s > 0 else 0.0
 
             def _build(stats_dict, end_h, direction):
+                """执行 build 对应的业务处理。
+
+                Args:
+                    stats_dict: 用于本函数处理的 `stats_dict` 参数。
+                    end_h: 用于本函数处理的 `end_h` 参数。
+                    direction: 用于本函数处理的 `direction` 参数。
+
+                Returns:
+                    处理结果；具体类型由调用上下文决定。
+                """
                 out = {}
                 aisles = sorted(stats_dict.keys())
                 for aisle in aisles:
@@ -1161,6 +1687,9 @@ def export_proposed_opt_daily_efficiency_csv(all_data):
         writer.writerows(rows)
     print(f"[INFO] saved {out_csv}")
 
+# ==========================================================================
+# 主函数：仿真结果可视化入口
+# ==========================================================================
 def main():
     """主函数，解析命令行参数并执行可视化分析"""
     parser = argparse.ArgumentParser(description="可视化分析仓储策略仿真结果")
@@ -1180,6 +1709,9 @@ def main():
     print_aisle_busy_times(all_data)
     print_daily_aisle_avg_task_time(all_data)
     print_aisle_used_time_std(all_data)
+    print_aisle_load_balance(all_data)
+    print_aisle_task_count_balance(all_data)
+    print_optimization_solve_times(all_data)
     print_aisle_task_counts(all_data)
     export_proposed_opt_daily_efficiency_csv(all_data)
     plot_tasks_completed_per_day(all_data)
@@ -1187,6 +1719,10 @@ def main():
     plot_outbound_hourly_throughput(all_data)
     plot_inbound_hourly_throughput(all_data)
     plot_avg_utilization_by_day(all_data)
+    plot_aisle_used_time_std_by_day(all_data)
+    plot_aisle_load_max_deviation_by_day(all_data)
+    plot_aisle_task_count_max_deviation_by_day(all_data)
+    plot_optimization_solve_time_buckets_opt_only(all_data)
     print("\n图表已生成并保存到当前目录")
 
 

@@ -1,17 +1,20 @@
-﻿"""
+"""实现基于规则和随机混合顺序的启发式调度器。"""
+
+"""
 
 
 """
 
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 from simulation.task_data import TaskData, TASK_TYPE_INBOUND, TASK_TYPE_OUTBOUND
+from simulation.position import InventoryPosition
 import random
 
 
 class HeuristicScheduler:
     """"""
-    
+
     def __init__(self, warehouse_core):
         """
         Args:
@@ -21,15 +24,28 @@ class HeuristicScheduler:
         self.inventory_manager = warehouse_core.inventory_manager
         self.time_estimator = warehouse_core.time_estimator
         self.aisles = warehouse_core.aisles
-        
-        # 
+
+        #
         self.solve_count = 0
         self.total_time = 0.0
-        
+
         # 入库货位分配器（如果warehouse_core有设置）
         self.position_allocator = None
-    
+
+    # ==========================================================================
+    # 辅助函数：任务特征与生产组解析
+    # ==========================================================================
     def _extract_feature_filters(self, task: TaskData, feature_keys: List[str]) -> List[dict]:
+        """执行 extract 特征 filters 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            task: 待处理的任务对象。
+            feature_keys: 用于本函数处理的 `feature_keys` 参数。
+
+        Returns:
+            List[dict]: 处理后的结果。
+        """
         filters = []
         for s in (task.skus or []):
             if not isinstance(s, dict):
@@ -42,6 +58,15 @@ class HeuristicScheduler:
         return filters
 
     def _resolve_task_group_idx(self, task: TaskData):
+        """执行 resolve 任务 任务组 idx 对应的业务处理。
+
+        Args:
+            self: 当前对象实例。
+            task: 待处理的任务对象。
+
+        Returns:
+            处理结果；具体类型由调用上下文决定。
+        """
         explicit_group_idx = getattr(task, "group_idx", None)
         if explicit_group_idx is not None:
             try:
@@ -58,21 +83,24 @@ class HeuristicScheduler:
             return None
         return None
 
-    def solve(self, inbound_tasks: List[TaskData], outbound_tasks: List[TaskData], 
-             running_tasks: Dict = None, current_time: float = 0.0) -> Dict[int, List[TaskData]]:
+    # ==========================================================================
+    # 主函数：启发式任务调度
+    # ==========================================================================
+    def solve(self, inbound_tasks: List[TaskData], outbound_tasks: List[TaskData],
+             running_tasks: Optional[Dict[str, TaskData]] = None, current_time: float = 0.0) -> Dict[int, List[TaskData]]:
         """
-        
+
         Args:
-            inbound_tasks: 
-            outbound_tasks: 
+            inbound_tasks:
+            outbound_tasks:
             running_tasks: 正在执行的任务字典 {task_id: task_info}，用于统计巷道任务数量
-            
+
         Returns:
             aisle_task_sequences: {aisle: [task_info, ...]}
                 task_info: task_id, task_type, production_line, sku, position, priority
         """
         start_time = time.time()
-        
+
         task_position_assignments = {}
         # 根据running_tasks初始化aisle_task_count
         aisle_task_count = {aisle: 0 for aisle in self.aisles}
@@ -81,7 +109,7 @@ class HeuristicScheduler:
                 aisle = task_info.assigned_aisle
                 if aisle in aisle_task_count:
                     aisle_task_count[aisle] += 1
-        
+
         # 0. 筛选出库任务：只保留当前组的任务
         filtered_outbound_tasks = []
         for task in outbound_tasks:
@@ -95,9 +123,9 @@ class HeuristicScheduler:
                 filtered_outbound_tasks.append(task)
             else:
                 print(f"  [启发式]筛选掉非当前组任务: {task.task_id} (任务组={task_group_idx}, 当前组={current_group_idx})")
-        
+
         outbound_tasks = filtered_outbound_tasks
-        
+
         # 2. 出库任务分配
         for task in outbound_tasks:
             if getattr(task, "positions", None):
@@ -110,10 +138,13 @@ class HeuristicScheduler:
             production_line = task.production_line
             match_mode = self.warehouse_core._get_outbound_match_mode(production_line)
             feature_keys = self.warehouse_core._get_outbound_match_features(production_line)
-            
+            # FIFO 是非 RFID 产线的硬约束：本轮仅保留同一匹配库存中最早入库的位置，
+            # 不再因巷道负载或随机选择跳过较早库存。
+            fifo_enabled = self.warehouse_core.is_outbound_fifo_enabled(production_line)
+
             # 查找可用位置
             available_positions_by_aisle = {}
-            
+
             if match_mode == "features":
                 feature_filters = self._extract_feature_filters(task, feature_keys)
                 if not feature_filters:
@@ -122,6 +153,21 @@ class HeuristicScheduler:
                 positions = self.inventory_manager.get_positions_by_features(
                     feature_filters[0], feature_keys, only_available=True
                 )
+                if fifo_enabled and positions:
+                    # API 同步阶段会将 inboundTime 规范化为 features 中的数值秒；
+                    # 未携带时间的历史库存按无穷大处理，使其排在已知时间库存之后。
+                    def position_inbound_time(position: InventoryPosition) -> float:
+                        features = getattr(position, "features", {}) or {}
+                        raw_time = features.get("_inbound_time") if isinstance(features, dict) else None
+                        return float(raw_time) if isinstance(raw_time, (int, float)) else float("inf")
+
+                    positions = [min(
+                        positions,
+                        key=lambda p: (
+                            position_inbound_time(p),
+                            int(p.aisle), int(p.row), int(p.column), int(p.level),
+                        ),
+                    )]
                 for pos in positions:
                     if pos.aisle not in available_positions_by_aisle:
                         available_positions_by_aisle[pos.aisle] = []
@@ -130,7 +176,7 @@ class HeuristicScheduler:
                 if not found:
                     continue
             else:
-                # SKU
+                # SKU 字段。
                 sku_ids = task.get_sku_ids()
                 if not sku_ids:
                     continue
@@ -153,9 +199,9 @@ class HeuristicScheduler:
                 elif len(sku_ids) == 2:
                     # 双梁任务：查找同时包含两个SKU的双层位置
                     for pos in self.inventory_manager.inventory_positions:
-                        if (pos.is_double_layer 
+                        if (pos.is_double_layer
                             and set([pos.upper_sku, pos.lower_sku]) == set(sku_ids)
-                            and pos.upper_quantity > 0 
+                            and pos.upper_quantity > 0
                             and pos.lower_quantity > 0):
                             if pos.aisle not in available_positions_by_aisle:
                                 available_positions_by_aisle[pos.aisle] = []
@@ -195,7 +241,7 @@ class HeuristicScheduler:
                     is_blocked = self.warehouse_core.check_blockage(aisle, out_line, current_time=current_time)
                     if not is_blocked:
                         valid_aisles.append(aisle)
-                
+
                 # 从有效巷道中选择任务最少的巷道
                 if valid_aisles:
                     best_aisle = min(valid_aisles, key=lambda a: aisle_task_count[a])
@@ -203,15 +249,9 @@ class HeuristicScheduler:
                     best_position = random.choice(available_positions_by_aisle[best_aisle])
                     aisle_task_count[best_aisle] += 1
                     task_position_assignments[task.task_id] = [best_position]
-        
+
         # 3. 入库任务分配（先来先做，in_line 仅决定目标层，不影响排序）
         for task in inbound_tasks:
-            if getattr(task, "positions", None):
-                pos0 = task.positions[0]
-                if pos0 is not None and pos0.aisle in aisle_task_count and aisle_task_count[pos0.aisle] == 0:
-                    task_position_assignments[task.task_id] = list(task.positions)
-                    aisle_task_count[pos0.aisle] += 1
-                continue
             target_aisle = task.assigned_aisle
             if target_aisle is None or target_aisle not in aisle_task_count:
                 continue
@@ -231,17 +271,17 @@ class HeuristicScheduler:
                 )
             else:
                 allocated_positions = [random.choice(empty_positions)]
-            # Hard guard: inbound must land on currently empty positions.
+                # 强约束：入库任务必须落到当前为空且可用的货位。
             if allocated_positions:
                 if any((p is None) or (not p.is_empty()) for p in allocated_positions):
                     print(f"[HEU] skip inbound {task.task_id}: allocated position not empty")
                     allocated_positions = []
             if allocated_positions:
                 task_position_assignments[task.task_id] = allocated_positions
-        
+
         # 4. 生成巷道任务序列
         aisle_task_sequences = {aisle: [] for aisle in self.aisles}
-        
+
         # 添加出库任务
         for task in outbound_tasks:
             if task.task_id in task_position_assignments:
@@ -267,7 +307,7 @@ class HeuristicScheduler:
                     positions=pos_list,
                     task_record=getattr(task, 'task_record', {})
                 )
-                # Preserve business fields for API response and downstream checks.
+                # 保留业务字段，供 API 响应和后续校验使用。
                 if hasattr(task, "out_line"):
                     new_task.out_line = getattr(task, "out_line", None)
                 if hasattr(task, "in_line"):
@@ -277,7 +317,7 @@ class HeuristicScheduler:
                 if hasattr(task, "group_idx"):
                     new_task.group_idx = getattr(task, "group_idx", None)
                 aisle_task_sequences[aisle].append(new_task)
-        
+
         # 添加入库任务
         for task in inbound_tasks:
             if task.task_id in task_position_assignments:
@@ -311,15 +351,23 @@ class HeuristicScheduler:
                 if hasattr(task, "group_idx"):
                     new_task.group_idx = getattr(task, "group_idx", None)
                 aisle_task_sequences[aisle].append(new_task)
-        
-        
+
+
         solve_time = time.time() - start_time
         self.total_time += solve_time
         self.solve_count += 1
-        
+
         return aisle_task_sequences
-    
+
     def get_average_solve_time(self) -> float:
+        """获取average solve 时间相关逻辑。
+
+        Args:
+            self: 当前对象实例。
+
+        Returns:
+            float: 处理后的结果。
+        """
         """"""
         if self.solve_count == 0:
             return 0.0

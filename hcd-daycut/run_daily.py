@@ -14,24 +14,33 @@ import datetime
 from pathlib import Path
 import re
 import argparse
-from typing import Optional, Iterable
+from typing import Any, Optional, Iterable
 from dataclasses import dataclass
 
-# In-file date selection (optional).
-# Set SELECT_DATES to override CLI, e.g. ["20251012", "20251017"].
-# Or set START_DATE/END_DATE for a range when SELECT_DATES is empty.
+# 文件内日期筛选配置（可选）。
+# 设置 SELECT_DATES 可覆盖命令行日期，例如 ["20251012", "20251017"]。
+# 当 SELECT_DATES 为空时，可通过 START_DATE/END_DATE 指定日期范围。
 SELECT_DATES = None
 START_DATE = "20251012"
 END_DATE = "20251030"
-# Use lambda = 1 / POISSON_X. Log suffix uses POISSON_X.
-POISSON_X = 50  # e.g. 50, 70, 100, 120
+# 泊松参数使用 lambda = 1 / POISSON_X；日志后缀记录 POISSON_X。
+# e.g. 50, 70, 100, 120
+POISSON_X = 50
 
+# ============================================================================
+# 辅助函数：日期筛选与日志文件命名
+# ============================================================================
 def get_date_and_tag(filename):
-    """
-    Extract date and optional tag from filename.
+    """Extract date and optional tag from filename.
     Example:
       inbound_task_config_20251012.json -> ("20251012", "default")
       inbound_task_config_20251012_v2.json -> ("20251012", "v2")
+
+    Args:
+        filename (Any): 输入或输出文件名。
+
+    Returns:
+        Any: 当前处理流程产生的结果；具体结构由函数摘要说明。
     """
     stem = Path(filename).stem
     match = re.search(r"(\d{8})(?:[_-]([A-Za-z0-9]+))?$", stem)
@@ -42,6 +51,17 @@ def get_date_and_tag(filename):
     return date_str, tag
 
 def _parse_date_list(dates_value: Optional[str]) -> Optional[set]:
+    """解析原始输入，提取本模块后续判断所需的结构化字段。
+
+    输入：dates_value（Optional[str]）
+    输出：Optional[set]
+
+    Args:
+        dates_value (Optional[str]): 供当前处理流程使用的 `dates_value` 值。
+
+    Returns:
+        Optional[set]: 当前处理流程产生的结果；具体结构由函数摘要说明。
+    """
     if not dates_value:
         return None
     parts = re.split(r"[,\s]+", dates_value.strip())
@@ -49,6 +69,20 @@ def _parse_date_list(dates_value: Optional[str]) -> Optional[set]:
 
 def _filter_dates(all_dates: Iterable[str], dates_value: Optional[str],
                   start_date: Optional[str], end_date: Optional[str]) -> list:
+    """执行 `_filter_dates` 对应的模块处理步骤，并返回该步骤产生的结果。
+
+    输入：all_dates（Iterable[str]）、dates_value（Optional[str]）、start_date（Optional[str]）、end_date（Optional[str]）
+    输出：list
+
+    Args:
+        all_dates (Iterable[str]): 供当前处理流程使用的 `all_dates` 值。
+        dates_value (Optional[str]): 供当前处理流程使用的 `dates_value` 值。
+        start_date (Optional[str]): 供当前处理流程使用的 `start_date` 值。
+        end_date (Optional[str]): 供当前处理流程使用的 `end_date` 值。
+
+    Returns:
+        list: 符合当前筛选或计算条件的结果集合。
+    """
     date_set = _parse_date_list(dates_value)
     filtered = []
     for d in sorted(all_dates):
@@ -62,6 +96,17 @@ def _filter_dates(all_dates: Iterable[str], dates_value: Optional[str],
     return filtered
 
 def _format_lambda_suffix(value: Optional[float]) -> str:
+    """将内部数据格式化为日志、展示或接口输出所需的形式。
+
+    输入：value（Optional[float]）
+    输出：str
+
+    Args:
+        value (Optional[float]): 待解析、格式化或计算的原始值。
+
+    Returns:
+        str: 当前处理得到的文本标识、格式化结果或诊断信息。
+    """
     if value is None:
         return ""
     text = f"{value}".replace(".", "p")
@@ -74,18 +119,34 @@ class RunningJob:
     cmd: list
     log_file: Path
     proc: subprocess.Popen
-    file_handle: any
+    file_handle: Any
 
+# ============================================================================
+# 主流程：逐日构造命令并启动仿真子进程
+# ============================================================================
 def main():
+    """作为脚本入口，解析运行参数并按既定顺序调用本文件的主要处理流程。
+
+    输入：无显式业务输入；依赖实例字段或模块配置。
+
+    Args:
+        None: 无显式业务参数；使用实例状态或模块配置。
+
+    Returns:
+        None: 通过实例状态、队列或外部副作用完成处理。
+    """
     parser = argparse.ArgumentParser(description="Run daily configs in batch.")
+    # 仅运行逗号或空格分隔的日期集合；传入后优先级高于起止日期。
     parser.add_argument(
         "--dates",
         help="Comma/space separated list of YYYYMMDD to run (e.g. 20251012,20251013)",
     )
+    # 批处理日期范围的包含起点，仅在未指定 --dates 时参与筛选。
     parser.add_argument(
         "--start-date",
         help="Start date YYYYMMDD (inclusive). Ignored if --dates is set.",
     )
+    # 批处理日期范围的包含终点，仅在未指定 --dates 时参与筛选。
     parser.add_argument(
         "--end-date",
         help="End date YYYYMMDD (inclusive). Ignored if --dates is set.",
@@ -93,16 +154,16 @@ def main():
     args = parser.parse_args()
     # 获取daily目录下的所有配置文件
     daily_dir = Path("simulation/data/daily")
-    
+
     if not daily_dir.exists():
         print(f"[ERROR] 目录 {daily_dir} 不存在")
         return
-    
+
     # 获取所有inbound配置文件
     inbound_files = list(daily_dir.glob("inbound_task_config_*.json"))
     # 获取所有plan配置文件
     plan_files = list(daily_dir.glob("production_plan_config_*.json"))
-    
+
     # 按日期匹配inbound和plan配置
     date_configs = {}
 
@@ -122,7 +183,7 @@ def main():
 
     print(f"[INFO] 找到 {len(date_configs)} 个日期的配置文件")
     print(f"[INFO] 日期列表: {sorted(date_configs.keys())}")
-    
+
     all_dates = sorted(date_configs.keys())
     dates_value = ",".join(SELECT_DATES) if SELECT_DATES else args.dates
     start_date = None if SELECT_DATES else (START_DATE or args.start_date)
@@ -137,23 +198,25 @@ def main():
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
 
+    # 运行配置
     run_configs = [
         ("proposed", "proposed", "heuristic"),
         ("proposed", "proposed", "optimization"),
         ("baseline", "baseline", "heuristic"),
         ("baseline", "baseline", "optimization"),
     ]
+    # 生成日志文件名
     abbreviations = {
         "baseline": "base",
         "proposed": "prop",
         "heuristic": "heu",
         "optimization": "opt",
     }
-    
+
     # 按日期运行仿真
     successful_runs = 0
     failed_runs = 0
-    
+
     for date_str in selected_dates:
         configs = date_configs[date_str]
         inbound_map = configs.get("inbound", {})
@@ -237,7 +300,7 @@ def main():
                     print(f"[ERROR] Failed to start {label}: {e}")
                     failed_runs += 1
 
-            # Wait all 4 configs in parallel batch
+# 等待本批次的 4 个配置并行执行完成。
             for job in running_jobs:
                 try:
                     return_code = job.proc.wait()

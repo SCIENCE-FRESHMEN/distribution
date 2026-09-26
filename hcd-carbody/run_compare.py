@@ -29,14 +29,17 @@ from typing import Tuple
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 
 
+# ==========================================================================
+# 辅助函数：文件名、子进程输出与单策略执行
+# ==========================================================================
 def sanitize_filename(name: str) -> str:
     """为Windows/NTFS安全的文件名进行清理和替换
-    
+
     将文件名中的非法字符替换为下划线，确保文件名在Windows系统上可以正常创建
-    
+
     Args:
         name: 原始文件名
-        
+
     Returns:
         清理后的文件名
     """
@@ -46,10 +49,10 @@ def sanitize_filename(name: str) -> str:
 
 def _decode_bytes(raw: bytes) -> str:
     """尝试使用不同编码解码字节串，优先尝试UTF-8和GBK编码
-    
+
     Args:
         raw: 原始字节串
-        
+
     Returns:
         解码后的字符串
     """
@@ -67,16 +70,19 @@ def _run_one(
     cfg: Tuple[str, str, str],
     logs_dir: Path,
     abbreviations: dict,
+    real_time_days: int | None,
+    balance_weight: float | None,
+    optimizer_weights: dict[str, float | None],
 ) -> Tuple[int, Tuple[str, str, str], Path, int, str | None]:
     """运行单个仿真配置
-    
+
     Args:
         idx: 当前配置的索引
         total: 总配置数
         cfg: 配置元组，包含(allocation, position, scheduler)
         logs_dir: 日志目录路径
         abbreviations: 策略名称缩写映射表
-        
+
     Returns:
         包含运行结果的元组(idx, 配置, 日志文件路径, 返回码, 错误信息)
     """
@@ -95,12 +101,32 @@ def _run_one(
 
     # 构造运行run.py的命令
     cmd = [
-        "python", "run.py",
+        # 继承 compare 进程的解释器，避免环境变量中的 python 指向其他 Conda 环境。
+        sys.executable, "run.py",
         "--inbound-allocation-strategy", allocation,      # 入库巷道分配策略
         "--inbound-position-strategy", position,          # 入库货位分配策略
         "--scheduler-type", scheduler,                    # 调度器类型
         "--log-file", str(internal_log),                  # 内部日志文件路径
     ]
+    # 仅在调用方显式指定时覆盖 warehouse.json，保证默认对比仍使用配置文件参数。
+    if balance_weight is not None:
+        cmd.extend(["--balance-weight", str(balance_weight)])
+    # 仅透传显式指定的评分权重；未传参数仍由 run.py 读取 warehouse.json，
+    # 因而旧的对比命令不会因为本次扩展而改变默认行为。
+    option_names = {
+        "makespan_weight": "--makespan-weight",
+        "production_line_avg_time_weight": "--production-line-avg-time-weight",
+        "production_line_balance_weight": "--production-line-balance-weight",
+        "aisle_dispersion_weight": "--aisle-dispersion-weight",
+        "inbound_wait_weight": "--inbound-wait-weight",
+    }
+    for key, option_name in option_names.items():
+        value = optimizer_weights.get(key)
+        if value is not None:
+            cmd.extend([option_name, str(value)])
+    # 未指定时保持 run.py 的原始完整周期行为；指定时所有策略使用相同天数。
+    if real_time_days is not None:
+        cmd.extend(["--real-time-days", str(real_time_days)])
 
     print(f"[INFO] submit {idx}/{total}: {allocation}-{position}-{scheduler} -> {log_file}")
     try:
@@ -116,17 +142,64 @@ def _run_one(
         return idx, cfg, log_file, -1, str(e)
 
 
+# ==========================================================================
+# 主函数：策略对比仿真入口
+# ==========================================================================
 def main() -> None:
     """主函数，解析命令行参数并运行对比实验"""
     parser = argparse.ArgumentParser(description="并行运行多种配置对比实验")
     parser.add_argument("--jobs", type=int, default=0, help="并行工作进程数；0表示自动检测")
     parser.add_argument("--logs-subdir", type=str, default="", help="输出日志子目录名")
     parser.add_argument(
+        "--real-time-days",
+        type=int,
+        default=None,
+        help="每组策略运行的实际数据天数；未传时使用 run.py 默认周期",
+    )
+    parser.add_argument(
         "--keep-internal-logs",
         action="store_true",
         help="保留临时日志文件如 logs/run-*.log (默认: 运行结束后删除)",
     )
+    parser.add_argument(
+        "--balance-weight",
+        type=float,
+        default=None,
+        help="优化调度的库存均衡变化权重；未传时使用 config/warehouse.json",
+    )
+    parser.add_argument("--makespan-weight", type=float, default=None, help="优化调度的最大完工时间权重")
+    parser.add_argument(
+        "--production-line-avg-time-weight",
+        type=float,
+        default=None,
+        help="优化调度的产线平均完成时间权重",
+    )
+    parser.add_argument(
+        "--production-line-balance-weight",
+        type=float,
+        default=None,
+        help="优化调度的产线进度均衡权重",
+    )
+    parser.add_argument(
+        "--aisle-dispersion-weight",
+        type=float,
+        default=None,
+        help="优化调度的巷道离散惩罚权重",
+    )
+    parser.add_argument(
+        "--inbound-wait-weight",
+        type=float,
+        default=None,
+        help="优化调度的入库等待时间权重",
+    )
     args = parser.parse_args()
+    optimizer_weights = {
+        "makespan_weight": args.makespan_weight,
+        "production_line_avg_time_weight": args.production_line_avg_time_weight,
+        "production_line_balance_weight": args.production_line_balance_weight,
+        "aisle_dispersion_weight": args.aisle_dispersion_weight,
+        "inbound_wait_weight": args.inbound_wait_weight,
+    }
 
     # 定义要测试的策略组合
     # 每个元组包含: (入库巷道分配策略, 入库货位分配策略, 调度器类型)
@@ -159,12 +232,22 @@ def main() -> None:
 
     failures = 0
     internal_logs: list[Path] = []
-    
+
     # 使用线程池并行执行所有配置的仿真
     with ThreadPoolExecutor(max_workers=jobs) as ex:
         # 提交所有任务到线程池
         futures = {
-            ex.submit(_run_one, i, len(configs), cfg, logs_dir, abbreviations): (i, cfg)
+            ex.submit(
+                _run_one,
+                i,
+                len(configs),
+                cfg,
+                logs_dir,
+                abbreviations,
+                args.real_time_days,
+                args.balance_weight,
+                optimizer_weights,
+            ): (i, cfg)
             for i, cfg in enumerate(configs, 1)
         }
         # 等待任务完成并处理结果
@@ -173,7 +256,7 @@ def main() -> None:
             i, cfg2, log_file, code, err = fut.result()
             allocation, position, scheduler = cfg2
             name = f"{allocation}-{position}-{scheduler}"
-            
+
             # 根据返回码判断任务是否成功
             if code == 0:
                 print(f"[INFO] done {i}/{len(configs)}: {name}, log={log_file}")
@@ -183,7 +266,7 @@ def main() -> None:
                     print(f"[ERROR] failed {i}/{len(configs)}: {name}, err={err}")
                 else:
                     print(f"[ERROR] failed {i}/{len(configs)}: {name}, returncode={code}, log={log_file}")
-            
+
             # 记录内部日志文件路径，用于后续清理
             allocation_abbr = abbreviations.get(allocation, allocation)
             position_abbr = abbreviations.get(position, position)
